@@ -1,0 +1,24 @@
+feat(proxy): initial release of AgentIAM wire proxy
+
+This commit establishes the foundational V1 architecture for the AgentIAM 
+LLM security proxy, providing a zero-dependency, Postgres-aware wire protocol 
+guardrail for AI agents.
+
+Key implementations:
+- Wire Protocol Multiplexing: Implemented a robust 3-goroutine proxy loop 
+  handling `pgproto3` messages between client and upstream database.
+- Connection Hijacking: Utilized `pgx/v5` pgconn for DialUpstream, negotiating 
+  auth (SCRAM/MD5) and gracefully passing raw socket state into the proxy loop.
+- AST Enforcement Engine: Integrated `pg_query_go` to intercept extended and 
+  simple query `Parse` phases. Added active AST mutation to enforce `LIMIT 100` 
+  and strict blocking of mutating commands (INSERT, UPDATE, DELETE, etc.).
+- Strict State Machine: Precisely modeled the Postgres Extended Query 
+  Error-Discard state mechanism, successfully dropping pipelined messages 
+  until `Sync` upon policy violations.
+- Policy Store: Added SQLite-backed persistent storage for mapping Agent 
+  API keys to AST enforcement rules.
+- Test Automation: Added complete Docker-based integration test harness using 
+  `testcontainers-go` covering auth, pipelining, limit injection, and blocks.
+
+The codebase is now structurally complete for the MVP release and fully 
+verified against native Postgres drivers (e.g., psycopg2).

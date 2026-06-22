@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: app_user
+      POSTGRES_PASSWORD: supersecretpassword
+      POSTGRES_DB: mydb
+    ports:
+      - "5434:5432"
+
+  agentiam:
+    build: .
+    ports:
+      - "5433:5433"
+    environment:
+      AGENTIAM_UPSTREAM_DSN: "postgres://app_user:supersecretpassword@postgres:5432/mydb?sslmode=disable"
+      AGENTIAM_LISTEN_PORT: "5433"
+      AGENTIAM_POLICY_DB_PATH: "/app/data/agentiam.db"
+    depends_on:
+      - postgres
