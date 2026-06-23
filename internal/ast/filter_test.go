@@ -200,3 +200,49 @@ func TestApplyRules(t *testing.T) {
 		})
 	}
 }
+
+func TestApplyRules_Analytical_Queries_Bypass_Limit(t *testing.T) {
+	rules := Rules{
+		AllowedStatements:  []string{"SELECT"},
+		EnforceSelectLimit: 10,
+	}
+
+	tests := []struct {
+		name     string
+		sql      string
+		expected string
+	}{
+		{
+			name:     "Count Aggregation",
+			sql:      "SELECT count(*) FROM users",
+			expected: "SELECT count(*) FROM users", // No limit injected
+		},
+		{
+			name:     "Sum Aggregation",
+			sql:      "SELECT sum(amount) FROM orders",
+			expected: "SELECT sum(amount) FROM orders",
+		},
+		{
+			name:     "Group By Clause",
+			sql:      "SELECT status, count(*) FROM orders GROUP BY status",
+			expected: "SELECT status, count(*) FROM orders GROUP BY status",
+		},
+		{
+			name:     "Window Function",
+			sql:      "SELECT id, sum(amount) OVER (PARTITION BY user_id) FROM orders",
+			expected: "SELECT id, sum(amount) OVER (PARTITION BY user_id) FROM orders",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := ApplyRules(tt.sql, rules)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if result != tt.expected {
+				t.Errorf("expected %q, got %q", tt.expected, result)
+			}
+		})
+	}
+}

@@ -5,16 +5,34 @@ import (
 	"reflect"
 	"strings"
 
-	pg_query "github.com/pganalyze/pg_query_go/v5"
+	lru "github.com/hashicorp/golang-lru/v2"
+	pg_query "github.com/pganalyze/pg_query_go/v6"
+	"github.com/wasilibs/go-pgquery/parser"
+	"google.golang.org/protobuf/proto"
 )
 
 var ErrComplexityExceeded = fmt.Errorf("Policy Violation: Maximum AST complexity exceeded")
 
+var queryCache *lru.Cache[string, string]
+
+func init() {
+	queryCache, _ = lru.New[string, string](2000)
+}
+
 // ApplyRules parses the SQL, checks against the rules, and returns the potentially modified SQL (e.g. with LIMIT appended).
 func ApplyRules(sql string, rules Rules) (string, error) {
-	tree, err := pg_query.Parse(sql)
+	cacheKey := fmt.Sprintf("%d:%s", rules.EnforceSelectLimit, sql)
+	if cached, ok := queryCache.Get(cacheKey); ok {
+		return cached, nil
+	}
+
+	b, err := parser.ParseToProtobuf(sql)
 	if err != nil {
 		return "", fmt.Errorf("failed to parse SQL: %w", err)
+	}
+	var tree pg_query.ParseResult
+	if err := proto.Unmarshal(b, &tree); err != nil {
+		return "", fmt.Errorf("failed to unmarshal AST: %w", err)
 	}
 
 	for _, stmt := range tree.Stmts {
@@ -24,10 +42,16 @@ func ApplyRules(sql string, rules Rules) (string, error) {
 		}
 	}
 
-	deparsed, err := pg_query.Deparse(tree)
+	deparseBytes, err := proto.Marshal(&tree)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal AST: %w", err)
+	}
+	deparsed, err := parser.DeparseFromProtobuf(deparseBytes)
 	if err != nil {
 		return "", fmt.Errorf("failed to deparse SQL: %w", err)
 	}
+
+	queryCache.Add(cacheKey, deparsed)
 	return deparsed, nil
 }
 
@@ -51,12 +75,15 @@ func enforceRules(node *pg_query.Node, rules Rules, depth int) error {
 		}
 
 		if rules.EnforceSelectLimit > 0 {
-			var isNoLimit bool
-			if sel.LimitCount == nil {
-				isNoLimit = true
-			} else if aconst, ok := sel.LimitCount.Node.(*pg_query.Node_AConst); ok && aconst.AConst.Isnull {
-				isNoLimit = true // LIMIT ALL
-			}
+			// Smart LIMIT: Skip injection for analytical queries
+			isAnalytical := len(sel.GroupClause) > 0 || hasAnalyticalNodes(sel.TargetList)
+			if !isAnalytical {
+				var isNoLimit bool
+				if sel.LimitCount == nil {
+					isNoLimit = true
+				} else if aconst, ok := sel.LimitCount.Node.(*pg_query.Node_AConst); ok && aconst.AConst.Isnull {
+					isNoLimit = true // LIMIT ALL
+				}
 
 			if isNoLimit {
 				// No limit, or LIMIT ALL
@@ -87,6 +114,7 @@ func enforceRules(node *pg_query.Node, rules Rules, depth int) error {
 					return fmt.Errorf("parameterized limits (e.g. LIMIT $1) are not allowed by policy")
 				default:
 					return fmt.Errorf("dynamic limits are not allowed by policy")
+				}
 				}
 			}
 		}
@@ -219,6 +247,80 @@ func isPostgresBoolFalse(sval string) bool {
 	switch strings.ToLower(sval) {
 	case "false", "off", "no", "0":
 		return true
+	}
+	return false
+}
+
+func hasAnalyticalNodes(v interface{}) bool {
+	if v == nil {
+		return false
+	}
+	val := reflect.ValueOf(v)
+	if !val.IsValid() {
+		return false
+	}
+	if val.Kind() == reflect.Ptr || val.Kind() == reflect.Interface {
+		if val.IsNil() {
+			return false
+		}
+		return hasAnalyticalNodes(val.Elem().Interface())
+	}
+
+	if val.Kind() == reflect.Struct {
+		for i := 0; i < val.NumField(); i++ {
+			field := val.Field(i)
+			if !field.CanInterface() {
+				continue
+			}
+			if field.Kind() == reflect.Ptr && !field.IsNil() {
+				if n, ok := field.Interface().(*pg_query.Node); ok {
+					switch node := n.Node.(type) {
+					case *pg_query.Node_FuncCall:
+						fc := node.FuncCall
+						if fc.Over != nil || fc.AggStar || fc.AggDistinct {
+							return true
+						}
+						for _, fn := range fc.Funcname {
+							if strNode, ok := fn.Node.(*pg_query.Node_String_); ok {
+								name := strings.ToLower(strNode.String_.Sval)
+								if name == "count" || name == "sum" || name == "avg" || name == "min" || name == "max" {
+									return true
+								}
+							}
+						}
+					}
+				}
+			}
+			if hasAnalyticalNodes(field.Interface()) {
+				return true
+			}
+		}
+	} else if val.Kind() == reflect.Slice {
+		for i := 0; i < val.Len(); i++ {
+			elem := val.Index(i)
+			if elem.Kind() == reflect.Ptr && !elem.IsNil() {
+				if n, ok := elem.Interface().(*pg_query.Node); ok {
+					switch node := n.Node.(type) {
+					case *pg_query.Node_FuncCall:
+						fc := node.FuncCall
+						if fc.Over != nil || fc.AggStar || fc.AggDistinct {
+							return true
+						}
+						for _, fn := range fc.Funcname {
+							if strNode, ok := fn.Node.(*pg_query.Node_String_); ok {
+								name := strings.ToLower(strNode.String_.Sval)
+								if name == "count" || name == "sum" || name == "avg" || name == "min" || name == "max" {
+									return true
+								}
+							}
+						}
+					}
+				}
+			}
+			if hasAnalyticalNodes(elem.Interface()) {
+				return true
+			}
+		}
 	}
 	return false
 }
