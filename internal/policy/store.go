@@ -7,10 +7,12 @@ import (
 	"agentiam/internal/ast"
 
 	_ "github.com/mattn/go-sqlite3"
+	"golang.org/x/crypto/bcrypt"
 )
 
 type Store struct {
-	db *sql.DB
+	db        *sql.DB
+	dummyHash []byte
 }
 
 type AgentPolicy struct {
@@ -27,8 +29,8 @@ func NewStore(dbPath string) (*Store, error) {
 
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS agents (
-			api_key TEXT PRIMARY KEY,
-			label TEXT,
+			client_id TEXT PRIMARY KEY,
+			api_key_hash TEXT,
 			allowed_ops TEXT
 		);
 	`)
@@ -36,18 +38,29 @@ func NewStore(dbPath string) (*Store, error) {
 		return nil, err
 	}
 
-	return &Store{db: db}, nil
+	dummyHash, _ := bcrypt.GenerateFromPassword([]byte("dummy"), bcrypt.DefaultCost)
+
+	return &Store{
+		db:        db,
+		dummyHash: dummyHash,
+	}, nil
 }
 
-// GetRulesForAgent looks up an API key and returns the AST rules.
-func (s *Store) GetRulesForAgent(apiKey string) (ast.Rules, error) {
+// GetRulesForAgent looks up a client ID, verifies the bcrypt password, and returns AST rules.
+func (s *Store) GetRulesForAgent(clientID string, suppliedPassword string) (ast.Rules, error) {
 	var allowedOpsStr string
-	err := s.db.QueryRow("SELECT allowed_ops FROM agents WHERE api_key = ?", apiKey).Scan(&allowedOpsStr)
+	var apiKeyHash string
+	
+	err := s.db.QueryRow("SELECT api_key_hash, allowed_ops FROM agents WHERE client_id = ?", clientID).Scan(&apiKeyHash, &allowedOpsStr)
 	if err != nil {
-		if err == sql.ErrNoRows {
-			return ast.Rules{}, fmt.Errorf("invalid agent API key")
-		}
-		return ast.Rules{}, err
+		// DUMMY BCRYPT TO EQUALIZE TIMING (Mitigates User Enumeration)
+		bcrypt.CompareHashAndPassword(s.dummyHash, []byte(suppliedPassword))
+		return ast.Rules{}, fmt.Errorf("invalid client ID or password")
+	}
+
+	// ALWAYS call CompareHashAndPassword without any length pre-checks to avoid timing oracles
+	if err := bcrypt.CompareHashAndPassword([]byte(apiKeyHash), []byte(suppliedPassword)); err != nil {
+		return ast.Rules{}, fmt.Errorf("invalid client ID or password")
 	}
 
 	var allowedOps []string
@@ -55,32 +68,20 @@ func (s *Store) GetRulesForAgent(apiKey string) (ast.Rules, error) {
 		return ast.Rules{}, fmt.Errorf("failed to parse policy: %w", err)
 	}
 
-	// Calculate blocked statements based on allowed. For MVP, we maintain a master list of dangerous ops.
-	dangerousOps := []string{"INSERT", "UPDATE", "DELETE", "DROP", "TRUNCATE", "ALTER"}
-	var blocked []string
-	
-	for _, op := range dangerousOps {
-		allowed := false
-		for _, a := range allowedOps {
-			if a == op {
-				allowed = true
-				break
-			}
-		}
-		if !allowed {
-			blocked = append(blocked, op)
-		}
-	}
-
 	return ast.Rules{
-		BlockedStatements:  blocked,
+		AllowedStatements:  allowedOps,
 		EnforceSelectLimit: 100, // Hardcoded for MVP
 	}, nil
 }
 
 // AddAgent is a helper to seed the database
-func (s *Store) AddAgent(apiKey, label string, allowedOps []string) error {
+func (s *Store) AddAgent(clientID, plaintextPassword string, allowedOps []string) error {
+	hash, err := bcrypt.GenerateFromPassword([]byte(plaintextPassword), bcrypt.DefaultCost)
+	if err != nil {
+		return err
+	}
+	
 	b, _ := json.Marshal(allowedOps)
-	_, err := s.db.Exec("INSERT OR REPLACE INTO agents (api_key, label, allowed_ops) VALUES (?, ?, ?)", apiKey, label, string(b))
+	_, err = s.db.Exec("INSERT OR REPLACE INTO agents (client_id, api_key_hash, allowed_ops) VALUES (?, ?, ?)", clientID, string(hash), string(b))
 	return err
 }

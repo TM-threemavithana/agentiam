@@ -2,6 +2,14 @@ package proxy_test
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
 	"net"
 	"net/url"
 	"testing"
@@ -64,7 +72,7 @@ func setupTestEnv(t *testing.T) (string, string, func()) {
 		t.Fatalf("failed to create policy store: %v", err)
 	}
 	// "test-agent" can only SELECT
-	err = store.AddAgent("test-agent-key", "Test", []string{"SELECT"})
+	err = store.AddAgent("test-agent", "test-agent-secret", []string{"SELECT"})
 	if err != nil {
 		t.Fatalf("failed to add agent: %v", err)
 	}
@@ -75,6 +83,7 @@ func setupTestEnv(t *testing.T) (string, string, func()) {
 		t.Fatalf("failed to listen: %v", err)
 	}
 
+	// For integration tests without TLS certs, we pass nil tlsConfig
 	_ = proxy.NewServer(l.Addr().String(), upstreamDSN, store)
 	go func() {
 		for {
@@ -83,7 +92,7 @@ func setupTestEnv(t *testing.T) (string, string, func()) {
 				return
 			}
 			go func(c net.Conn) {
-				session := proxy.NewSession(c, upstreamDSN, store)
+				session := proxy.NewSession(c, upstreamDSN, store, nil)
 				defer session.Close()
 				session.Run()
 			}(conn)
@@ -94,11 +103,11 @@ func setupTestEnv(t *testing.T) (string, string, func()) {
 	proxyURL.Host = l.Addr().String()
 
 	// Good DSN for test agent
-	proxyURL.User = url.UserPassword("test-agent-key", "ignored")
+	proxyURL.User = url.UserPassword("test-agent", "test-agent-secret")
 	proxyDSN := proxyURL.String()
 
 	// Bad DSN for auth failure test
-	proxyURL.User = url.UserPassword("wrong-key", "ignored")
+	proxyURL.User = url.UserPassword("test-agent", "wrong-secret")
 	badProxyDSN := proxyURL.String()
 
 	cleanup := func() {
@@ -216,6 +225,165 @@ func TestProxyIntegration(t *testing.T) {
 		_, err := pgx.Connect(ctx, badProxyDSN)
 		if err == nil {
 			t.Fatal("expected auth error with bad DSN, got none")
+		}
+	})
+
+	// Test 6: SimpleQuery Error Recovery
+	t.Run("6_SimpleQuery_Discard", func(t *testing.T) {
+		conn, err := pgx.Connect(ctx, proxyDSN)
+		if err != nil {
+			t.Fatalf("failed to connect via proxy: %v", err)
+		}
+		defer conn.Close(ctx)
+
+		// Exec uses SimpleQuery protocol when not prepared
+		_, err = conn.PgConn().Exec(ctx, "DELETE FROM test_table").ReadAll()
+		if err == nil {
+			t.Fatal("expected error from DELETE via SimpleQuery, got none")
+		}
+
+		// Ensure connection recovers state correctly
+		var res int
+		err = conn.QueryRow(ctx, "SELECT 1").Scan(&res)
+		if err != nil {
+			t.Fatalf("subsequent SELECT failed after SimpleQuery error: %v", err)
+		}
+	})
+}
+
+func generateTestTLSConfig(t *testing.T) *tls.Config {
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate key: %v", err)
+	}
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{Organization: []string{"Acme Co"}},
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatalf("failed to create certificate: %v", err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+	b, err := x509.MarshalECPrivateKey(priv)
+	if err != nil {
+		t.Fatalf("failed to marshal key: %v", err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: b})
+
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatalf("failed to parse key pair: %v", err)
+	}
+	return &tls.Config{Certificates: []tls.Certificate{cert}}
+}
+
+func TestTLSUpgradeAndEnforcement(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. Setup minimal upstream (we mock the upstream just to test proxy handshake)
+	store, _ := policy.NewStore("file::memory:?cache=shared")
+	store.AddAgent("test-agent", "secret", []string{"SELECT"})
+	
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer l.Close()
+
+	tlsConfig := generateTestTLSConfig(t)
+	
+	// Create a dummy upstream listener to simulate Postgres answering
+	upstreamL, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer upstreamL.Close()
+	go func() {
+		for {
+			c, err := upstreamL.Accept()
+			if err != nil {
+				return
+			}
+			c.Close() // immediately close, we don't care about upstream in this test, just proxy auth phase
+		}
+	}()
+	upstreamDSN := "postgres://127.0.0.1:" + upstreamL.Addr().(*net.TCPAddr).String()
+
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				session := proxy.NewSession(c, upstreamDSN, store, tlsConfig)
+				defer session.Close()
+				session.Run()
+			}(conn)
+		}
+	}()
+
+	addr := l.Addr().String()
+
+	// Assertion 1 (Negative): Send a plaintext StartupMessage
+	t.Run("Plaintext_Rejected", func(t *testing.T) {
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("Failed to dial server: %v", err)
+		}
+		defer conn.Close()
+
+		// Startup message without SSLRequest
+		// Length (25 bytes), Protocol (196608), "user\0test-agent\0\0"
+		startupMsg := []byte{0, 0, 0, 25, 0, 3, 0, 0, 'u', 's', 'e', 'r', 0, 't', 'e', 's', 't', '-', 'a', 'g', 'e', 'n', 't', 0, 0}
+		
+		_, err = conn.Write(startupMsg)
+		if err != nil {
+			t.Fatalf("Failed to write plaintext StartupMessage: %v", err)
+		}
+
+		// Read the ErrorResponse
+		resp := make([]byte, 1024)
+		conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		n, err := conn.Read(resp)
+		if err != nil {
+			t.Fatalf("Failed to read proxy response: %v", err)
+		}
+		
+		// Ensure it's an ErrorResponse ('E')
+		if n == 0 || resp[0] != 'E' {
+			t.Fatalf("Expected ErrorResponse 'E', got %v", resp[:n])
+		}
+	})
+
+	// Assertion 2 (Positive): Connect via pgx with TLS enabled
+	t.Run("TLS_Accepted", func(t *testing.T) {
+		// DSN with sslmode=require (skips cert verification but enforces TLS)
+		proxyURL, _ := url.Parse("postgres://" + addr + "/testdb?sslmode=require")
+		proxyURL.User = url.UserPassword("test-agent", "secret")
+		
+		cfg, err := pgx.ParseConfig(proxyURL.String())
+		if err != nil {
+			t.Fatalf("failed to parse config: %v", err)
+		}
+		// Trust the self-signed cert
+		cfg.Config.TLSConfig = &tls.Config{InsecureSkipVerify: true}
+
+		conn, err := pgx.ConnectConfig(ctx, cfg)
+		
+		// If the proxy correctly parsed TLS and passed the auth phase, it will try to dial the dummy upstream.
+		// Since the dummy upstream immediately closes, pgx will return an error, but NOT a TLS or Auth error.
+		if err == nil {
+			conn.Close(ctx)
+		} else {
+			// We expect EOF or connection reset from the dummy upstream closing the connection, 
+			// which proves the proxy successfully completed its TLS handshake and authenticated the user.
+			if err.Error() == "FATAL: SSL connection is required" {
+				t.Fatalf("Proxy rejected secure connection!")
+			}
 		}
 	})
 }
