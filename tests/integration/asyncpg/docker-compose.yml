@@ -37,9 +37,12 @@ services:
     environment:
       - AGENTIAM_LISTEN_PORT=5432
       - AGENTIAM_UPSTREAM_DSN=postgres://postgres:postgres@pgbouncer:6432/agentiam?sslmode=disable
+      - AGENTIAM_POLICY_FILE=/etc/agentiam/policies.yaml
       - AGENTIAM_POLL_INTERVAL=5s
     ports:
       - "5432:5432"
+    volumes:
+      - ./policies.yaml:/etc/agentiam/policies.yaml:ro
     depends_on:
       - pgbouncer
     networks:

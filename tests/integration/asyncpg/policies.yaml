@@ -1,0 +1,12 @@
+version: "1"
+agents:
+  - name: test-agent-key
+    key: "$2a$10$zmUdNg9T6RWlvx8e9CVpZeSNtYkUQUjRhSfXazCmATEMNyevxybbe" # password: Test Agent
+    allowed_statements:
+      - SELECT
+      - INSERT
+      - CREATE
+      - TRUNCATE
+    allowed_tables: []
+    select_limit: 100
+    created_at: "2026-06-23T12:00:00Z"
