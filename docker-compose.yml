@@ -2,21 +2,50 @@ version: '3.8'
 
 services:
   postgres:
-    image: postgres:15-alpine
+    image: postgres:15
     environment:
-      POSTGRES_USER: app_user
-      POSTGRES_PASSWORD: supersecretpassword
-      POSTGRES_DB: mydb
-    ports:
-      - "5434:5432"
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: agentiam
+      POSTGRES_HOST_AUTH_METHOD: trust
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+    networks:
+      - backend
+
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    entrypoint: ["pgbouncer", "/etc/pgbouncer/pgbouncer.ini"]
+    user: postgres
+    volumes:
+      - ./deploy/pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./deploy/pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - frontend
+      - backend
 
   agentiam:
     build: .
-    ports:
-      - "5433:5433"
     environment:
-      AGENTIAM_UPSTREAM_DSN: "postgres://app_user:supersecretpassword@postgres:5432/mydb?sslmode=disable"
-      AGENTIAM_LISTEN_PORT: "5433"
-      AGENTIAM_POLICY_DB_PATH: "/app/data/agentiam.db"
+      - AGENTIAM_LISTEN_PORT=5432
+      - AGENTIAM_UPSTREAM_DSN=postgres://postgres:postgres@pgbouncer:6432/agentiam?sslmode=disable
+      - AGENTIAM_POLL_INTERVAL=5s
+    ports:
+      - "5432:5432"
     depends_on:
-      - postgres
+      - pgbouncer
+    networks:
+      - frontend
+
+networks:
+  frontend:
+    driver: bridge
+  backend:
+    driver: bridge
+    internal: true

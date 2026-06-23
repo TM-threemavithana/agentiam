@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"agentiam/internal/policy"
+	"io"
 	"net"
 	"runtime"
 	"sync"
@@ -11,8 +12,9 @@ import (
 
 func TestMaxConnectionsAndGoroutineCleanup(t *testing.T) {
 	store, _ := policy.NewStore(":memory:")
+	logger := NewLogger(io.Discard)
 	// We use a dummy upstream DSN since we won't actually dial it for rejected connections
-	server := NewServer("127.0.0.1:0", "postgres://dummy", store)
+	server := NewServer("127.0.0.1:0", "postgres://dummy", store, nil, logger)
 	
 	// Force max connections to 5 for testing
 	server.maxConns = 5
@@ -34,7 +36,7 @@ func TestMaxConnectionsAndGoroutineCleanup(t *testing.T) {
 			select {
 			case server.sem <- struct{}{}:
 				go func(c net.Conn) {
-					session := NewSession(c, "postgres://dummy", store, nil)
+					session := NewSession(c, "postgres://dummy", store, nil, logger, server)
 					defer session.Close()
 					session.Run()
 					<-server.sem
@@ -123,7 +125,9 @@ func TestStartupIterationLimit(t *testing.T) {
 				return
 			}
 			go func(c net.Conn) {
-				session := NewSession(c, "postgres://dummy", store, nil)
+				logger := NewLogger(io.Discard)
+				server := NewServer("127.0.0.1:0", "postgres://dummy", store, nil, logger)
+				session := NewSession(c, "postgres://dummy", store, nil, logger, server)
 				defer session.Close()
 				_ = session.Run() // Run the session, which should hit the iteration limit
 			}(conn)

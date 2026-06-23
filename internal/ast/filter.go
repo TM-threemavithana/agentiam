@@ -106,10 +106,17 @@ func enforceRules(node *pg_query.Node, rules Rules) error {
 		if !isAllowed("TRUNCATE", rules.AllowedStatements) {
 			return fmt.Errorf("TRUNCATE statements are not allowed by policy")
 		}
+	case *pg_query.Node_CreateStmt, *pg_query.Node_IndexStmt:
+		if !isAllowed("CREATE", rules.AllowedStatements) {
+			return fmt.Errorf("CREATE statements are not allowed by policy")
+		}
 	case *pg_query.Node_AlterTableStmt, *pg_query.Node_AlterRoleStmt, *pg_query.Node_AlterSystemStmt, *pg_query.Node_AlterDatabaseStmt:
 		if !isAllowed("ALTER", rules.AllowedStatements) {
 			return fmt.Errorf("ALTER statements are not allowed by policy")
 		}
+	case *pg_query.Node_TransactionStmt:
+		// Always allow BEGIN/COMMIT/ROLLBACK as PgBouncer handles them and connection pooling relies on it.
+		return nil
 	case *pg_query.Node_VariableSetStmt:
 		return fmt.Errorf("SET statements are not allowed by policy")
 	case *pg_query.Node_ExplainStmt:

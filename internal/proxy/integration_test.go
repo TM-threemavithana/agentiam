@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"io"
 	"math/big"
 	"net"
 	"net/url"
@@ -83,8 +84,10 @@ func setupTestEnv(t *testing.T) (string, string, func()) {
 		t.Fatalf("failed to listen: %v", err)
 	}
 
-	// For integration tests without TLS certs, we pass nil tlsConfig
-	_ = proxy.NewServer(l.Addr().String(), upstreamDSN, store)
+	logger := proxy.NewLogger(io.Discard)
+	server := proxy.NewServer(l.Addr().String(), upstreamDSN, store, nil, logger)
+	go server.PollPolicyUpdatesForTest()
+
 	go func() {
 		for {
 			conn, err := l.Accept()
@@ -92,7 +95,7 @@ func setupTestEnv(t *testing.T) (string, string, func()) {
 				return
 			}
 			go func(c net.Conn) {
-				session := proxy.NewSession(c, upstreamDSN, store, nil)
+				session := proxy.NewSession(c, upstreamDSN, store, nil, logger, server)
 				defer session.Close()
 				session.Run()
 			}(conn)
@@ -319,7 +322,9 @@ func TestTLSUpgradeAndEnforcement(t *testing.T) {
 				return
 			}
 			go func(c net.Conn) {
-				session := proxy.NewSession(c, upstreamDSN, store, tlsConfig)
+				logger := proxy.NewLogger(io.Discard)
+				server := proxy.NewServer("127.0.0.1:0", upstreamDSN, store, tlsConfig, logger)
+				session := proxy.NewSession(c, upstreamDSN, store, tlsConfig, logger, server)
 				defer session.Close()
 				session.Run()
 			}(conn)

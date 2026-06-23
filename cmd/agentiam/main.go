@@ -29,17 +29,21 @@ func main() {
 		log.Fatalf("Failed to initialize policy store: %v", err)
 	}
 
+	// Initialize structured logger
+	logger := proxy.NewLogger(os.Stdout)
+
 	// For demonstration purposes, seed the database with a test agent API key
-	// that only allows SELECT operations.
-	err = store.AddAgent("test-agent-key", "Test Agent", []string{"SELECT"})
+	// that allows SELECT, INSERT, CREATE, and TRUNCATE, but blocks DELETE.
+	err = store.AddAgent("test-agent-key", "Test Agent", []string{"SELECT", "INSERT", "CREATE", "TRUNCATE"})
 	if err != nil {
 		log.Fatalf("Failed to seed test agent: %v", err)
 	}
-	log.Println("Seeded test agent 'test-agent-key' with policy: SELECT only")
+	logger.Info("Seeded test agent with policy: SELECT, INSERT, CREATE, TRUNCATE", "agent", "test-agent-key")
 
-	srv := proxy.NewServer(":"+listenPort, upstreamDSN, store)
-	log.Printf("AgentIAM starting on port %s...", listenPort)
+	srv := proxy.NewServer(":"+listenPort, upstreamDSN, store, nil, logger)
+	logger.Info("AgentIAM starting...", "port", listenPort)
 	if err := srv.Start(); err != nil {
-		log.Fatalf("Proxy server failed: %v", err)
+		logger.Error("Proxy server failed", "error", err)
+		os.Exit(1)
 	}
 }

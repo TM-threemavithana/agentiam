@@ -7,7 +7,6 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -18,10 +17,12 @@ import (
 )
 
 type Session struct {
-	clientConn  net.Conn
+	clientConn   net.Conn
 	upstreamConn net.Conn
-	upstreamDSN string
-	store       *policy.Store
+	upstreamDSN  string
+	store        *policy.Store
+	logger       *Logger
+	server       *Server
 
 	clientBackend    *pgproto3.Backend
 	upstreamFrontend *pgproto3.Frontend
@@ -32,20 +33,21 @@ type Session struct {
 	closeOnce    sync.Once
 }
 
-func NewSession(clientConn net.Conn, upstreamDSN string, store *policy.Store, tlsConfig *tls.Config) *Session {
+func NewSession(clientConn net.Conn, upstreamDSN string, store *policy.Store, tlsConfig *tls.Config, logger *Logger, server *Server) *Session {
 	return &Session{
 		clientConn:  clientConn,
 		upstreamDSN: upstreamDSN,
 		store:       store,
 		tlsConfig:   tlsConfig,
+		logger:      logger,
+		server:      server,
 	}
 }
 
 func (s *Session) Run() error {
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel() // Guarantees monitor unblocks on normal exit
+	defer cancel()
 
-	// Context-Socket Monitor: Tears down sockets instantly if context cancels (e.g. upstream drop)
 	go func() {
 		<-ctx.Done()
 		s.Close()
@@ -72,35 +74,31 @@ func (s *Session) Run() error {
 				return fmt.Errorf("client attempted plaintext connection when TLS is enforced")
 			}
 			clientID = msg.Parameters["user"]
-			break // Exit the switch, but we need to exit the loop too
+			break
 
 		case *pgproto3.SSLRequest:
 			if s.tlsConfig == nil {
 				s.clientConn.Write([]byte("N"))
-				continue // Wait for the actual StartupMessage on the next loop iteration
+				continue
 			}
 
-			// Respond 'S' to support SSL
 			if _, err := s.clientConn.Write([]byte("S")); err != nil {
 				return err
 			}
 
-			// Upgrade connection
 			tlsConn := tls.Server(s.clientConn, s.tlsConfig)
 			if err := tlsConn.Handshake(); err != nil {
 				return fmt.Errorf("TLS handshake failed: %w", err)
 			}
 
-			// Swap connection and backend
 			s.clientConn = tlsConn
 			s.clientBackend = pgproto3.NewBackend(pgproto3.NewChunkReader(s.clientConn), s.clientConn)
-			continue // Re-read StartupMessage over TLS on the next iteration
+			continue
 
 		default:
 			return fmt.Errorf("unexpected startup message: %T", startupMsg)
 		}
 
-		// If we reach here and it was a StartupMessage, we break the loop
 		if clientID != "" {
 			break
 		}
@@ -110,10 +108,8 @@ func (s *Session) Run() error {
 		return fmt.Errorf("startup sequence failed: maximum iterations exceeded")
 	}
 
-	// Phase 1.5: Send Password Challenge
 	s.clientBackend.Send(&pgproto3.AuthenticationCleartextPassword{})
 
-	// Wait for PasswordMessage
 	s.clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	authMsg, err := s.clientBackend.Receive()
 	s.clientConn.SetReadDeadline(time.Time{})
@@ -127,23 +123,25 @@ func (s *Session) Run() error {
 		return fmt.Errorf("expected PasswordMessage, got %T", authMsg)
 	}
 
-	// Phase 2: Authenticate via Policy Store using bcrypt
-	rules, err := s.store.GetRulesForAgent(clientID, pwdMsg.Password)
+	rules, authVersion, err := s.store.GetRulesForAgent(clientID, pwdMsg.Password)
 	if err != nil {
+		s.logger.Error("Auth failed", "client", clientID, "error", err)
 		s.clientBackend.Send(&pgproto3.ErrorResponse{Severity: "FATAL", Message: "Invalid Agent Credentials"})
 		return fmt.Errorf("auth failed: %w", err)
 	}
 	s.rules = rules
 	s.clientBackend.Send(&pgproto3.AuthenticationOk{})
 
-	// Phase 3: Dial Upstream via pgconn (Handles SCRAM, MD5, etc.)
+	// Register session with Server for dynamic revocation
+	s.server.RegisterSession(clientID, s, authVersion, cancel)
+	defer s.server.UnregisterSession(clientID, s)
+
 	pgConn, err := pgconn.Connect(ctx, s.upstreamDSN)
 	if err != nil {
 		s.clientBackend.Send(&pgproto3.ErrorResponse{Severity: "FATAL", Message: "Failed to dial upstream database"})
 		return fmt.Errorf("upstream dial failed: %w", err)
 	}
 	
-	// Hijack the raw connection
 	hijacked, err := pgConn.Hijack()
 	if err != nil {
 		return fmt.Errorf("failed to hijack upstream conn: %w", err)
@@ -153,31 +151,26 @@ func (s *Session) Run() error {
 
 	s.upstreamFrontend = pgproto3.NewFrontend(pgproto3.NewChunkReader(s.upstreamConn), s.upstreamConn)
 
-	// Forward ParameterStatus from upstream to downstream client
 	for k, v := range hijacked.ParameterStatuses {
 		s.clientBackend.Send(&pgproto3.ParameterStatus{Name: k, Value: v})
 	}
 	
-	// Forward BackendKeyData (pgconn uses []byte for SecretKey, pgproto3/v2 uses uint32)
 	secretKeyUint := uint32(0)
 	if len(hijacked.SecretKey) >= 4 {
 		secretKeyUint = uint32(hijacked.SecretKey[0])<<24 | uint32(hijacked.SecretKey[1])<<16 | uint32(hijacked.SecretKey[2])<<8 | uint32(hijacked.SecretKey[3])
 	}
 	s.clientBackend.Send(&pgproto3.BackendKeyData{ProcessID: hijacked.PID, SecretKey: secretKeyUint})
 	
-	// Complete startup
 	s.clientBackend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
 
-	// Phase 4: The 3-Goroutine Proxy Loop
 	return s.proxyLoop(ctx, cancel, clientID)
 }
 
 func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clientID string) error {
 	clientWriteCh := make(chan pgproto3.BackendMessage, 64)
 
-	// Writer Goroutine (owns s.clientBackend exclusively)
 	go func() {
-		defer cancel() // if writer dies, tear down everything
+		defer cancel()
 		for {
 			select {
 			case <-ctx.Done():
@@ -188,27 +181,24 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 				}
 				err := s.clientBackend.Send(msg)
 				if err != nil {
-					log.Printf("Error writing to client: %v", err)
+					s.logger.Error("Error writing to client", "error", err)
 					return
 				}
 			}
 		}
 	}()
 
-	// Upstream-to-Client Reader Goroutine
 	go func() {
 		defer cancel()
 		for {
 			msg, err := s.upstreamFrontend.Receive()
 			if err != nil {
 				if err != io.EOF && err != io.ErrUnexpectedEOF {
-					log.Printf("Upstream read error: %v", err)
+					s.logger.Error("Upstream read error", "error", err)
 				}
 				return
 			}
 
-			// If we are in discard mode, suppress ReadyForQuery.
-			// clientToUpstream will synthesize it on Sync.
 			if s.errorDiscard.Load() {
 				if _, isReady := msg.(*pgproto3.ReadyForQuery); isReady {
 					continue
@@ -223,18 +213,15 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 		}
 	}()
 
-	// Client-to-Upstream Reader Goroutine (Main Loop)
 	for {
-		// Wait for next message (Idle State)
 		s.clientConn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 		msg, err := s.clientBackend.Receive()
 		
-		// Clear deadline (Active State)
 		s.clientConn.SetReadDeadline(time.Time{})
 
 		if err != nil {
 			if err != io.EOF && err != io.ErrUnexpectedEOF {
-				log.Printf("Client read error: %v", err)
+				s.logger.Error("Client read error", "error", err)
 			}
 			return err
 		}
@@ -253,7 +240,7 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 
 			rewrittenSQL, err := ast.ApplyRules(v.Query, s.rules)
 			if err != nil {
-				log.Printf("[BLOCKED] Agent %s attempted: %s\nReason: %v", clientID, v.Query, err)
+				s.logger.Error("Policy violation", "client", clientID, "query", v.Query, "error", err)
 				
 				clientWriteCh <- &pgproto3.ErrorResponse{
 					Severity: "ERROR",
@@ -264,7 +251,7 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 				continue
 			}
 
-			log.Printf("[ALLOWED] SQL: %s", rewrittenSQL)
+			s.logger.Info("Query forwarded", "client", clientID, "query", rewrittenSQL)
 			v.Query = rewrittenSQL
 			s.upstreamFrontend.Send(v)
 
@@ -282,8 +269,7 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 
 		case *pgproto3.Sync:
 			if s.errorDiscard.Load() {
-				// Recover from discard
-				s.errorDiscard.Store(false) // reset FIRST
+				s.errorDiscard.Store(false)
 				clientWriteCh <- &pgproto3.ReadyForQuery{TxStatus: 'I'}
 			} else {
 				s.upstreamFrontend.Send(v)
@@ -292,7 +278,7 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 		case *pgproto3.Query:
 			rewrittenSQL, err := ast.ApplyRules(v.String, s.rules)
 			if err != nil {
-				log.Printf("[BLOCKED SimpleQuery] Agent %s attempted: %s\nReason: %v", clientID, v.String, err)
+				s.logger.Error("Policy violation", "client", clientID, "query", v.String, "error", err)
 				clientWriteCh <- &pgproto3.ErrorResponse{
 					Severity: "ERROR",
 					Message:  fmt.Sprintf("AgentIAM Policy Violation: %v", err),
@@ -300,7 +286,7 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 				clientWriteCh <- &pgproto3.ReadyForQuery{TxStatus: 'I'}
 				continue
 			}
-			log.Printf("[ALLOWED SimpleQuery] SQL: %s", rewrittenSQL)
+			s.logger.Info("Query forwarded", "client", clientID, "query", rewrittenSQL)
 			v.String = rewrittenSQL
 			s.upstreamFrontend.Send(v)
 
