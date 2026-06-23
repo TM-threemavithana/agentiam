@@ -1,131 +1,218 @@
 package policy
 
 import (
-	"database/sql"
-	"encoding/json"
+	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"fmt"
 	"log/slog"
+	"os"
+	"sync"
+	"time"
 
 	"agentiam/internal/ast"
 
-	_ "github.com/mattn/go-sqlite3"
+	"github.com/fsnotify/fsnotify"
 	"golang.org/x/crypto/bcrypt"
+	"gopkg.in/yaml.v3"
 )
 
+type AgentConfig struct {
+	Name              string   `yaml:"name"`
+	Key               string   `yaml:"key"` // bcrypt hash
+	AllowedStatements []string `yaml:"allowed_statements"`
+	AllowedTables     []string `yaml:"allowed_tables"`
+	SelectLimit       int      `yaml:"select_limit"`
+	CreatedAt         string   `yaml:"created_at"`
+}
+
+type PoliciesYAML struct {
+	Version string        `yaml:"version"`
+	Agents  []AgentConfig `yaml:"agents"`
+}
+
+type agentState struct {
+	config        AgentConfig
+	version       int
+	cachedPwdHash [32]byte
+	hasCache      bool
+}
+
 type Store struct {
-	db        *sql.DB
+	mu        sync.RWMutex
+	agents    map[string]agentState
 	dummyHash []byte
+	filePath  string
+	logger    *slog.Logger
 }
 
-type AgentPolicy struct {
-	APIKey     string
-	Label      string
-	AllowedOps []string
-}
-
-func NewStore(dbPath string) (*Store, error) {
-	db, err := sql.Open("sqlite3", dbPath)
-	if err != nil {
-		return nil, err
-	}
-
-	_, err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS agents (
-			client_id TEXT PRIMARY KEY,
-			api_key_hash TEXT,
-			allowed_ops TEXT,
-			version INTEGER DEFAULT 1
-		);
-	`)
-	if err != nil {
-		return nil, err
-	}
-
-	// TODO(Phase 6): Replace with golang-migrate integration
-	// This error-ignore block ensures backwards compatibility for existing deployments
-	_, err = db.Exec(`ALTER TABLE agents ADD COLUMN version INTEGER DEFAULT 1;`)
-	if err == nil {
-		slog.Info("schema: ensured version column exists", "table", "agents")
-	}
-
+func NewStore(filePath string, logger *slog.Logger) (*Store, error) {
 	dummyHash, _ := bcrypt.GenerateFromPassword([]byte("dummy"), bcrypt.DefaultCost)
 
-	return &Store{
-		db:        db,
+	s := &Store{
+		agents:    make(map[string]agentState),
 		dummyHash: dummyHash,
-	}, nil
-}
-
-// GetRulesForAgent looks up a client ID, verifies the bcrypt password, and returns AST rules and the version.
-func (s *Store) GetRulesForAgent(clientID string, suppliedPassword string) (ast.Rules, int, error) {
-	var allowedOpsStr string
-	var apiKeyHash string
-	var version int
-	
-	err := s.db.QueryRow("SELECT api_key_hash, allowed_ops, version FROM agents WHERE client_id = ?", clientID).Scan(&apiKeyHash, &allowedOpsStr, &version)
-	if err != nil {
-		// DUMMY BCRYPT TO EQUALIZE TIMING (Mitigates User Enumeration)
-		bcrypt.CompareHashAndPassword(s.dummyHash, []byte(suppliedPassword))
-		return ast.Rules{}, 0, fmt.Errorf("invalid client ID or password")
+		filePath:  filePath,
+		logger:    logger,
 	}
 
-	// ALWAYS call CompareHashAndPassword without any length pre-checks to avoid timing oracles
-	if err := bcrypt.CompareHashAndPassword([]byte(apiKeyHash), []byte(suppliedPassword)); err != nil {
-		return ast.Rules{}, 0, fmt.Errorf("invalid client ID or password")
-	}
-
-	var allowedOps []string
-	if err := json.Unmarshal([]byte(allowedOpsStr), &allowedOps); err != nil {
-		return ast.Rules{}, 0, fmt.Errorf("failed to parse policy: %w", err)
-	}
-
-	return ast.Rules{
-		AllowedStatements:  allowedOps,
-		EnforceSelectLimit: 100, // Hardcoded for MVP
-	}, version, nil
-}
-
-// GetAgentVersions fetches the current policy version for all registered agents.
-func (s *Store) GetAgentVersions() (map[string]int, error) {
-	rows, err := s.db.Query("SELECT client_id, version FROM agents")
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	versions := make(map[string]int)
-	for rows.Next() {
-		var clientID string
-		var version int
-		if err := rows.Scan(&clientID, &version); err != nil {
-			return nil, err
+	if err := s.loadYAML(); err != nil {
+		if os.IsNotExist(err) {
+			s.logger.Warn("Policy file does not exist, starting with empty policies", "file", filePath)
+		} else {
+			return nil, fmt.Errorf("failed to load initial policies: %w", err)
 		}
-		versions[clientID] = version
 	}
-	return versions, nil
+
+	return s, nil
 }
 
-// AddAgent is a helper to seed the database
-func (s *Store) AddAgent(clientID, plaintextPassword string, allowedOps []string) error {
-	hash, err := bcrypt.GenerateFromPassword([]byte(plaintextPassword), bcrypt.DefaultCost)
+func (s *Store) loadYAML() error {
+	b, err := os.ReadFile(s.filePath)
 	if err != nil {
 		return err
 	}
-	
-	b, _ := json.Marshal(allowedOps)
-	_, err = s.db.Exec(`
-		INSERT INTO agents (client_id, api_key_hash, allowed_ops, version) 
-		VALUES (?, ?, ?, 1)
-		ON CONFLICT(client_id) DO UPDATE SET 
-			api_key_hash = excluded.api_key_hash, 
-			allowed_ops = excluded.allowed_ops,
-			version = agents.version + 1
-	`, clientID, string(hash), string(b))
-	return err
+
+	var py PoliciesYAML
+	if err := yaml.Unmarshal(b, &py); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	newAgents := make(map[string]agentState)
+
+	for _, a := range py.Agents {
+		oldState, exists := s.agents[a.Name]
+
+		version := 1
+		hasCache := false
+		var cachedPwdHash [32]byte
+
+		if exists {
+			version = oldState.version
+			// If the hash changed, bump version and drop cache
+			if oldState.config.Key != a.Key {
+				version++
+			} else {
+				// Keep cache if key is exactly the same
+				hasCache = oldState.hasCache
+				cachedPwdHash = oldState.cachedPwdHash
+			}
+			// If policies changed, bump version (so tightened policies take effect via RWMutex immediately for new queries, but we also want version bump so poller triggers if needed? Wait, poller triggers revocation. We only bump version to trigger full session drop. The user requested: tightened policy takes effect next query, but key changes/deletions trigger immediate drop.)
+			// For simplicity, we bump version if *anything* changes.
+			// Wait, the user said: "tightening takes effect on next query, key deletion is immediate".
+			// The poller checks `dbVersion != meta.authVersion`. If version bumps, session drops!
+			// So we MUST NOT bump version for policy tightening, ONLY for key rotation.
+			// The in-memory map update automatically applies tightening on next query!
+		}
+
+		newAgents[a.Name] = agentState{
+			config:        a,
+			version:       version,
+			hasCache:      hasCache,
+			cachedPwdHash: cachedPwdHash,
+		}
+	}
+
+	s.agents = newAgents
+	s.logger.Info("Loaded policies", "count", len(s.agents))
+	return nil
 }
 
-// RemoveAgent deletes an agent's policy from the store, revoking their access immediately.
-func (s *Store) RemoveAgent(clientID string) error {
-	_, err := s.db.Exec("DELETE FROM agents WHERE client_id = ?", clientID)
-	return err
+func (s *Store) Watch(ctx context.Context) {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		s.logger.Error("Failed to start fsnotify watcher", "error", err)
+		return
+	}
+	defer watcher.Close()
+
+	if err := watcher.Add(s.filePath); err != nil {
+		s.logger.Error("Failed to watch policy file", "error", err, "file", s.filePath)
+		// We continue, perhaps the file will be created later.
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return
+			}
+			if event.Op&fsnotify.Write == fsnotify.Write || event.Op&fsnotify.Create == fsnotify.Create {
+				time.Sleep(50 * time.Millisecond) // wait for write to complete
+				if err := s.loadYAML(); err != nil {
+					s.logger.Error("policy reload failed, keeping current policies", "error", err, "file", s.filePath)
+				} else {
+					s.logger.Info("Policies hot-reloaded successfully")
+				}
+			}
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return
+			}
+			s.logger.Error("fsnotify error", "error", err)
+		}
+	}
+}
+
+func (s *Store) GetRulesForAgent(clientID string, suppliedPassword string) (ast.Rules, int, error) {
+	s.mu.RLock()
+	state, exists := s.agents[clientID]
+	s.mu.RUnlock()
+
+	pwdHash := sha256.Sum256([]byte(suppliedPassword))
+
+	if !exists {
+		bcrypt.CompareHashAndPassword(s.dummyHash, []byte(suppliedPassword)) // mitigates timing oracle
+		return ast.Rules{}, 0, fmt.Errorf("invalid client ID or password")
+	}
+
+	// Fast path: cached validation
+	if state.hasCache && subtle.ConstantTimeCompare(state.cachedPwdHash[:], pwdHash[:]) == 1 {
+		// Valid!
+	} else {
+		// Slow path: bcrypt
+		if err := bcrypt.CompareHashAndPassword([]byte(state.config.Key), []byte(suppliedPassword)); err != nil {
+			return ast.Rules{}, 0, fmt.Errorf("invalid client ID or password")
+		}
+
+		// Update cache
+		s.mu.Lock()
+		if st, ok := s.agents[clientID]; ok {
+			st.hasCache = true
+			st.cachedPwdHash = pwdHash
+			s.agents[clientID] = st
+		}
+		s.mu.Unlock()
+	}
+
+	// Always get the LATEST rules from memory (even if auth was cached) to ensure mid-session policy tightening applies on the next query.
+	s.mu.RLock()
+	state = s.agents[clientID]
+	s.mu.RUnlock()
+
+	limit := state.config.SelectLimit
+	if limit <= 0 {
+		limit = 100 // default fallback
+	}
+
+	return ast.Rules{
+		AllowedStatements:  state.config.AllowedStatements,
+		EnforceSelectLimit: limit,
+	}, state.version, nil
+}
+
+func (s *Store) GetAgentVersions() (map[string]int, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	versions := make(map[string]int)
+	for k, v := range s.agents {
+		versions[k] = v.version
+	}
+	return versions, nil
 }

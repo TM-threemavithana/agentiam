@@ -9,9 +9,14 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"fmt"
 	"io"
+	"log/slog"
 	"math/big"
 	"net"
+	"os"
+
+	"golang.org/x/crypto/bcrypt"
 	"net/url"
 	"testing"
 	"time"
@@ -68,14 +73,20 @@ func setupTestEnv(t *testing.T) (string, string, func()) {
 	}
 
 	// 2. Setup Policy Store
-	store, err := policy.NewStore("file::memory:?cache=shared")
+	hash, _ := bcrypt.GenerateFromPassword([]byte("test-agent-secret"), bcrypt.DefaultCost)
+	yamlContent := fmt.Sprintf(`agents:
+  - name: test-agent
+    key: "%s"
+    allowed_statements:
+      - "SELECT"
+`, string(hash))
+	tmpFile, _ := os.CreateTemp("", "policies-*.yaml")
+	tmpFile.Write([]byte(yamlContent))
+	tmpFile.Close()
+	defer os.Remove(tmpFile.Name())
+	store, err := policy.NewStore(tmpFile.Name(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("failed to create policy store: %v", err)
-	}
-	// "test-agent" can only SELECT
-	err = store.AddAgent("test-agent", "test-agent-secret", []string{"SELECT"})
-	if err != nil {
-		t.Fatalf("failed to add agent: %v", err)
 	}
 
 	// 3. Start Proxy Server
@@ -260,12 +271,12 @@ func generateTestTLSConfig(t *testing.T) *tls.Config {
 		t.Fatalf("failed to generate key: %v", err)
 	}
 	template := x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{Organization: []string{"Acme Co"}},
-		NotBefore:    time.Now(),
-		NotAfter:     time.Now().Add(time.Hour),
-		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{Organization: []string{"Acme Co"}},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
 	}
 	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
@@ -290,9 +301,19 @@ func TestTLSUpgradeAndEnforcement(t *testing.T) {
 	ctx := context.Background()
 
 	// 1. Setup minimal upstream (we mock the upstream just to test proxy handshake)
-	store, _ := policy.NewStore("file::memory:?cache=shared")
-	store.AddAgent("test-agent", "secret", []string{"SELECT"})
-	
+	hash, _ := bcrypt.GenerateFromPassword([]byte("secret"), bcrypt.DefaultCost)
+	yamlContent := fmt.Sprintf(`agents:
+  - name: test-agent
+    key: "%s"
+    allowed_statements:
+      - "SELECT"
+`, string(hash))
+	tmpFile, _ := os.CreateTemp("", "policies-*.yaml")
+	tmpFile.Write([]byte(yamlContent))
+	tmpFile.Close()
+	defer os.Remove(tmpFile.Name())
+	store, _ := policy.NewStore(tmpFile.Name(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to listen: %v", err)
@@ -300,7 +321,7 @@ func TestTLSUpgradeAndEnforcement(t *testing.T) {
 	defer l.Close()
 
 	tlsConfig := generateTestTLSConfig(t)
-	
+
 	// Create a dummy upstream listener to simulate Postgres answering
 	upstreamL, _ := net.Listen("tcp", "127.0.0.1:0")
 	defer upstreamL.Close()
@@ -344,7 +365,7 @@ func TestTLSUpgradeAndEnforcement(t *testing.T) {
 		// Startup message without SSLRequest
 		// Length (25 bytes), Protocol (196608), "user\0test-agent\0\0"
 		startupMsg := []byte{0, 0, 0, 25, 0, 3, 0, 0, 'u', 's', 'e', 'r', 0, 't', 'e', 's', 't', '-', 'a', 'g', 'e', 'n', 't', 0, 0}
-		
+
 		_, err = conn.Write(startupMsg)
 		if err != nil {
 			t.Fatalf("Failed to write plaintext StartupMessage: %v", err)
@@ -357,7 +378,7 @@ func TestTLSUpgradeAndEnforcement(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to read proxy response: %v", err)
 		}
-		
+
 		// Ensure it's an ErrorResponse ('E')
 		if n == 0 || resp[0] != 'E' {
 			t.Fatalf("Expected ErrorResponse 'E', got %v", resp[:n])
@@ -369,7 +390,7 @@ func TestTLSUpgradeAndEnforcement(t *testing.T) {
 		// DSN with sslmode=require (skips cert verification but enforces TLS)
 		proxyURL, _ := url.Parse("postgres://" + addr + "/testdb?sslmode=require")
 		proxyURL.User = url.UserPassword("test-agent", "secret")
-		
+
 		cfg, err := pgx.ParseConfig(proxyURL.String())
 		if err != nil {
 			t.Fatalf("failed to parse config: %v", err)
@@ -378,17 +399,58 @@ func TestTLSUpgradeAndEnforcement(t *testing.T) {
 		cfg.Config.TLSConfig = &tls.Config{InsecureSkipVerify: true}
 
 		conn, err := pgx.ConnectConfig(ctx, cfg)
-		
+
 		// If the proxy correctly parsed TLS and passed the auth phase, it will try to dial the dummy upstream.
 		// Since the dummy upstream immediately closes, pgx will return an error, but NOT a TLS or Auth error.
 		if err == nil {
 			conn.Close(ctx)
 		} else {
-			// We expect EOF or connection reset from the dummy upstream closing the connection, 
+			// We expect EOF or connection reset from the dummy upstream closing the connection,
 			// which proves the proxy successfully completed its TLS handshake and authenticated the user.
 			if err.Error() == "FATAL: SSL connection is required" {
 				t.Fatalf("Proxy rejected secure connection!")
 			}
+		}
+	})
+
+	t.Run("TLS_Downgrade_Attack", func(t *testing.T) {
+		c, err := net.DialTimeout("tcp", addr, 2*time.Second)
+		if err != nil {
+			t.Fatalf("Failed to dial: %v", err)
+		}
+		defer c.Close()
+
+		// Send SSLRequest: length (8), code (80877103)
+		sslReq := []byte{0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f}
+		c.Write(sslReq)
+
+		// Expect 'S'
+		resp := make([]byte, 1)
+		c.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, err := c.Read(resp)
+		if err != nil || n != 1 || resp[0] != 'S' {
+			t.Fatalf("Expected 'S', got %v (err: %v)", resp, err)
+		}
+
+		// Send Plaintext StartupMessage instead of ClientHello
+		// Length (33 bytes), Protocol (196608), "user\0test-agent\0database\0testdb\0\0"
+		startupMsg := []byte{
+			0, 0, 0, 33, // length
+			0, 3, 0, 0, // protocol 3.0
+			'u', 's', 'e', 'r', 0,
+			't', 'e', 's', 't', '-', 'a', 'g', 'e', 'n', 't', 0,
+			'd', 'a', 't', 'a', 'b', 'a', 's', 'e', 0,
+			't', 'e', 's', 't', 'd', 'b', 0,
+			0, // terminator
+		}
+		c.Write(startupMsg)
+
+		// Expect proxy to forcefully close the connection during handshake failure
+		c.SetReadDeadline(time.Now().Add(2 * time.Second))
+		buf := make([]byte, 1024)
+		_, err = c.Read(buf)
+		if err == nil {
+			t.Fatalf("Expected proxy to close connection on plaintext downgrade, but connection stayed open")
 		}
 	})
 }

@@ -3,7 +3,9 @@ package proxy
 import (
 	"agentiam/internal/policy"
 	"io"
+	"log/slog"
 	"net"
+	"os"
 	"runtime"
 	"sync"
 	"testing"
@@ -11,11 +13,15 @@ import (
 )
 
 func TestMaxConnectionsAndGoroutineCleanup(t *testing.T) {
-	store, _ := policy.NewStore(":memory:")
+	tmpFile, _ := os.CreateTemp("", "policies-*.yaml")
+	tmpFile.Write([]byte("agents:\n  - name: dummy\n    key: dummy\n"))
+	tmpFile.Close()
+	defer os.Remove(tmpFile.Name())
+	store, _ := policy.NewStore(tmpFile.Name(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	logger := NewLogger(io.Discard)
 	// We use a dummy upstream DSN since we won't actually dial it for rejected connections
 	server := NewServer("127.0.0.1:0", "postgres://dummy", store, nil, logger)
-	
+
 	// Force max connections to 5 for testing
 	server.maxConns = 5
 	server.sem = make(chan struct{}, 5)
@@ -48,7 +54,7 @@ func TestMaxConnectionsAndGoroutineCleanup(t *testing.T) {
 	}()
 
 	addr := l.Addr().String()
-	
+
 	// Wait a bit to ensure stable baseline
 	time.Sleep(100 * time.Millisecond)
 	baselineGoroutines := runtime.NumGoroutine()
@@ -91,7 +97,7 @@ func TestMaxConnectionsAndGoroutineCleanup(t *testing.T) {
 	// Wait briefly to allow the rejected connection's goroutine cleanup (if any) to happen.
 	// Since we rejected it synchronously before spawning a goroutine, NumGoroutine shouldn't have spiked permanently.
 	time.Sleep(100 * time.Millisecond)
-	
+
 	// Close all valid connections to trigger teardown of their goroutines
 	for _, c := range conns {
 		c.Close()
@@ -99,9 +105,9 @@ func TestMaxConnectionsAndGoroutineCleanup(t *testing.T) {
 
 	// Wait for all teardown to complete
 	time.Sleep(200 * time.Millisecond)
-	
+
 	finalGoroutines := runtime.NumGoroutine()
-	
+
 	// Final count should equal baseline (or very close, accounting for Go's internal runtime noise)
 	// We allow a small tolerance, but if it leaked 5*3=15 goroutines, it would be a major failure.
 	if finalGoroutines > baselineGoroutines+2 {
@@ -110,7 +116,11 @@ func TestMaxConnectionsAndGoroutineCleanup(t *testing.T) {
 }
 
 func TestStartupIterationLimit(t *testing.T) {
-	store, _ := policy.NewStore(":memory:")
+	tmpFile, _ := os.CreateTemp("", "policies-*.yaml")
+	tmpFile.Write([]byte("agents:\n  - name: dummy\n    key: dummy\n"))
+	tmpFile.Close()
+	defer os.Remove(tmpFile.Name())
+	store, _ := policy.NewStore(tmpFile.Name(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	// Use a dummy upstream DSN since we only care about the startup phase
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

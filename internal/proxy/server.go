@@ -83,7 +83,7 @@ func (s *Server) pollPolicyUpdates() {
 			interval = d
 		}
 	}
-	
+
 	s.logger.Info("Starting policy revocation poller", "interval", interval.String())
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()

@@ -1,6 +1,9 @@
 package main
 
 import (
+	"context"
+	"crypto/tls"
+	"fmt"
 	"log"
 	"os"
 
@@ -19,31 +22,57 @@ func main() {
 		listenPort = "5433"
 	}
 
-	dbPath := os.Getenv("AGENTIAM_POLICY_DB_PATH")
-	if dbPath == "" {
-		dbPath = "./agentiam.db"
-	}
-
-	store, err := policy.NewStore(dbPath)
-	if err != nil {
-		log.Fatalf("Failed to initialize policy store: %v", err)
+	policyFile := os.Getenv("AGENTIAM_POLICY_FILE")
+	if policyFile == "" {
+		policyFile = "./policies.yaml"
 	}
 
 	// Initialize structured logger
 	logger := proxy.NewLogger(os.Stdout)
 
-	// For demonstration purposes, seed the database with a test agent API key
-	// that allows SELECT, INSERT, CREATE, and TRUNCATE, but blocks DELETE.
-	err = store.AddAgent("test-agent-key", "Test Agent", []string{"SELECT", "INSERT", "CREATE", "TRUNCATE"})
+	store, err := policy.NewStore(policyFile, logger.Logger)
 	if err != nil {
-		log.Fatalf("Failed to seed test agent: %v", err)
+		log.Fatalf("Failed to initialize policy store: %v", err)
 	}
-	logger.Info("Seeded test agent with policy: SELECT, INSERT, CREATE, TRUNCATE", "agent", "test-agent-key")
 
-	srv := proxy.NewServer(":"+listenPort, upstreamDSN, store, nil, logger)
+	// Start the fsnotify hot-reload watcher
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go store.Watch(ctx)
+
+	tlsConfig, err := loadTLSConfig(logger)
+	if err != nil {
+		log.Fatalf("Failed to initialize TLS: %v", err)
+	}
+
+	srv := proxy.NewServer(":"+listenPort, upstreamDSN, store, tlsConfig, logger)
 	logger.Info("AgentIAM starting...", "port", listenPort)
 	if err := srv.Start(); err != nil {
 		logger.Error("Proxy server failed", "error", err)
 		os.Exit(1)
 	}
+}
+
+func loadTLSConfig(logger *proxy.Logger) (*tls.Config, error) {
+	certFile := os.Getenv("AGENTIAM_TLS_CERT")
+	keyFile := os.Getenv("AGENTIAM_TLS_KEY")
+
+	if certFile != "" && keyFile != "" {
+		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load TLS pair: %w", err)
+		}
+		return &tls.Config{Certificates: []tls.Certificate{cert}}, nil
+	}
+
+	if os.Getenv("AGENTIAM_DEV_MODE") == "true" {
+		logger.Warn("TLS: using ephemeral self-signed cert — not for production")
+		cert, err := proxy.GenerateEphemeralCert()
+		if err != nil {
+			return nil, err
+		}
+		return &tls.Config{Certificates: []tls.Certificate{cert}}, nil
+	}
+
+	return nil, nil
 }

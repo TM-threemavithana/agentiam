@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: testdb
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Install CGO dependencies
+        run: sudo apt-get install -y build-essential
+
+      - name: Verify module
+        run: go mod tidy && git diff --exit-code go.sum
+
+      - name: Lint
+        run: |
+          go fmt ./...
+          git diff --exit-code
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: go test -v -race -timeout 120s ./...
+        env:
+          AGENTIAM_TEST_DB_DSN: postgres://postgres:postgres@localhost:5432/testdb?sslmode=disable

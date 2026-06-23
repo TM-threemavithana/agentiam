@@ -2,10 +2,13 @@ package ast
 
 import (
 	"fmt"
+	"reflect"
 	"strings"
 
 	pg_query "github.com/pganalyze/pg_query_go/v5"
 )
+
+var ErrComplexityExceeded = fmt.Errorf("Policy Violation: Maximum AST complexity exceeded")
 
 // ApplyRules parses the SQL, checks against the rules, and returns the potentially modified SQL (e.g. with LIMIT appended).
 func ApplyRules(sql string, rules Rules) (string, error) {
@@ -15,7 +18,7 @@ func ApplyRules(sql string, rules Rules) (string, error) {
 	}
 
 	for _, stmt := range tree.Stmts {
-		err = enforceRules(stmt.Stmt, rules)
+		err = enforceRules(stmt.Stmt, rules, 0)
 		if err != nil {
 			return "", err
 		}
@@ -28,17 +31,21 @@ func ApplyRules(sql string, rules Rules) (string, error) {
 	return deparsed, nil
 }
 
-func enforceRules(node *pg_query.Node, rules Rules) error {
+func enforceRules(node *pg_query.Node, rules Rules, depth int) error {
+	if depth > 50 {
+		return ErrComplexityExceeded
+	}
+
 	if len(rules.AllowedStatements) == 0 {
 		return fmt.Errorf("policy has no allowed statements")
 	}
 
-	var withClause *pg_query.WithClause
-
+	// Policy Checking for Statements
+	// We only strictly deny if the node is a Statement type and not allowed.
+	// We check this via the switch, and a fallback check for '*Stmt' suffix.
 	switch n := node.Node.(type) {
 	case *pg_query.Node_SelectStmt:
 		sel := n.SelectStmt
-		withClause = sel.WithClause
 		if len(sel.LockingClause) > 0 {
 			return fmt.Errorf("SELECT ... FOR UPDATE/SHARE is not allowed by policy")
 		}
@@ -84,17 +91,14 @@ func enforceRules(node *pg_query.Node, rules Rules) error {
 			}
 		}
 	case *pg_query.Node_InsertStmt:
-		withClause = n.InsertStmt.WithClause
 		if !isAllowed("INSERT", rules.AllowedStatements) {
 			return fmt.Errorf("INSERT statements are not allowed by policy")
 		}
 	case *pg_query.Node_UpdateStmt:
-		withClause = n.UpdateStmt.WithClause
 		if !isAllowed("UPDATE", rules.AllowedStatements) {
 			return fmt.Errorf("UPDATE statements are not allowed by policy")
 		}
 	case *pg_query.Node_DeleteStmt:
-		withClause = n.DeleteStmt.WithClause
 		if !isAllowed("DELETE", rules.AllowedStatements) {
 			return fmt.Errorf("DELETE statements are not allowed by policy")
 		}
@@ -119,6 +123,10 @@ func enforceRules(node *pg_query.Node, rules Rules) error {
 		return nil
 	case *pg_query.Node_VariableSetStmt:
 		return fmt.Errorf("SET statements are not allowed by policy")
+	case *pg_query.Node_VariableShowStmt:
+		if !isAllowed("SHOW", rules.AllowedStatements) {
+			return fmt.Errorf("SHOW statements are not allowed by policy")
+		}
 	case *pg_query.Node_ExplainStmt:
 		for _, opt := range n.ExplainStmt.Options {
 			if defElem, ok := opt.Node.(*pg_query.Node_DefElem); ok && defElem.DefElem.Defname == "analyze" {
@@ -134,21 +142,67 @@ func enforceRules(node *pg_query.Node, rules Rules) error {
 			}
 		}
 		// Pure EXPLAIN or EXPLAIN (ANALYZE false)
-		return enforceRules(n.ExplainStmt.Query, rules)
+		// It will be recursed automatically below
 	default:
-		return fmt.Errorf("statement type %T is not allowed by policy (Default Deny)", n)
-	}
-
-	if withClause != nil {
-		for _, cte := range withClause.Ctes {
-			if cteNode, ok := cte.Node.(*pg_query.Node_CommonTableExpr); ok {
-				if err := enforceRules(cteNode.CommonTableExpr.Ctequery, rules); err != nil {
-					return err
-				}
-			}
+		// To maintain strict deny, we only deny if the node is a recognized statement type that we haven't explicitly allowed above.
+		if strings.HasSuffix(fmt.Sprintf("%T", n), "Stmt") {
+			return fmt.Errorf("statement type %T is not allowed by policy (Default Deny)", n)
 		}
 	}
 
+	// Recurse into all child nodes generically to enforce complexity limits and find nested statements
+	return walkChildren(node.Node, rules, depth+1)
+}
+
+func walkChildren(v interface{}, rules Rules, depth int) error {
+	if v == nil {
+		return nil
+	}
+	val := reflect.ValueOf(v)
+	if !val.IsValid() {
+		return nil
+	}
+	if val.Kind() == reflect.Ptr || val.Kind() == reflect.Interface {
+		if val.IsNil() {
+			return nil
+		}
+		return walkChildren(val.Elem().Interface(), rules, depth)
+	}
+
+	if val.Kind() == reflect.Struct {
+		for i := 0; i < val.NumField(); i++ {
+			field := val.Field(i)
+			if !field.CanInterface() {
+				continue
+			}
+			if field.Kind() == reflect.Ptr && !field.IsNil() {
+				if n, ok := field.Interface().(*pg_query.Node); ok {
+					if err := enforceRules(n, rules, depth); err != nil {
+						return err
+					}
+					continue
+				}
+			}
+			if err := walkChildren(field.Interface(), rules, depth); err != nil {
+				return err
+			}
+		}
+	} else if val.Kind() == reflect.Slice {
+		for i := 0; i < val.Len(); i++ {
+			elem := val.Index(i)
+			if elem.Kind() == reflect.Ptr && !elem.IsNil() {
+				if n, ok := elem.Interface().(*pg_query.Node); ok {
+					if err := enforceRules(n, rules, depth); err != nil {
+						return err
+					}
+					continue
+				}
+			}
+			if err := walkChildren(elem.Interface(), rules, depth); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 

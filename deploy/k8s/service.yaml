@@ -1,0 +1,21 @@
+# deploy/k8s/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: agentiam
+  namespace: agentiam
+  labels:
+    app: agentiam
+spec:
+  type: ClusterIP
+  selector:
+    app: agentiam
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+      protocol: TCP
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+      protocol: TCP

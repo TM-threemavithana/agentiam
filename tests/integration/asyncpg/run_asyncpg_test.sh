@@ -18,5 +18,15 @@ echo "Running asyncpg Python integration tests (including PgBouncer concurrency)
 # Connect to AgentIAM, which listens on 5432 (mapped from docker compose)
 /tmp/venv/bin/python test_asyncpg.py postgres://test-agent-key:Test%20Agent@127.0.0.1:5432/agentiam?sslmode=disable
 
-echo "Tests passed! Cleaning up stack..."
+echo "Tests passed!"
+
+echo "Verifying network isolation..."
+if docker compose exec -T agentiam sh -c 'nc -z -w 2 postgres 5432 2>/dev/null'; then
+  echo "FAIL: AgentIAM can reach postgres directly (bypassing PgBouncer)!"
+  exit 1
+else
+  echo "SUCCESS: AgentIAM is isolated from postgres."
+fi
+
+echo "Cleaning up stack..."
 docker compose down

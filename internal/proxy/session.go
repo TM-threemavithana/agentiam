@@ -141,7 +141,7 @@ func (s *Session) Run() error {
 		s.clientBackend.Send(&pgproto3.ErrorResponse{Severity: "FATAL", Message: "Failed to dial upstream database"})
 		return fmt.Errorf("upstream dial failed: %w", err)
 	}
-	
+
 	hijacked, err := pgConn.Hijack()
 	if err != nil {
 		return fmt.Errorf("failed to hijack upstream conn: %w", err)
@@ -154,13 +154,13 @@ func (s *Session) Run() error {
 	for k, v := range hijacked.ParameterStatuses {
 		s.clientBackend.Send(&pgproto3.ParameterStatus{Name: k, Value: v})
 	}
-	
+
 	secretKeyUint := uint32(0)
 	if len(hijacked.SecretKey) >= 4 {
 		secretKeyUint = uint32(hijacked.SecretKey[0])<<24 | uint32(hijacked.SecretKey[1])<<16 | uint32(hijacked.SecretKey[2])<<8 | uint32(hijacked.SecretKey[3])
 	}
 	s.clientBackend.Send(&pgproto3.BackendKeyData{ProcessID: hijacked.PID, SecretKey: secretKeyUint})
-	
+
 	s.clientBackend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
 
 	return s.proxyLoop(ctx, cancel, clientID)
@@ -216,7 +216,7 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 	for {
 		s.clientConn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 		msg, err := s.clientBackend.Receive()
-		
+
 		s.clientConn.SetReadDeadline(time.Time{})
 
 		if err != nil {
@@ -241,12 +241,12 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 			rewrittenSQL, err := ast.ApplyRules(v.Query, s.rules)
 			if err != nil {
 				s.logger.Error("Policy violation", "client", clientID, "query", v.Query, "error", err)
-				
+
 				clientWriteCh <- &pgproto3.ErrorResponse{
 					Severity: "ERROR",
 					Message:  fmt.Sprintf("AgentIAM Policy Violation: %v", err),
 				}
-				
+
 				s.errorDiscard.Store(true)
 				continue
 			}
@@ -274,7 +274,7 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 			} else {
 				s.upstreamFrontend.Send(v)
 			}
-		
+
 		case *pgproto3.Query:
 			rewrittenSQL, err := ast.ApplyRules(v.String, s.rules)
 			if err != nil {

@@ -93,6 +93,26 @@ async def test_multiplexing_scale(dsn, num_clients=100):
     await asyncio.gather(*(fast_query() for _ in range(num_clients)))
     print("Multiplexing scale test passed.")
 
+async def test_deep_nesting(dsn):
+    print("Running deep nesting DoS test (100 sequential CTEs)...")
+    conn = await asyncpg.connect(dsn)
+    try:
+        ctes = ["cte_0 AS (SELECT 1 as val)"]
+        for i in range(1, 100):
+            ctes.append(f"cte_{i} AS (SELECT * FROM cte_{i-1})")
+        
+        query = "WITH " + ", ".join(ctes) + " SELECT * FROM cte_99"
+        
+        try:
+            await conn.execute(query)
+            assert False, "Expected deep nesting query to be blocked!"
+        except asyncpg.exceptions.PostgresError as e:
+            if "Maximum AST complexity exceeded" not in str(e):
+                raise e
+            print("Successfully blocked deep nesting DoS attempt.")
+    finally:
+        await conn.close()
+
 async def main():
     if len(sys.argv) < 2:
         print("Usage: test_asyncpg.py <dsn>")
@@ -100,6 +120,7 @@ async def main():
     dsn = sys.argv[1]
     
     await test_auth(dsn)
+    await test_deep_nesting(dsn)
     await test_transaction_isolation(dsn, 50)
     await test_multiplexing_scale(dsn, 100)
     print("All tests passed!")

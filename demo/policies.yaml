@@ -1,0 +1,13 @@
+version: "1"
+agents:
+  - name: "langchain-bot"
+    key: "$2a$10$zmUdNg9T6RWlvx8e9CVpZeSNtYkUQUjRhSfXazCmATEMNyevxybbe" # Hash for "test-agent-key"
+    allowed_statements:
+      - SELECT
+      - SHOW
+    allowed_tables:
+      - users
+      - orders
+      - information_schema.tables
+      - information_schema.columns
+    select_limit: 100

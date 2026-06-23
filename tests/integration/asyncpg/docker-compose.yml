@@ -21,8 +21,8 @@ services:
     entrypoint: ["pgbouncer", "/etc/pgbouncer/pgbouncer.ini"]
     user: postgres
     volumes:
-      - ./deploy/pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
-      - ./deploy/pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+      - ./pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -31,7 +31,9 @@ services:
       - backend
 
   agentiam:
-    build: .
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
     environment:
       - AGENTIAM_LISTEN_PORT=5432
       - AGENTIAM_UPSTREAM_DSN=postgres://postgres:postgres@pgbouncer:6432/agentiam?sslmode=disable

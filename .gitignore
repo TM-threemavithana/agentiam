@@ -1,0 +1,45 @@
+# Compiled binaries
+agentiam
+agentiamctl
+agentiam.exe
+agentiamctl.exe
+*.exe
+
+# Build output
+/dist/
+/build/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+demo/__pycache__/
+
+# Development scratch
+*.db
+agentiam.db
+genhash.go
+test_walk.go
+commit.txt
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment files (never commit real secrets)
+.env
+demo/.env
+
+# Test artifacts
+coverage.out
+*.test
+
+# Local documentation
+docs/

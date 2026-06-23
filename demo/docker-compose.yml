@@ -1,0 +1,94 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: app_user
+      POSTGRES_PASSWORD: supersecretpassword
+      POSTGRES_DB: postgres
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app_user -d postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+    networks:
+      - backend
+
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    environment:
+      DB_USER: app_user
+      DB_PASSWORD: supersecretpassword
+      DB_HOST: postgres
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: 10000
+      DEFAULT_POOL_SIZE: 50
+      AUTH_TYPE: md5
+      AUTH_FILE: /etc/pgbouncer/userlist.txt
+      IGNORE_STARTUP_PARAMETERS: extra_float_digits
+      SERVER_RESET_QUERY: DISCARD ALL
+    volumes:
+      - ./userlist.txt:/etc/pgbouncer/userlist.txt:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U app_user -d postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+    networks:
+      - backend
+      - proxy_net
+
+  agentiam:
+    build:
+      context: .. # Build from root so we can access AgentIAM source
+      dockerfile: Dockerfile
+    environment:
+      - AGENTIAM_LISTEN_PORT=5432
+      - AGENTIAM_UPSTREAM_DSN=postgres://app_user:supersecretpassword@pgbouncer:5432/postgres?sslmode=disable
+      - AGENTIAM_POLICY_FILE=/etc/agentiam/policies.yaml
+      - AGENTIAM_POLL_INTERVAL=5s
+      - AGENTIAM_METRICS_PORT=9090
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./policies.yaml:/etc/agentiam/policies.yaml:ro
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9090/metrics || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+    networks:
+      - proxy_net
+      - frontend
+
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - AGENTIAM_DEMO_MOCK=${AGENTIAM_DEMO_MOCK:-false}
+    depends_on:
+      agentiam:
+        condition: service_healthy
+    networks:
+      - frontend
+    restart: "no"
+
+networks:
+  frontend:
+    driver: bridge
+  proxy_net:
+    driver: bridge
+  backend:
+    driver: bridge
+    internal: true

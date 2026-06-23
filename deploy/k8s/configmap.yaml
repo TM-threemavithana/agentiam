@@ -1,0 +1,24 @@
+# deploy/k8s/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agentiam-config
+  namespace: agentiam
+data:
+  pgbouncer.ini: |
+    [databases]
+    * = host=127.0.0.1 port=5432 dbname=postgres
+
+    [pgbouncer]
+    listen_addr = 127.0.0.1
+    listen_port = 6432
+    auth_type = md5
+    auth_file = /etc/pgbouncer/userlist.txt
+    pool_mode = transaction
+    max_client_conn = 10000
+    default_pool_size = 50
+    server_reset_query = DISCARD ALL
+    prepared_statements = 1
+    log_connections = 1
+    log_disconnections = 1
+    log_pooler_errors = 1
