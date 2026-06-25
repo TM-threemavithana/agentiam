@@ -16,7 +16,7 @@ python3 -m venv /tmp/venv
 
 echo "Running asyncpg Python integration tests (including PgBouncer concurrency)..."
 # Connect to AgentIAM, which listens on 5432 (mapped from docker compose)
-/tmp/venv/bin/python test_asyncpg.py postgres://test-agent-key:Test%20Agent@127.0.0.1:5432/agentiam?sslmode=disable
+/tmp/venv/bin/python test_asyncpg.py postgres://test-agent-key:Test%20Agent@127.0.0.1:15432/agentiam?sslmode=disable
 
 echo "Tests passed!"
 

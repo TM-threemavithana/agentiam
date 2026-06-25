@@ -17,40 +17,13 @@ services:
     networks:
       - backend
 
-  pgbouncer:
-    image: edoburu/pgbouncer:latest
-    environment:
-      DB_USER: app_user
-      DB_PASSWORD: supersecretpassword
-      DB_HOST: postgres
-      POOL_MODE: transaction
-      MAX_CLIENT_CONN: 10000
-      DEFAULT_POOL_SIZE: 50
-      AUTH_TYPE: md5
-      AUTH_FILE: /etc/pgbouncer/userlist.txt
-      IGNORE_STARTUP_PARAMETERS: extra_float_digits
-      SERVER_RESET_QUERY: DISCARD ALL
-    volumes:
-      - ./userlist.txt:/etc/pgbouncer/userlist.txt:ro
-    depends_on:
-      postgres:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U app_user -d postgres"]
-      interval: 2s
-      timeout: 5s
-      retries: 10
-    networks:
-      - backend
-      - proxy_net
-
   agentiam:
     build:
       context: .. # Build from root so we can access AgentIAM source
       dockerfile: Dockerfile
     environment:
       - AGENTIAM_LISTEN_PORT=5432
-      - AGENTIAM_UPSTREAM_DSN=postgres://app_user:supersecretpassword@pgbouncer:5432/postgres?sslmode=disable
+      - AGENTIAM_UPSTREAM_DSN=postgres://app_user:supersecretpassword@postgres:5432/postgres?sslmode=disable
       - AGENTIAM_POLICY_FILE=/etc/agentiam/policies.yaml
       - AGENTIAM_POLL_INTERVAL=5s
       - AGENTIAM_METRICS_PORT=9090
@@ -59,7 +32,7 @@ services:
     volumes:
       - ./policies.yaml:/etc/agentiam/policies.yaml:ro
     depends_on:
-      pgbouncer:
+      postgres:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9090/metrics || exit 1"]
@@ -67,7 +40,7 @@ services:
       timeout: 5s
       retries: 10
     networks:
-      - proxy_net
+      - backend
       - frontend
 
   agent:
@@ -86,8 +59,6 @@ services:
 
 networks:
   frontend:
-    driver: bridge
-  proxy_net:
     driver: bridge
   backend:
     driver: bridge

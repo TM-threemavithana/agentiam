@@ -1,7 +1,7 @@
 version: "1"
 agents:
   - name: test-agent-key
-    key: "$2a$10$zmUdNg9T6RWlvx8e9CVpZeSNtYkUQUjRhSfXazCmATEMNyevxybbe" # password: Test Agent
+    key: "SCRAM-SHA-256$4096:cmFuZG9tc2FsdA==$6WCMsfOPn/zmNGTc2OKF+1/VOxstymDWrrnfCmXs1XY=:WKUziEL6X6MWU1Zs+5Mgz0Itpi1Ru6ltn4DELdVdI7I=" # password: Test Agent
     allowed_statements:
       - SELECT
       - INSERT

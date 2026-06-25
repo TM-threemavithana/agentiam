@@ -16,37 +16,25 @@ services:
     networks:
       - backend
 
-  pgbouncer:
-    image: edoburu/pgbouncer:latest
-    entrypoint: ["pgbouncer", "/etc/pgbouncer/pgbouncer.ini"]
-    user: postgres
-    volumes:
-      - ./pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
-      - ./pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
-    depends_on:
-      postgres:
-        condition: service_healthy
-    networks:
-      - frontend
-      - backend
-
   agentiam:
     build:
       context: ../../..
       dockerfile: Dockerfile
     environment:
       - AGENTIAM_LISTEN_PORT=5432
-      - AGENTIAM_UPSTREAM_DSN=postgres://postgres:postgres@pgbouncer:6432/agentiam?sslmode=disable
+      - AGENTIAM_UPSTREAM_DSN=postgres://postgres:postgres@postgres:5432/agentiam?sslmode=disable
       - AGENTIAM_POLICY_FILE=/etc/agentiam/policies.yaml
       - AGENTIAM_POLL_INTERVAL=5s
     ports:
-      - "5432:5432"
+      - "15432:5432"
     volumes:
       - ./policies.yaml:/etc/agentiam/policies.yaml:ro
     depends_on:
-      - pgbouncer
+      postgres:
+        condition: service_healthy
     networks:
       - frontend
+      - backend
 
 networks:
   frontend:

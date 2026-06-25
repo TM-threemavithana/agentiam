@@ -34,6 +34,20 @@ var (
 		},
 		[]string{"reason"}, // e.g., forbidden_statement, limit_violation
 	)
+
+	PoolIdleConnections = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "agentiam_pool_idle_connections",
+			Help: "Number of idle connections in the upstream pool.",
+		},
+	)
+
+	PoolTotalConnections = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "agentiam_pool_total_connections",
+			Help: "Total configured size of the upstream pool.",
+		},
+	)
 )
 
 func init() {
@@ -41,4 +55,7 @@ func init() {
 	prometheus.MustRegister(QueriesTotal)
 	prometheus.MustRegister(AuthFailuresTotal)
 	prometheus.MustRegister(BlockedQueriesTotal)
+	prometheus.MustRegister(PoolIdleConnections)
+	prometheus.MustRegister(PoolTotalConnections)
 }
+

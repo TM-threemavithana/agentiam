@@ -1,11 +1,16 @@
 package ast
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"strings"
+	"time"
 
-	lru "github.com/hashicorp/golang-lru/v2"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+
+	"agentiam/internal/cache"
 	pg_query "github.com/pganalyze/pg_query_go/v6"
 	"github.com/wasilibs/go-pgquery/parser"
 	"google.golang.org/protobuf/proto"
@@ -13,18 +18,28 @@ import (
 
 var ErrComplexityExceeded = fmt.Errorf("Policy Violation: Maximum AST complexity exceeded")
 
-var queryCache *lru.Cache[string, string]
+type PostgresParser struct{}
 
-func init() {
-	queryCache, _ = lru.New[string, string](2000)
-}
+// ApplyRules parses the SQL into an AST, checks it against the rules, injects limits, and returns the rewritten SQL.
+func (p *PostgresParser) ApplyRules(sql string, rules Rules, astCache cache.ASTCache) (string, error) {
+	_, span := otel.Tracer("agentiam/ast").Start(context.Background(), "ApplyRules")
+	defer span.End()
 
-// ApplyRules parses the SQL, checks against the rules, and returns the potentially modified SQL (e.g. with LIMIT appended).
-func ApplyRules(sql string, rules Rules) (string, error) {
+	start := time.Now()
+	defer func() {
+		ParsingDuration.Observe(time.Since(start).Seconds())
+	}()
+
 	cacheKey := fmt.Sprintf("%d:%s", rules.EnforceSelectLimit, sql)
-	if cached, ok := queryCache.Get(cacheKey); ok {
-		return cached, nil
+	if astCache != nil {
+		if cached, ok := astCache.Get(cacheKey); ok {
+			AstCacheHitsTotal.Inc()
+			span.SetAttributes(attribute.Bool("cache.hit", true))
+			return cached, nil
+		}
 	}
+	AstCacheMissesTotal.Inc()
+	span.SetAttributes(attribute.Bool("cache.hit", false))
 
 	b, err := parser.ParseToProtobuf(sql)
 	if err != nil {
@@ -51,7 +66,9 @@ func ApplyRules(sql string, rules Rules) (string, error) {
 		return "", fmt.Errorf("failed to deparse SQL: %w", err)
 	}
 
-	queryCache.Add(cacheKey, deparsed)
+	if astCache != nil {
+		astCache.Add(cacheKey, deparsed)
+	}
 	return deparsed, nil
 }
 

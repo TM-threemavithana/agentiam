@@ -97,11 +97,9 @@ async def test_deep_nesting(dsn):
     print("Running deep nesting DoS test (100 sequential CTEs)...")
     conn = await asyncpg.connect(dsn)
     try:
-        ctes = ["cte_0 AS (SELECT 1 as val)"]
+        query = "SELECT 1 as val"
         for i in range(1, 100):
-            ctes.append(f"cte_{i} AS (SELECT * FROM cte_{i-1})")
-        
-        query = "WITH " + ", ".join(ctes) + " SELECT * FROM cte_99"
+            query = f"SELECT * FROM ({query}) AS t_{i}"
         
         try:
             await conn.execute(query)
@@ -123,7 +121,56 @@ async def main():
     await test_deep_nesting(dsn)
     await test_transaction_isolation(dsn, 50)
     await test_multiplexing_scale(dsn, 100)
+    await test_cancellation(dsn)
+    await test_mid_transaction_disconnect(dsn)
     print("All tests passed!")
+
+
+
+async def test_cancellation(dsn):
+    print("Running cancellation test...")
+    conn = await asyncpg.connect(dsn)
+    try:
+        # Expected to be cancelled
+        await conn.execute('SELECT pg_sleep(10)', timeout=1.0)
+        assert False, "Expected timeout/cancellation error"
+    except asyncio.TimeoutError:
+        print("Cancellation successful via timeout.")
+    finally:
+        if not conn.is_closed():
+            await conn.close()
+
+async def test_mid_transaction_disconnect(dsn):
+    print("Running mid-transaction disconnect test...")
+    conn = await asyncpg.connect(dsn)
+    
+    # Start a transaction and mutate state
+    await conn.execute('BEGIN')
+    await conn.execute('CREATE TABLE IF NOT EXISTS disconnect_test (val int)')
+    await conn.execute('INSERT INTO disconnect_test VALUES (1)')
+    
+    # Forcefully close the socket to simulate a crash/disconnect mid-transaction
+    # conn.terminate() abruptly closes the socket without sending a clean terminate message
+    await conn.execute("SELECT pg_sleep(1)") # Wait for the insert to commit? No, it's a transaction
+    
+    # We use loop.call_soon to abruptly terminate it while something is running
+    conn.terminate()
+    
+    # Wait a bit for the proxy to detect EOF and rollback
+    await asyncio.sleep(1)
+    
+    # Open a new connection and verify the table or row doesn't exist (it should have rolled back)
+    conn2 = await asyncpg.connect(dsn)
+    try:
+        # Table might exist if created before, but the row definitely shouldn't be there 
+        # Actually, DDL in postgres is transactional! 
+        val = await conn2.fetchval("SELECT count(*) FROM pg_tables WHERE tablename = 'disconnect_test'")
+        assert val == 0, "Table should not exist because the transaction was rolled back!"
+        print("Mid-transaction disconnect recovery successful.")
+    finally:
+        await conn2.close()
+
 
 if __name__ == '__main__':
     asyncio.run(main())
+

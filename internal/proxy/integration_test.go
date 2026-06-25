@@ -84,7 +84,7 @@ func setupTestEnv(t *testing.T) (string, string, func()) {
 	tmpFile.Write([]byte(yamlContent))
 	tmpFile.Close()
 	defer os.Remove(tmpFile.Name())
-	store, err := policy.NewStore(tmpFile.Name(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	store, err := policy.NewStore(nil, tmpFile.Name(), "", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("failed to create policy store: %v", err)
 	}
@@ -95,8 +95,12 @@ func setupTestEnv(t *testing.T) (string, string, func()) {
 		t.Fatalf("failed to listen: %v", err)
 	}
 
-	logger := proxy.NewLogger(io.Discard)
-	server := proxy.NewServer(l.Addr().String(), upstreamDSN, store, nil, logger)
+	logger := proxy.NewLogger(os.Stdout)
+	handlers := make(map[proxy.ProtocolType]proxy.ProtocolHandler)
+	server := proxy.NewServer(l.Addr().String(), upstreamDSN, store, nil, logger, nil, handlers)
+	pgHandler := proxy.NewPostgresProtocolHandler(upstreamDSN, store, nil, logger, server)
+	server.SetHandler(proxy.ProtocolPostgres, pgHandler)
+	server.InitPool(context.Background())
 	go server.PollPolicyUpdatesForTest()
 
 	go func() {
@@ -312,7 +316,7 @@ func TestTLSUpgradeAndEnforcement(t *testing.T) {
 	tmpFile.Write([]byte(yamlContent))
 	tmpFile.Close()
 	defer os.Remove(tmpFile.Name())
-	store, _ := policy.NewStore(tmpFile.Name(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	store, _ := policy.NewStore(nil, tmpFile.Name(), "", slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -343,8 +347,11 @@ func TestTLSUpgradeAndEnforcement(t *testing.T) {
 				return
 			}
 			go func(c net.Conn) {
-				logger := proxy.NewLogger(io.Discard)
-				server := proxy.NewServer("127.0.0.1:0", upstreamDSN, store, tlsConfig, logger)
+				logger := proxy.NewLogger(os.Stdout)
+				handlers := make(map[proxy.ProtocolType]proxy.ProtocolHandler)
+				server := proxy.NewServer("127.0.0.1:0", upstreamDSN, store, tlsConfig, logger, nil, handlers)
+				pgHandler := proxy.NewPostgresProtocolHandler(upstreamDSN, store, tlsConfig, logger, server)
+				server.SetHandler(proxy.ProtocolPostgres, pgHandler)
 				session := proxy.NewSession(c, upstreamDSN, store, tlsConfig, logger, server)
 				defer session.Close()
 				session.Run()
@@ -454,3 +461,11 @@ func TestTLSUpgradeAndEnforcement(t *testing.T) {
 		}
 	})
 }
+
+
+
+
+
+
+
+

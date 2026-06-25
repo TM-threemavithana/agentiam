@@ -7,8 +7,7 @@ import (
 
 func TestApplyRules(t *testing.T) {
 	rules := Rules{
-		AllowedStatements:  []string{"SELECT"},
-		EnforceSelectLimit: 100,
+		AllowedStatements:  []string{"SELECT"}, EnforceSelectLimit: 100,
 	}
 
 	tests := []struct {
@@ -55,7 +54,7 @@ func TestApplyRules(t *testing.T) {
 		},
 		{
 			name:          "Subquery Limit Injection",
-			sql:           "SELECT * FROM (SELECT * FROM users)",
+			sql:           "SELECT * FROM (SELECT * FROM users, nil)",
 			expectBlocked: false,
 			expectLimit:   true,
 		},
@@ -177,7 +176,7 @@ func TestApplyRules(t *testing.T) {
 				testRules.AllowedStatements = []string{}
 			}
 
-			result, err := ApplyRules(tt.sql, testRules)
+			result, err := (&PostgresParser{}).ApplyRules(tt.sql, testRules, nil)
 
 			if tt.expectBlocked {
 				if err == nil {
@@ -236,7 +235,7 @@ func TestApplyRules_Analytical_Queries_Bypass_Limit(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := ApplyRules(tt.sql, rules)
+			result, err := (&PostgresParser{}).ApplyRules(tt.sql, rules, nil)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -246,3 +245,7 @@ func TestApplyRules_Analytical_Queries_Bypass_Limit(t *testing.T) {
 		})
 	}
 }
+
+
+
+
