@@ -1,7 +1,7 @@
 package proxy
 
 import (
-	"github.com/TM-threemavithana/agentiam/internal/policy"
+	"github.com/tm-threemavithana/agentiam/internal/policy"
 	"io"
 	"log/slog"
 	"net"

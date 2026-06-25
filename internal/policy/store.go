@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/TM-threemavithana/agentiam/internal/ast"
+	"github.com/tm-threemavithana/agentiam/internal/ast"
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/redis/go-redis/v9"

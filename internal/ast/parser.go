@@ -1,6 +1,6 @@
 package ast
 
-import "github.com/TM-threemavithana/agentiam/internal/cache"
+import "github.com/tm-threemavithana/agentiam/internal/cache"
 
 // ASTParser defines a generic interface for SQL dialect parsers to validate and rewrite queries against AgentIAM rules.
 type ASTParser interface {

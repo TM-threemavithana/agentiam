@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"net"
 
-	"github.com/TM-threemavithana/agentiam/internal/policy"
+	"github.com/tm-threemavithana/agentiam/internal/policy"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/server"

@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/TM-threemavithana/agentiam/internal/policy"
+	"github.com/tm-threemavithana/agentiam/internal/policy"
 
 	"github.com/jackc/pgproto3/v2"
 )

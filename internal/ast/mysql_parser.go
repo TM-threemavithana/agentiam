@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"fmt"
 
-	"github.com/TM-threemavithana/agentiam/internal/cache"
+	"github.com/tm-threemavithana/agentiam/internal/cache"
 
 	"github.com/pingcap/tidb/pkg/parser"
 	"github.com/pingcap/tidb/pkg/parser/ast"
