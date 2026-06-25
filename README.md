@@ -81,8 +81,10 @@ AgentIAM does not pool upstream connections; it maintains a 1:1 mapping between 
 
 ### Security Boundaries
 - **Authentication:** The proxy currently uses `AuthenticationCleartextPassword` during the local handshake with the AI agent. It is designed to be deployed as a sidecar or within a secure internal network boundary.
-- **Timing Oracles:** The proxy does not obfuscate parsing latency. An attacker could theoretically use timing side-channels to deduce whether a query was rejected locally by the AST parser or upstream.
+- **Timing Oracles:** The proxy does not obfuscate latency during authentication or policy evaluation. An attacker on the same subnet could theoretically deduce valid agent keys by measuring `bcrypt` comparison time, and could detect SQLite hit vs miss latency for policy lookups.
+- **Parameterized LIMITs:** While the proxy automatically injects a `LIMIT` clause for unbounded `SELECT` statements, it deliberately rejects parameterized limits (e.g., `LIMIT $1`). Applications or ORMs that default to parameterized limits must disable them for proxy compliance.
 - **Semantic Logic:** The proxy prevents unauthorized tables from being queried, but does not currently enforce row-level security (RLS) or inject tenant isolation limits.
+- **Concurrency & DDoS Protection:** The proxy utilizes a strict `AGENTIAM_MAX_CONNECTIONS` concurrency semaphore and guarantees no goroutine leaks when handling connection drops under extreme load.
 
 ---
 
