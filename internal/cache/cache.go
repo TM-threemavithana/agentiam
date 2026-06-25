@@ -48,12 +48,12 @@ func NewRedisCache(url string, ttl time.Duration) (*RedisCache, error) {
 	opt.WriteTimeout = 50 * time.Millisecond
 	opt.DialTimeout = 100 * time.Millisecond
 	client := redis.NewClient(opt)
-	
+
 	ctx := context.Background()
 	if err := client.Ping(ctx).Err(); err != nil {
 		return nil, err
 	}
-	
+
 	return &RedisCache{
 		client: client,
 		ctx:    ctx,

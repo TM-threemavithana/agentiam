@@ -247,4 +247,3 @@ func (s *Server) handleCancelRequest(conn net.Conn, msg *pgproto3.CancelRequest)
 	}
 	conn.Close()
 }
-

@@ -194,8 +194,3 @@ func TestStartupIterationLimit(t *testing.T) {
 		t.Fatalf("Expected connection to be closed by proxy after 3 iterations, but read succeeded")
 	}
 }
-
-
-
-
-

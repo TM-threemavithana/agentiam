@@ -461,11 +461,3 @@ func TestTLSUpgradeAndEnforcement(t *testing.T) {
 		}
 	})
 }
-
-
-
-
-
-
-
-

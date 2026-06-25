@@ -102,36 +102,36 @@ func enforceRules(node *pg_query.Node, rules Rules, depth int) error {
 					isNoLimit = true // LIMIT ALL
 				}
 
-			if isNoLimit {
-				// No limit, or LIMIT ALL
-				sel.LimitCount = &pg_query.Node{
-					Node: &pg_query.Node_AConst{
-						AConst: &pg_query.A_Const{
-							Val: &pg_query.A_Const_Ival{
-								Ival: &pg_query.Integer{
-									Ival: int32(rules.EnforceSelectLimit),
+				if isNoLimit {
+					// No limit, or LIMIT ALL
+					sel.LimitCount = &pg_query.Node{
+						Node: &pg_query.Node_AConst{
+							AConst: &pg_query.A_Const{
+								Val: &pg_query.A_Const_Ival{
+									Ival: &pg_query.Integer{
+										Ival: int32(rules.EnforceSelectLimit),
+									},
 								},
 							},
 						},
-					},
-				}
-				// Force standard limit syntax
-				sel.LimitOption = pg_query.LimitOption_LIMIT_OPTION_COUNT
-			} else {
-				// A limit is specified. We must ensure it's not dynamic, and cap it.
-				switch n := sel.LimitCount.Node.(type) {
-				case *pg_query.Node_AConst:
-					// Cap existing limit using 'lesser of'
-					if ival, ok := n.AConst.Val.(*pg_query.A_Const_Ival); ok {
-						if ival.Ival.Ival > int32(rules.EnforceSelectLimit) {
-							ival.Ival.Ival = int32(rules.EnforceSelectLimit)
-						}
 					}
-				case *pg_query.Node_ParamRef:
-					return fmt.Errorf("parameterized limits (e.g. LIMIT $1) are not allowed by policy")
-				default:
-					return fmt.Errorf("dynamic limits are not allowed by policy")
-				}
+					// Force standard limit syntax
+					sel.LimitOption = pg_query.LimitOption_LIMIT_OPTION_COUNT
+				} else {
+					// A limit is specified. We must ensure it's not dynamic, and cap it.
+					switch n := sel.LimitCount.Node.(type) {
+					case *pg_query.Node_AConst:
+						// Cap existing limit using 'lesser of'
+						if ival, ok := n.AConst.Val.(*pg_query.A_Const_Ival); ok {
+							if ival.Ival.Ival > int32(rules.EnforceSelectLimit) {
+								ival.Ival.Ival = int32(rules.EnforceSelectLimit)
+							}
+						}
+					case *pg_query.Node_ParamRef:
+						return fmt.Errorf("parameterized limits (e.g. LIMIT $1) are not allowed by policy")
+					default:
+						return fmt.Errorf("dynamic limits are not allowed by policy")
+					}
 				}
 			}
 		}

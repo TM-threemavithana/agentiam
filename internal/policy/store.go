@@ -60,11 +60,11 @@ func NewStore(rdb *redis.Client, filePath string, apiUrl string, logger *slog.Lo
 	dummyHash, _ := bcrypt.GenerateFromPassword([]byte("dummy"), bcrypt.DefaultCost)
 
 	s := &Store{
-		agents:    make(map[string]agentState),
-		dummyHash: dummyHash,
-		filePath:  filePath,
-		apiUrl:    apiUrl,
-		logger:    logger,
+		agents:     make(map[string]agentState),
+		dummyHash:  dummyHash,
+		filePath:   filePath,
+		apiUrl:     apiUrl,
+		logger:     logger,
 		httpClient: &http.Client{Timeout: 5 * time.Second},
 		rdb:        rdb,
 	}
@@ -109,7 +109,7 @@ func (s *Store) loadPolicies() error {
 		if err != nil {
 			return fmt.Errorf("failed to create request: %w", err)
 		}
-		
+
 		resp, err := s.httpClient.Do(req)
 		if err == nil {
 			defer resp.Body.Close()
@@ -181,10 +181,10 @@ func (s *Store) Watch(ctx context.Context) {
 		go func() {
 			pubsub := s.rdb.Subscribe(ctx, "agentiam:policies:updates")
 			defer pubsub.Close()
-			
+
 			s.logger.Info("Listening for policy updates via Redis Pub/Sub", "channel", "agentiam:policies:updates")
 			ch := pubsub.Channel()
-			
+
 			for {
 				select {
 				case <-ctx.Done():
@@ -239,7 +239,7 @@ func (s *Store) Watch(ctx context.Context) {
 			}
 			if event.Op&fsnotify.Write == fsnotify.Write || event.Op&fsnotify.Create == fsnotify.Create {
 				time.Sleep(50 * time.Millisecond) // wait for write to complete
-				if s.rdb == nil { // Skip file updates if Redis is active
+				if s.rdb == nil {                 // Skip file updates if Redis is active
 					if err := s.loadPolicies(); err != nil {
 						s.logger.Error("policy reload failed, keeping current policies", "error", err, "file", s.filePath)
 					} else {
@@ -345,5 +345,3 @@ func (s *Store) GetAgentKey(clientID string) (string, error) {
 	}
 	return "", fmt.Errorf("invalid client ID")
 }
-
-

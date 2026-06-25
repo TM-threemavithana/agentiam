@@ -58,4 +58,3 @@ func init() {
 	prometheus.MustRegister(PoolIdleConnections)
 	prometheus.MustRegister(PoolTotalConnections)
 }
-

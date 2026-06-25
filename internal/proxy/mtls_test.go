@@ -135,13 +135,13 @@ func TestMutualTLSAuthentication(t *testing.T) {
 		t.Fatalf("failed to listen: %v", err)
 	}
 	port := fmt.Sprintf("%d", l.Addr().(*net.TCPAddr).Port)
-	
+
 	logger := NewLogger(os.Stdout)
 	handlers := make(map[ProtocolType]ProtocolHandler)
 	server := NewServer("127.0.0.1:"+port, "postgres://dummy:5432", store, tlsConfig, logger, nil, handlers)
 	pgHandler := NewPostgresProtocolHandler("postgres://dummy:5432", store, tlsConfig, logger, server)
 	server.SetHandler(ProtocolPostgres, pgHandler)
-	
+
 	go func() {
 		for {
 			conn, err := l.Accept()
@@ -182,7 +182,7 @@ func TestMutualTLSAuthentication(t *testing.T) {
 		}
 
 		frontend := pgproto3.NewFrontend(pgproto3.NewChunkReader(tlsClientConn), tlsClientConn)
-		
+
 		err = frontend.Send(&pgproto3.StartupMessage{
 			ProtocolVersion: pgproto3.ProtocolVersionNumber,
 			Parameters: map[string]string{
@@ -212,7 +212,3 @@ func TestMutualTLSAuthentication(t *testing.T) {
 		}
 	})
 }
-
-
-
-

@@ -42,7 +42,7 @@ func (m *mockServer) start(l net.Listener) {
 func FuzzProxyLoop(f *testing.F) {
 	// Add some seed corpus with valid PG messages
 	f.Add([]byte("Q\x00\x00\x00\x11SELECT 1;\x00")) // Query: SELECT 1;
-	f.Add([]byte("X\x00\x00\x00\x04"))             // Terminate
+	f.Add([]byte("X\x00\x00\x00\x04"))              // Terminate
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		// Create a local listener for the mock upstream
@@ -58,7 +58,7 @@ func FuzzProxyLoop(f *testing.F) {
 		// Set up a mock Server and Pool
 		logger := NewLogger(os.Stdout)
 		pool := NewPool(l.Addr().String(), 1, logger)
-		
+
 		server := &Server{
 			pool:   pool,
 			logger: logger,
@@ -91,9 +91,8 @@ func FuzzProxyLoop(f *testing.F) {
 
 		// Run proxyLoop
 		_ = session.proxyLoop(ctx, cancel, "fuzz-client")
-		
+
 		// Ensure that when proxyLoop exits, it doesn't leave the pool in a bad state
 		session.Close()
 	})
 }
-

@@ -52,7 +52,7 @@ func main() {
 		opt.WriteTimeout = 50 * time.Millisecond
 		opt.DialTimeout = 100 * time.Millisecond
 		rdb = redis.NewClient(opt)
-		
+
 		ctx := context.Background()
 		if err := rdb.Ping(ctx).Err(); err != nil {
 			log.Fatalf("Failed to connect to Redis: %v", err)
@@ -94,7 +94,7 @@ func main() {
 
 	handlers := make(map[proxy.ProtocolType]proxy.ProtocolHandler)
 	srv := proxy.NewServer(":"+listenPort, upstreamDSN, store, tlsConfig, logger, astCache, handlers)
-	
+
 	pgHandler := proxy.NewPostgresProtocolHandler(upstreamDSN, store, tlsConfig, logger, srv)
 	mysqlHandler := proxy.NewMySQLProtocolHandler(store, logger)
 
@@ -150,4 +150,3 @@ func loadTLSConfig(logger *proxy.Logger) (*tls.Config, error) {
 
 	return nil, fmt.Errorf("TLS configuration missing (set AGENTIAM_TLS_CERT/KEY or AGENTIAM_DEV_MODE=true)")
 }
-

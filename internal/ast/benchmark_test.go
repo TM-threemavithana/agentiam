@@ -31,5 +31,3 @@ func BenchmarkFilterAST(b *testing.B) {
 		}
 	})
 }
-
-

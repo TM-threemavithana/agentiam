@@ -18,7 +18,7 @@ import (
 )
 
 type PreparedStatement struct {
-	SQL       string
+	SQL           string
 	ParameterOIDs []uint32
 }
 
@@ -65,10 +65,10 @@ func (h *PostgresProtocolHandler) HandleSession(ctx context.Context, clientConn 
 }
 
 type Session struct {
-	clientConn   net.Conn
-	uconn        *UpstreamConn
-	upstreamDSN  string
-	uconnMu      sync.Mutex
+	clientConn  net.Conn
+	uconn       *UpstreamConn
+	upstreamDSN string
+	uconnMu     sync.Mutex
 
 	store  *policy.Store
 	logger *Logger
@@ -199,81 +199,81 @@ func (s *Session) Run() error {
 
 	if !mtlsVerified {
 		if strings.HasPrefix(agentKey, "SCRAM-SHA-256$") {
-		s.clientBackend.Send(&pgproto3.AuthenticationSASL{AuthMechanisms: []string{"SCRAM-SHA-256"}})
-		s.clientBackend.SetAuthType(pgproto3.AuthTypeSASL)
+			s.clientBackend.Send(&pgproto3.AuthenticationSASL{AuthMechanisms: []string{"SCRAM-SHA-256"}})
+			s.clientBackend.SetAuthType(pgproto3.AuthTypeSASL)
 
-		s.clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-		authMsg, err := s.clientBackend.Receive()
-		s.clientConn.SetReadDeadline(time.Time{})
-		if err != nil {
-			return fmt.Errorf("error receiving SASL Initial Response: %w", err)
+			s.clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			authMsg, err := s.clientBackend.Receive()
+			s.clientConn.SetReadDeadline(time.Time{})
+			if err != nil {
+				return fmt.Errorf("error receiving SASL Initial Response: %w", err)
+			}
+
+			saslInitial, ok := authMsg.(*pgproto3.SASLInitialResponse)
+			if !ok || saslInitial.AuthMechanism != "SCRAM-SHA-256" {
+				return fmt.Errorf("expected SASLInitialResponse for SCRAM")
+			}
+
+			clientFirstBare := string(saslInitial.Data)
+			if strings.HasPrefix(clientFirstBare, "n,,") {
+				clientFirstBare = clientFirstBare[3:]
+			}
+
+			iters, salt, storedKey, serverKey, err := ParseSCRAMSecret(agentKey)
+			if err != nil {
+				return err
+			}
+
+			serverNonce := "r=Oye230"
+			saltStr := base64.StdEncoding.EncodeToString(salt)
+			serverFirst := fmt.Sprintf("%s,s=%s,i=%d", clientFirstBare[2:]+serverNonce, saltStr, iters)
+			s.clientBackend.Send(&pgproto3.AuthenticationSASLContinue{Data: []byte(serverFirst)})
+
+			s.clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			authMsg, err = s.clientBackend.Receive()
+			s.clientConn.SetReadDeadline(time.Time{})
+			if err != nil {
+				return err
+			}
+
+			saslResp, ok := authMsg.(*pgproto3.SASLResponse)
+			if !ok {
+				return fmt.Errorf("expected SASLResponse")
+			}
+
+			clientFinal := string(saslResp.Data)
+			parts := strings.Split(clientFinal, ",p=")
+			if len(parts) != 2 {
+				return fmt.Errorf("invalid SASLResponse")
+			}
+			clientFinalWithoutProof := parts[0]
+			clientProofStr := parts[1]
+
+			serverSignature, err := VerifySCRAM(clientFirstBare, serverFirst, clientFinalWithoutProof, clientProofStr, storedKey, serverKey)
+			if err != nil {
+				s.clientBackend.Send(&pgproto3.ErrorResponse{Severity: "FATAL", Message: "Password authentication failed"})
+				return fmt.Errorf("SCRAM auth failed")
+			}
+
+			s.clientBackend.Send(&pgproto3.AuthenticationSASLFinal{Data: []byte("v=" + serverSignature)})
+			suppliedPassword = "SCRAM_VERIFIED"
+		} else {
+			s.clientBackend.Send(&pgproto3.AuthenticationCleartextPassword{})
+			s.clientBackend.SetAuthType(pgproto3.AuthTypeCleartextPassword)
+
+			s.clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			authMsg, err := s.clientBackend.Receive()
+			s.clientConn.SetReadDeadline(time.Time{})
+			if err != nil {
+				return fmt.Errorf("error receiving password: %w", err)
+			}
+
+			pwdMsg, ok := authMsg.(*pgproto3.PasswordMessage)
+			if !ok {
+				return fmt.Errorf("expected password message")
+			}
+			suppliedPassword = pwdMsg.Password
 		}
-
-		saslInitial, ok := authMsg.(*pgproto3.SASLInitialResponse)
-		if !ok || saslInitial.AuthMechanism != "SCRAM-SHA-256" {
-			return fmt.Errorf("expected SASLInitialResponse for SCRAM")
-		}
-
-		clientFirstBare := string(saslInitial.Data)
-		if strings.HasPrefix(clientFirstBare, "n,,") {
-			clientFirstBare = clientFirstBare[3:]
-		}
-
-		iters, salt, storedKey, serverKey, err := ParseSCRAMSecret(agentKey)
-		if err != nil {
-			return err
-		}
-
-		serverNonce := "r=Oye230"
-		saltStr := base64.StdEncoding.EncodeToString(salt)
-		serverFirst := fmt.Sprintf("%s,s=%s,i=%d", clientFirstBare[2:]+serverNonce, saltStr, iters)
-		s.clientBackend.Send(&pgproto3.AuthenticationSASLContinue{Data: []byte(serverFirst)})
-
-		s.clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-		authMsg, err = s.clientBackend.Receive()
-		s.clientConn.SetReadDeadline(time.Time{})
-		if err != nil {
-			return err
-		}
-
-		saslResp, ok := authMsg.(*pgproto3.SASLResponse)
-		if !ok {
-			return fmt.Errorf("expected SASLResponse")
-		}
-
-		clientFinal := string(saslResp.Data)
-		parts := strings.Split(clientFinal, ",p=")
-		if len(parts) != 2 {
-			return fmt.Errorf("invalid SASLResponse")
-		}
-		clientFinalWithoutProof := parts[0]
-		clientProofStr := parts[1]
-
-		serverSignature, err := VerifySCRAM(clientFirstBare, serverFirst, clientFinalWithoutProof, clientProofStr, storedKey, serverKey)
-		if err != nil {
-			s.clientBackend.Send(&pgproto3.ErrorResponse{Severity: "FATAL", Message: "Password authentication failed"})
-			return fmt.Errorf("SCRAM auth failed")
-		}
-
-		s.clientBackend.Send(&pgproto3.AuthenticationSASLFinal{Data: []byte("v=" + serverSignature)})
-		suppliedPassword = "SCRAM_VERIFIED"
-	} else {
-		s.clientBackend.Send(&pgproto3.AuthenticationCleartextPassword{})
-		s.clientBackend.SetAuthType(pgproto3.AuthTypeCleartextPassword)
-
-		s.clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-		authMsg, err := s.clientBackend.Receive()
-		s.clientConn.SetReadDeadline(time.Time{})
-		if err != nil {
-			return fmt.Errorf("error receiving password: %w", err)
-		}
-
-		pwdMsg, ok := authMsg.(*pgproto3.PasswordMessage)
-		if !ok {
-			return fmt.Errorf("expected password message")
-		}
-		suppliedPassword = pwdMsg.Password
-	}
 	}
 
 	rules, authVersion, err := s.store.GetRulesForAgent(clientID, suppliedPassword)
@@ -311,7 +311,7 @@ func (s *Session) getOrAcquireUpstream(ctx context.Context, clientWriteCh chan p
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Inject statement timeout
 	timeout := s.rules.MaxExecutionTimeMs
 	if timeout <= 0 {
@@ -319,7 +319,7 @@ func (s *Session) getOrAcquireUpstream(ctx context.Context, clientWriteCh chan p
 	}
 	u.SwallowSetTimeout.Add(1)
 	u.Frontend.Send(&pgproto3.Query{String: fmt.Sprintf("SET statement_timeout = '%dms'", timeout)})
-	
+
 	s.uconn = u
 
 	go func() {
@@ -494,7 +494,7 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 					ParameterOIDs: ps.ParameterOIDs,
 				})
 			}
-			
+
 			v.PreparedStatement = ""
 			v.DestinationPortal = ""
 			u.Frontend.Send(v)
@@ -603,7 +603,3 @@ func (s *Session) Close() {
 		s.recoverBrokenTransaction()
 	})
 }
-
-
-
-

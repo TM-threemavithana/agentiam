@@ -7,7 +7,7 @@ import (
 
 func TestApplyRules(t *testing.T) {
 	rules := Rules{
-		AllowedStatements:  []string{"SELECT"}, EnforceSelectLimit: 100,
+		AllowedStatements: []string{"SELECT"}, EnforceSelectLimit: 100,
 	}
 
 	tests := []struct {
@@ -245,7 +245,3 @@ func TestApplyRules_Analytical_Queries_Bypass_Limit(t *testing.T) {
 		})
 	}
 }
-
-
-
-

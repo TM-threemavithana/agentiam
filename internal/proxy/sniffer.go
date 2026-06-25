@@ -37,7 +37,7 @@ func SniffProtocol(conn net.Conn, timeout time.Duration) (ProtocolType, net.Conn
 
 	var buf [4]byte
 	n, err := io.ReadAtLeast(conn, buf[:], 1)
-	
+
 	// Clear the deadline for normal operations
 	conn.SetReadDeadline(time.Time{})
 
@@ -62,7 +62,7 @@ func SniffProtocol(conn net.Conn, timeout time.Duration) (ProtocolType, net.Conn
 		return ProtocolPostgres, prefixConn, nil
 	}
 
-	// Fallback to postgres for now if we read something unexpected, 
+	// Fallback to postgres for now if we read something unexpected,
 	// the protocol handler will reject it cleanly.
 	return ProtocolPostgres, prefixConn, nil
 }

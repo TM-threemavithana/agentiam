@@ -107,6 +107,3 @@ func (v *mysqlVisitor) Enter(in ast.Node) (ast.Node, bool) {
 func (v *mysqlVisitor) Leave(in ast.Node) (ast.Node, bool) {
 	return in, true
 }
-
-
-

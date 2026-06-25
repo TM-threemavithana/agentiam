@@ -7,9 +7,9 @@ import (
 
 	"agentiam/internal/policy"
 
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/server"
+	_ "github.com/go-sql-driver/mysql"
 )
 
 // MySQLProtocolHandler implements the ProtocolHandler interface for the MySQL wire protocol.
@@ -91,19 +91,19 @@ func (a *AgentIAMAuthHandler) OnAuthFailure(conn *server.Conn, err error) {
 }
 
 // AgentIAMMySQLHandler intercepts COM_QUERY and proxies it upstream.
-// 
+//
 // Protocol Context (MySQL Client/Server Protocol):
-// - Command Packets: Sent by the client to the server. The first byte of the payload defines the command type.
-//   0x03 = COM_QUERY (Text Protocol).
-//   Reference: https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_query.html
+//   - Command Packets: Sent by the client to the server. The first byte of the payload defines the command type.
+//     0x03 = COM_QUERY (Text Protocol).
+//     Reference: https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_query.html
 //
 // - Text Resultset: The server responds to COM_QUERY with a Text Resultset, which consists of:
-//   1. Column Count Packet (Length-Encoded Integer)
-//   2. Column Definition Packets (One per column)
-//   3. EOF Packet (if CLIENT_DEPRECATE_EOF is not set)
-//   4. Row Data Packets (One per row, values are length-encoded strings)
-//   5. EOF Packet or OK Packet.
-//   Reference: https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_query_response_text_resultset.html
+//  1. Column Count Packet (Length-Encoded Integer)
+//  2. Column Definition Packets (One per column)
+//  3. EOF Packet (if CLIENT_DEPRECATE_EOF is not set)
+//  4. Row Data Packets (One per row, values are length-encoded strings)
+//  5. EOF Packet or OK Packet.
+//     Reference: https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_query_response_text_resultset.html
 type AgentIAMMySQLHandler struct {
 	server.EmptyHandler
 	db     *sql.DB
@@ -158,4 +158,3 @@ func (h *AgentIAMMySQLHandler) HandleQuery(query string) (*mysql.Result, error) 
 
 	return mysql.NewResult(resultset), nil
 }
-

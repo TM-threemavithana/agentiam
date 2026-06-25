@@ -57,7 +57,7 @@ func VerifySCRAM(clientFirstBare string, serverFirst string, clientFinalWithoutP
 	}
 
 	authMessage := clientFirstBare + "," + serverFirst + "," + clientFinalWithoutProof
-	
+
 	mac := hmac.New(sha256.New, storedKey)
 	mac.Write([]byte(authMessage))
 	clientSignature := mac.Sum(nil)

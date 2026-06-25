@@ -12,15 +12,15 @@ import (
 )
 
 type UpstreamConn struct {
-	Conn      net.Conn
-	Frontend  *pgproto3.Frontend
-	PID       uint32
-	SecretKey uint32
-	InUse     atomic.Bool
-	Broken    atomic.Bool
+	Conn                 net.Conn
+	Frontend             *pgproto3.Frontend
+	PID                  uint32
+	SecretKey            uint32
+	InUse                atomic.Bool
+	Broken               atomic.Bool
 	SwallowParseComplete atomic.Int32
 	SwallowSetTimeout    atomic.Int32
-	TxStatus  byte
+	TxStatus             byte
 }
 
 func (u *UpstreamConn) Close() {
@@ -30,11 +30,11 @@ func (u *UpstreamConn) Close() {
 }
 
 type Pool struct {
-	dsn     string
-	size    int
-	logger  *Logger
-	conns   chan *UpstreamConn
-	mu      sync.Mutex
+	dsn    string
+	size   int
+	logger *Logger
+	conns  chan *UpstreamConn
+	mu     sync.Mutex
 }
 
 func NewPool(dsn string, size int, logger *Logger) *Pool {
@@ -120,7 +120,7 @@ func (p *Pool) Release(u *UpstreamConn) {
 			if err != nil {
 				p.logger.Error("Failed to re-dial broken connection", "error", err)
 				// Put a broken one back so next acquire will retry dialing
-				p.conns <- &UpstreamConn{} 
+				p.conns <- &UpstreamConn{}
 				return
 			}
 			p.conns <- newU
@@ -148,7 +148,3 @@ func (p *Pool) Release(u *UpstreamConn) {
 		PoolIdleConnections.Inc()
 	}()
 }
-
-
-
-
