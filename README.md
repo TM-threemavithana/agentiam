@@ -4,8 +4,8 @@
 
 Connecting Large Language Models (LLMs) directly to your database for "Text-to-SQL" functionality is incredibly dangerous. AgentIAM sits between your LangChain/LlamaIndex agent and your database, intercepting network traffic over wire protocols to parse and block destructive queries before they can execute.
 
-[![CI](https://github.com/yourusername/agentiam/actions/workflows/ci.yml/badge.svg)](https://github.com/yourusername/agentiam/actions/workflows/ci.yml)
-[![Go Report Card](https://goreportcard.com/badge/github.com/yourusername/agentiam)](https://goreportcard.com/report/github.com/yourusername/agentiam)
+[![CI](https://github.com/TM-threemavithana/agentiam/actions/workflows/ci.yml/badge.svg)](https://github.com/TM-threemavithana/agentiam/actions/workflows/ci.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/TM-threemavithana/agentiam)](https://goreportcard.com/report/github.com/TM-threemavithana/agentiam)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Version: v1.0.0](https://img.shields.io/badge/Version-v1.0.0-green.svg)]()
 
