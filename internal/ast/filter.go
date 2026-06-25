@@ -10,7 +10,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 
-	"agentiam/internal/cache"
+	"github.com/TM-threemavithana/agentiam/internal/cache"
 	pg_query "github.com/pganalyze/pg_query_go/v6"
 	"github.com/wasilibs/go-pgquery/parser"
 	"google.golang.org/protobuf/proto"

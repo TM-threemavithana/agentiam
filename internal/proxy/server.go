@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"agentiam/internal/cache"
-	"agentiam/internal/policy"
+	"github.com/TM-threemavithana/agentiam/internal/cache"
+	"github.com/TM-threemavithana/agentiam/internal/policy"
 
 	"github.com/jackc/pgproto3/v2"
 	"github.com/prometheus/client_golang/prometheus/promhttp"

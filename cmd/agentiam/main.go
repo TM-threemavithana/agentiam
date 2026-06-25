@@ -9,9 +9,9 @@ import (
 	"os"
 	"time"
 
-	"agentiam/internal/cache"
-	"agentiam/internal/policy"
-	"agentiam/internal/proxy"
+	"github.com/TM-threemavithana/agentiam/internal/cache"
+	"github.com/TM-threemavithana/agentiam/internal/policy"
+	"github.com/TM-threemavithana/agentiam/internal/proxy"
 
 	"github.com/redis/go-redis/v9"
 )

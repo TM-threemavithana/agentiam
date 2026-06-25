@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"agentiam/internal/ast"
+	"github.com/TM-threemavithana/agentiam/internal/ast"
 
 	"github.com/jackc/pgproto3/v2"
 )

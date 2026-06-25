@@ -21,8 +21,8 @@ import (
 	"testing"
 	"time"
 
-	"agentiam/internal/policy"
-	"agentiam/internal/proxy"
+	"github.com/TM-threemavithana/agentiam/internal/policy"
+	"github.com/TM-threemavithana/agentiam/internal/proxy"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/testcontainers/testcontainers-go"

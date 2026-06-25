@@ -1,4 +1,4 @@
-module agentiam
+module github.com/TM-threemavithana/agentiam
 
 go 1.25.0
 

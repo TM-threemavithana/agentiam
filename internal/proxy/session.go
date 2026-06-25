@@ -11,8 +11,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"agentiam/internal/ast"
-	"agentiam/internal/policy"
+	"github.com/TM-threemavithana/agentiam/internal/ast"
+	"github.com/TM-threemavithana/agentiam/internal/policy"
 
 	"github.com/jackc/pgproto3/v2"
 )
