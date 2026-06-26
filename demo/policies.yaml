@@ -5,6 +5,8 @@ agents:
     allowed_statements:
       - SELECT
       - SHOW
+      - SET
+      - ROLLBACK
     allowed_tables:
       - users
       - orders

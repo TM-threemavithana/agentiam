@@ -27,6 +27,7 @@ services:
       - AGENTIAM_POLICY_FILE=/etc/agentiam/policies.yaml
       - AGENTIAM_POLL_INTERVAL=5s
       - AGENTIAM_METRICS_PORT=9090
+      - AGENTIAM_DEV_MODE=true
     ports:
       - "5432:5432"
     volumes:
@@ -50,6 +51,7 @@ services:
     environment:
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - AGENTIAM_DEMO_MOCK=${AGENTIAM_DEMO_MOCK:-false}
+      - PYTHONUNBUFFERED=1
     depends_on:
       agentiam:
         condition: service_healthy

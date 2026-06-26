@@ -119,17 +119,17 @@ func (s *Session) Run() error {
 		s.Close()
 	}()
 
-	s.clientBackend = pgproto3.NewBackend(pgproto3.NewChunkReader(s.clientConn), s.clientConn)
-
 	var clientID string
 	var err error
 
 	for i := 0; i < 3; i++ {
-		s.clientConn.SetReadDeadline(time.Now().Add(5 * time.Minute))
-		s.startupMsg, err = s.clientBackend.ReceiveStartupMessage()
-		s.clientConn.SetReadDeadline(time.Time{})
-		if err != nil {
-			return err
+		if s.startupMsg == nil {
+			s.clientConn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+			s.startupMsg, err = s.clientBackend.ReceiveStartupMessage()
+			s.clientConn.SetReadDeadline(time.Time{})
+			if err != nil {
+				return err
+			}
 		}
 
 		switch msg := s.startupMsg.(type) {
@@ -145,6 +145,7 @@ func (s *Session) Run() error {
 		case *pgproto3.SSLRequest:
 			if s.tlsConfig == nil {
 				s.clientConn.Write([]byte("N"))
+				s.startupMsg = nil
 				continue
 			}
 
@@ -159,6 +160,7 @@ func (s *Session) Run() error {
 
 			s.clientConn = tlsConn
 			s.clientBackend = pgproto3.NewBackend(pgproto3.NewChunkReader(s.clientConn), s.clientConn)
+			s.startupMsg = nil
 			continue
 
 		default:
@@ -356,12 +358,6 @@ func (s *Session) getOrAcquireUpstream(ctx context.Context, clientWriteCh chan p
 				}
 			}
 
-			select {
-			case <-ctx.Done():
-				return
-			case clientWriteCh <- msg:
-			}
-
 			if rfq, ok := msg.(*pgproto3.ReadyForQuery); ok {
 				if u.SwallowSetTimeout.Load() > 0 {
 					u.SwallowSetTimeout.Add(-1)
@@ -371,10 +367,21 @@ func (s *Session) getOrAcquireUpstream(ctx context.Context, clientWriteCh chan p
 				u.TxStatus = rfq.TxStatus
 				if rfq.TxStatus == 'I' {
 					if s.rules.PoolMode != "session" {
+						select {
+						case <-ctx.Done():
+							return
+						case clientWriteCh <- msg:
+						}
 						s.releaseUpstream()
 						return
 					}
 				}
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case clientWriteCh <- msg:
 			}
 		}
 	}()

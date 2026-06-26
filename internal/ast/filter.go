@@ -167,7 +167,9 @@ func enforceRules(node *pg_query.Node, rules Rules, depth int) error {
 		// Always allow BEGIN/COMMIT/ROLLBACK as PgBouncer handles them and connection pooling relies on it.
 		return nil
 	case *pg_query.Node_VariableSetStmt:
-		return fmt.Errorf("SET statements are not allowed by policy")
+		if !isAllowed("SET", rules.AllowedStatements) {
+			return fmt.Errorf("SET statements are not allowed by policy")
+		}
 	case *pg_query.Node_VariableShowStmt:
 		if !isAllowed("SHOW", rules.AllowedStatements) {
 			return fmt.Errorf("SHOW statements are not allowed by policy")

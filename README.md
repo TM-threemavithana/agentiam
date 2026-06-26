@@ -8,7 +8,9 @@ Connecting Large Language Models (LLMs) directly to your database for "Text-to-S
 [![Go Report Card](https://goreportcard.com/badge/github.com/tm-threemavithana/agentiam)](https://goreportcard.com/report/github.com/tm-threemavithana/agentiam)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 
-> *Demo GIF showing LangChain agent getting blocked by AgentIAM when attempting to DELETE FROM users goes here.*
+<div align="center">
+  <img src="assets/demo_screenshot.png" alt="AgentIAM Demo" width="800">
+</div>
 
 ---
 
