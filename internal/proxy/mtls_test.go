@@ -102,7 +102,7 @@ func TestMutualTLSAuthentication(t *testing.T) {
 	tmpFile.Write([]byte(yamlContent))
 	tmpFile.Close()
 	defer os.Remove(tmpFile.Name())
-	store, _ := policy.NewStore(nil, tmpFile.Name(), "", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	store, _ := policy.NewStore(tmpFile.Name(), "", slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	// 2. Setup Certificates
 	serverCert, err := GenerateEphemeralCert()
@@ -138,8 +138,8 @@ func TestMutualTLSAuthentication(t *testing.T) {
 
 	logger := NewLogger(os.Stdout)
 	handlers := make(map[ProtocolType]ProtocolHandler)
-	server := NewServer("127.0.0.1:"+port, "postgres://dummy:5432", store, tlsConfig, logger, nil, handlers)
-	pgHandler := NewPostgresProtocolHandler("postgres://dummy:5432", store, tlsConfig, logger, server)
+	server := NewServer("127.0.0.1:"+port, "postgres://dummy:5432", store, tlsConfig, logger, nil, handlers, false)
+	pgHandler := NewPostgresProtocolHandler("postgres://dummy:5432", store, tlsConfig, logger, server, false)
 	server.SetHandler(ProtocolPostgres, pgHandler)
 
 	go func() {
@@ -149,7 +149,7 @@ func TestMutualTLSAuthentication(t *testing.T) {
 				return
 			}
 			go func(c net.Conn) {
-				session := NewSession(c, "postgres://dummy:5432", store, tlsConfig, logger, server)
+				session := NewSession(c, "postgres://dummy:5432", store, tlsConfig, logger, server, false)
 				defer session.Close()
 				session.Run()
 			}(conn)

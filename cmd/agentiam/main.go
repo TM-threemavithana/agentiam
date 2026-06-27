@@ -7,13 +7,10 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"time"
 
 	"github.com/tm-threemavithana/agentiam/internal/cache"
 	"github.com/tm-threemavithana/agentiam/internal/policy"
 	"github.com/tm-threemavithana/agentiam/internal/proxy"
-
-	"github.com/redis/go-redis/v9"
 )
 
 func main() {
@@ -41,25 +38,12 @@ func main() {
 	// Initialize structured logger
 	logger := proxy.NewLogger(os.Stdout)
 
-	var rdb *redis.Client
-	redisUrl := os.Getenv("AGENTIAM_REDIS_URL")
-	if redisUrl != "" {
-		opt, err := redis.ParseURL(redisUrl)
-		if err != nil {
-			log.Fatalf("Failed to parse Redis URL: %v", err)
-		}
-		opt.ReadTimeout = 50 * time.Millisecond
-		opt.WriteTimeout = 50 * time.Millisecond
-		opt.DialTimeout = 100 * time.Millisecond
-		rdb = redis.NewClient(opt)
-
-		ctx := context.Background()
-		if err := rdb.Ping(ctx).Err(); err != nil {
-			log.Fatalf("Failed to connect to Redis: %v", err)
-		}
+	insecureAuth := os.Getenv("AGENTIAM_INSECURE_CLEARTEXT_AUTH") == "true"
+	if insecureAuth {
+		logger.Warn("INSECURE CLEARTEXT AUTH IS ENABLED. DO NOT USE IN PRODUCTION WITHOUT SECURE BOUNDARIES.")
 	}
 
-	store, err := policy.NewStore(rdb, policyFile, apiUrl, logger.Logger)
+	store, err := policy.NewStore(policyFile, apiUrl, logger.Logger)
 	if err != nil {
 		log.Fatalf("Failed to initialize policy store: %v", err)
 	}
@@ -75,28 +59,18 @@ func main() {
 	}
 
 	var astCache cache.ASTCache
-	if rdb != nil {
-		rc := cache.NewRedisCacheFromClient(rdb, 24*time.Hour)
-		lc, err := cache.NewLocalCache(2000)
-		if err != nil {
-			log.Fatalf("Failed to initialize local fallback cache: %v", err)
-		}
-		astCache = cache.NewFallbackCache(lc, rc)
-		logger.Info("Using Redis+Local fallback for distributed AST Cache")
-	} else {
-		lc, err := cache.NewLocalCache(2000)
-		if err != nil {
-			log.Fatalf("Failed to initialize local cache: %v", err)
-		}
-		astCache = lc
-		logger.Info("Using local LRU for AST Cache")
+	lc, err := cache.NewLocalCache(2000)
+	if err != nil {
+		log.Fatalf("Failed to initialize local cache: %v", err)
 	}
+	astCache = lc
+	logger.Info("Using local LRU for AST Cache")
 
 	handlers := make(map[proxy.ProtocolType]proxy.ProtocolHandler)
-	srv := proxy.NewServer(":"+listenPort, upstreamDSN, store, tlsConfig, logger, astCache, handlers)
+	srv := proxy.NewServer(":"+listenPort, upstreamDSN, store, tlsConfig, logger, astCache, handlers, insecureAuth)
 
-	pgHandler := proxy.NewPostgresProtocolHandler(upstreamDSN, store, tlsConfig, logger, srv)
-	mysqlHandler := proxy.NewMySQLProtocolHandler(store, logger)
+	pgHandler := proxy.NewPostgresProtocolHandler(upstreamDSN, store, tlsConfig, logger, srv, insecureAuth)
+	mysqlHandler := proxy.NewMySQLProtocolHandler(store, logger, insecureAuth)
 
 	srv.SetHandler(proxy.ProtocolPostgres, pgHandler)
 	srv.SetHandler(proxy.ProtocolMySQL, mysqlHandler)

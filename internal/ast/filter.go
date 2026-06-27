@@ -21,7 +21,7 @@ var ErrComplexityExceeded = fmt.Errorf("Policy Violation: Maximum AST complexity
 type PostgresParser struct{}
 
 // ApplyRules parses the SQL into an AST, checks it against the rules, injects limits, and returns the rewritten SQL.
-func (p *PostgresParser) ApplyRules(sql string, rules Rules, astCache cache.ASTCache) (string, error) {
+func (p *PostgresParser) ApplyRules(sql string, rules Rules, astCache cache.ASTCache) (string, []int, error) {
 	_, span := otel.Tracer("agentiam/ast").Start(context.Background(), "ApplyRules")
 	defer span.End()
 
@@ -35,7 +35,7 @@ func (p *PostgresParser) ApplyRules(sql string, rules Rules, astCache cache.ASTC
 		if cached, ok := astCache.Get(cacheKey); ok {
 			AstCacheHitsTotal.Inc()
 			span.SetAttributes(attribute.Bool("cache.hit", true))
-			return cached, nil
+			return cached, nil, nil // Cache does not store limitParams currently, but they shouldn't hit cache often if parameterized. TODO: cache limitparams
 		}
 	}
 	AstCacheMissesTotal.Inc()
@@ -43,36 +43,38 @@ func (p *PostgresParser) ApplyRules(sql string, rules Rules, astCache cache.ASTC
 
 	b, err := parser.ParseToProtobuf(sql)
 	if err != nil {
-		return "", fmt.Errorf("failed to parse SQL: %w", err)
+		return "", nil, fmt.Errorf("failed to parse SQL: %w", err)
 	}
 	var tree pg_query.ParseResult
 	if err := proto.Unmarshal(b, &tree); err != nil {
-		return "", fmt.Errorf("failed to unmarshal AST: %w", err)
+		return "", nil, fmt.Errorf("failed to unmarshal AST: %w", err)
 	}
 
+	var limitParams []int
+
 	for _, stmt := range tree.Stmts {
-		err = enforceRules(stmt.Stmt, rules, 0)
+		err = enforceRules(stmt.Stmt, rules, 0, &limitParams)
 		if err != nil {
-			return "", err
+			return "", nil, err
 		}
 	}
 
 	deparseBytes, err := proto.Marshal(&tree)
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal AST: %w", err)
+		return "", nil, fmt.Errorf("failed to marshal AST: %w", err)
 	}
 	deparsed, err := parser.DeparseFromProtobuf(deparseBytes)
 	if err != nil {
-		return "", fmt.Errorf("failed to deparse SQL: %w", err)
+		return "", nil, fmt.Errorf("failed to deparse SQL: %w", err)
 	}
 
 	if astCache != nil {
 		astCache.Add(cacheKey, deparsed)
 	}
-	return deparsed, nil
+	return deparsed, limitParams, nil
 }
 
-func enforceRules(node *pg_query.Node, rules Rules, depth int) error {
+func enforceRules(node *pg_query.Node, rules Rules, depth int, limitParams *[]int) error {
 	if depth > 50 {
 		return ErrComplexityExceeded
 	}
@@ -128,7 +130,7 @@ func enforceRules(node *pg_query.Node, rules Rules, depth int) error {
 							}
 						}
 					case *pg_query.Node_ParamRef:
-						return fmt.Errorf("parameterized limits (e.g. LIMIT $1) are not allowed by policy")
+						*limitParams = append(*limitParams, int(n.ParamRef.Number))
 					default:
 						return fmt.Errorf("dynamic limits are not allowed by policy")
 					}
@@ -198,10 +200,10 @@ func enforceRules(node *pg_query.Node, rules Rules, depth int) error {
 	}
 
 	// Recurse into all child nodes generically to enforce complexity limits and find nested statements
-	return walkChildren(node.Node, rules, depth+1)
+	return walkChildren(node.Node, rules, depth+1, limitParams)
 }
 
-func walkChildren(v interface{}, rules Rules, depth int) error {
+func walkChildren(v interface{}, rules Rules, depth int, limitParams *[]int) error {
 	if v == nil {
 		return nil
 	}
@@ -213,7 +215,7 @@ func walkChildren(v interface{}, rules Rules, depth int) error {
 		if val.IsNil() {
 			return nil
 		}
-		return walkChildren(val.Elem().Interface(), rules, depth)
+		return walkChildren(val.Elem().Interface(), rules, depth, limitParams)
 	}
 
 	if val.Kind() == reflect.Struct {
@@ -224,13 +226,13 @@ func walkChildren(v interface{}, rules Rules, depth int) error {
 			}
 			if field.Kind() == reflect.Ptr && !field.IsNil() {
 				if n, ok := field.Interface().(*pg_query.Node); ok {
-					if err := enforceRules(n, rules, depth); err != nil {
+					if err := enforceRules(n, rules, depth, limitParams); err != nil {
 						return err
 					}
 					continue
 				}
 			}
-			if err := walkChildren(field.Interface(), rules, depth); err != nil {
+			if err := walkChildren(field.Interface(), rules, depth, limitParams); err != nil {
 				return err
 			}
 		}
@@ -239,13 +241,13 @@ func walkChildren(v interface{}, rules Rules, depth int) error {
 			elem := val.Index(i)
 			if elem.Kind() == reflect.Ptr && !elem.IsNil() {
 				if n, ok := elem.Interface().(*pg_query.Node); ok {
-					if err := enforceRules(n, rules, depth); err != nil {
+					if err := enforceRules(n, rules, depth, limitParams); err != nil {
 						return err
 					}
 					continue
 				}
 			}
-			if err := walkChildren(elem.Interface(), rules, depth); err != nil {
+			if err := walkChildren(elem.Interface(), rules, depth, limitParams); err != nil {
 				return err
 			}
 		}

@@ -16,14 +16,14 @@ func TestUnifiedPortMultiplexer(t *testing.T) {
 	tmpFile.Close()
 	defer os.Remove(tmpFile.Name())
 
-	store, _ := policy.NewStore(nil, tmpFile.Name(), "", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	store, _ := policy.NewStore(tmpFile.Name(), "", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	logger := NewLogger(io.Discard)
 
 	handlers := make(map[ProtocolType]ProtocolHandler)
-	server := NewServer("127.0.0.1:0", "postgres://dummy", store, nil, logger, nil, handlers)
+	server := NewServer("127.0.0.1:0", "postgres://dummy", store, nil, logger, nil, handlers, false)
 
-	pgHandler := NewPostgresProtocolHandler("postgres://dummy", store, nil, logger, server)
-	mysqlHandler := NewMySQLProtocolHandler(store, logger)
+	pgHandler := NewPostgresProtocolHandler("postgres://dummy", store, nil, logger, server, false)
+	mysqlHandler := NewMySQLProtocolHandler(store, logger, false)
 
 	server.SetHandler(ProtocolPostgres, pgHandler)
 	server.SetHandler(ProtocolMySQL, mysqlHandler)

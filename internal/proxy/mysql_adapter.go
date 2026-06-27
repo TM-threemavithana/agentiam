@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"net"
 
 	"github.com/tm-threemavithana/agentiam/internal/policy"
@@ -14,15 +15,16 @@ import (
 
 // MySQLProtocolHandler implements the ProtocolHandler interface for the MySQL wire protocol.
 type MySQLProtocolHandler struct {
-	store       *policy.Store
-	logger      *Logger
-	upstreamDSN string
-	db          *sql.DB
+	store        *policy.Store
+	logger       *Logger
+	upstreamDSN  string
+	db           *sql.DB
+	insecureAuth bool
 }
 
 // NewMySQLProtocolHandler creates a new handler capable of routing and parsing MySQL client connections.
-func NewMySQLProtocolHandler(store *policy.Store, logger *Logger) *MySQLProtocolHandler {
-	return &MySQLProtocolHandler{store: store, logger: logger, upstreamDSN: "root@tcp(127.0.0.1:3306)/"}
+func NewMySQLProtocolHandler(store *policy.Store, logger *Logger, insecureAuth bool) *MySQLProtocolHandler {
+	return &MySQLProtocolHandler{store: store, logger: logger, upstreamDSN: "root@tcp(127.0.0.1:3306)/", insecureAuth: insecureAuth}
 }
 
 // InitPool initializes the upstream *sql.DB connection pool.
@@ -41,7 +43,7 @@ func (h *MySQLProtocolHandler) InitPool() error {
 func (h *MySQLProtocolHandler) HandleSession(ctx context.Context, clientConn net.Conn) error {
 	h.logger.Info("MySQL connection accepted", "remote_addr", clientConn.RemoteAddr().String())
 
-	authHandler := &AgentIAMAuthHandler{store: h.store, logger: h.logger}
+	authHandler := &AgentIAMAuthHandler{store: h.store, logger: h.logger, insecureAuth: h.insecureAuth}
 	serverConf := server.NewDefaultServer()
 
 	// Initialize the MySQL Proxy handler
@@ -71,12 +73,17 @@ func (h *MySQLProtocolHandler) HandleSession(ctx context.Context, clientConn net
 
 // AgentIAMAuthHandler implements the MySQL server authentication interface.
 type AgentIAMAuthHandler struct {
-	store  *policy.Store
-	logger *Logger
+	store        *policy.Store
+	logger       *Logger
+	insecureAuth bool
 }
 
 // GetCredential retrieves the password for a given user.
 func (a *AgentIAMAuthHandler) GetCredential(username string) (server.Credential, bool, error) {
+	if !a.insecureAuth {
+		return server.Credential{}, false, fmt.Errorf("insecure auth rejected. mTLS is required")
+	}
+
 	if username == "root" {
 		return server.Credential{Passwords: []string{""}, AuthPluginName: "mysql_native_password"}, true, nil
 	}

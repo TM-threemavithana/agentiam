@@ -42,11 +42,12 @@ type Server struct {
 	activeSessions map[string]map[*Session]sessionMeta
 	sessionByPID   map[uint32]*Session
 	nextPID        uint32
+	insecureAuth   bool
 }
 
 // NewServer initializes a new Server instance.
 // It requires a pre-configured policy.Store, logger, AST cache, and a map of ProtocolHandlers.
-func NewServer(listenAddr, upstreamDSN string, store *policy.Store, tlsConfig *tls.Config, logger *Logger, astCache cache.ASTCache, handlers map[ProtocolType]ProtocolHandler) *Server {
+func NewServer(listenAddr, upstreamDSN string, store *policy.Store, tlsConfig *tls.Config, logger *Logger, astCache cache.ASTCache, handlers map[ProtocolType]ProtocolHandler, insecureAuth bool) *Server {
 	maxConns := 10000
 	return &Server{
 		listenAddr:     listenAddr,
@@ -61,6 +62,7 @@ func NewServer(listenAddr, upstreamDSN string, store *policy.Store, tlsConfig *t
 		sem:            make(chan struct{}, maxConns),
 		activeSessions: make(map[string]map[*Session]sessionMeta),
 		sessionByPID:   make(map[uint32]*Session),
+		insecureAuth:   insecureAuth,
 	}
 }
 

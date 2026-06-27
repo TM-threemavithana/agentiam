@@ -46,7 +46,7 @@ func TestMySQLAdapterIntegration(t *testing.T) {
 	logger := proxy.NewLogger(io.Discard)
 
 	// 2. Setup AgentIAM Proxy with MySQL Dialect
-	store, _ := policy.NewStore(nil, "", "", logger.Logger)
+	store, _ := policy.NewStore("", "", logger.Logger)
 	store.SetAgentPolicy("test-agent", policy.AgentConfig{
 		Name:          "test-agent",
 		Key:           "test-key",
@@ -55,8 +55,8 @@ func TestMySQLAdapterIntegration(t *testing.T) {
 	})
 
 	handlers := make(map[proxy.ProtocolType]proxy.ProtocolHandler)
-	srv := proxy.NewServer("127.0.0.1:3308", upstreamDSN, store, nil, logger, nil, handlers)
-	mysqlHandler := proxy.NewMySQLProtocolHandler(store, logger)
+	srv := proxy.NewServer("127.0.0.1:3308", upstreamDSN, store, nil, logger, nil, handlers, false)
+	mysqlHandler := proxy.NewMySQLProtocolHandler(store, logger, false)
 	srv.SetHandler(proxy.ProtocolMySQL, mysqlHandler)
 	go srv.Start()
 	time.Sleep(1 * time.Second) // wait for server to start

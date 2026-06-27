@@ -16,7 +16,6 @@ import (
 	"github.com/tm-threemavithana/agentiam/internal/ast"
 
 	"github.com/fsnotify/fsnotify"
-	"github.com/redis/go-redis/v9"
 	"golang.org/x/crypto/bcrypt"
 	"gopkg.in/yaml.v3"
 )
@@ -53,10 +52,9 @@ type Store struct {
 	apiUrl     string
 	logger     *slog.Logger
 	httpClient *http.Client
-	rdb        *redis.Client
 }
 
-func NewStore(rdb *redis.Client, filePath string, apiUrl string, logger *slog.Logger) (*Store, error) {
+func NewStore(filePath string, apiUrl string, logger *slog.Logger) (*Store, error) {
 	dummyHash, _ := bcrypt.GenerateFromPassword([]byte("dummy"), bcrypt.DefaultCost)
 
 	s := &Store{
@@ -66,7 +64,6 @@ func NewStore(rdb *redis.Client, filePath string, apiUrl string, logger *slog.Lo
 		apiUrl:     apiUrl,
 		logger:     logger,
 		httpClient: &http.Client{Timeout: 5 * time.Second},
-		rdb:        rdb,
 	}
 
 	if err := s.loadPolicies(); err != nil {
@@ -82,26 +79,6 @@ func NewStore(rdb *redis.Client, filePath string, apiUrl string, logger *slog.Lo
 
 func (s *Store) loadPolicies() error {
 	var py PoliciesYAML
-
-	// 1. Try Redis first if configured
-	if s.rdb != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		agentMap, err := s.rdb.HGetAll(ctx, "agentiam:agents").Result()
-		if err == nil && len(agentMap) > 0 {
-			for _, jsonStr := range agentMap {
-				var ac AgentConfig
-				if err := json.Unmarshal([]byte(jsonStr), &ac); err == nil {
-					py.Agents = append(py.Agents, ac)
-				} else {
-					s.logger.Error("Failed to decode agent from Redis", "error", err)
-				}
-			}
-			s.logger.Info("Policies loaded via Redis Control Plane", "count", len(py.Agents))
-		} else if err != nil && err != redis.Nil {
-			s.logger.Error("Failed to load from Redis", "error", err)
-		}
-	}
 
 	// 2. Try HTTP API if Redis didn't yield agents
 	if len(py.Agents) == 0 && s.apiUrl != "" {
@@ -176,31 +153,6 @@ func (s *Store) loadPolicies() error {
 }
 
 func (s *Store) Watch(ctx context.Context) {
-	// Start Redis Pub/Sub if configured
-	if s.rdb != nil {
-		go func() {
-			pubsub := s.rdb.Subscribe(ctx, "agentiam:policies:updates")
-			defer pubsub.Close()
-
-			s.logger.Info("Listening for policy updates via Redis Pub/Sub", "channel", "agentiam:policies:updates")
-			ch := pubsub.Channel()
-
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case msg, ok := <-ch:
-					if !ok {
-						return
-					}
-					s.logger.Info("Received Redis Pub/Sub policy update", "agent", msg.Payload)
-					if err := s.loadPolicies(); err != nil {
-						s.logger.Error("Redis policy hot-reload failed", "error", err)
-					}
-				}
-			}
-		}()
-	}
 
 	// Legacy Watchers
 	watcher, err := fsnotify.NewWatcher()
@@ -228,7 +180,7 @@ func (s *Store) Watch(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if s.apiUrl != "" && s.rdb == nil {
+			if s.apiUrl != "" {
 				if err := s.loadPolicies(); err != nil {
 					s.logger.Error("Remote policy reload failed", "error", err)
 				}
@@ -239,12 +191,10 @@ func (s *Store) Watch(ctx context.Context) {
 			}
 			if event.Op&fsnotify.Write == fsnotify.Write || event.Op&fsnotify.Create == fsnotify.Create {
 				time.Sleep(50 * time.Millisecond) // wait for write to complete
-				if s.rdb == nil {                 // Skip file updates if Redis is active
-					if err := s.loadPolicies(); err != nil {
-						s.logger.Error("policy reload failed, keeping current policies", "error", err, "file", s.filePath)
-					} else {
-						s.logger.Info("Policies hot-reloaded successfully")
-					}
+				if err := s.loadPolicies(); err != nil {
+					s.logger.Error("policy reload failed, keeping current policies", "error", err, "file", s.filePath)
+				} else {
+					s.logger.Info("Policies hot-reloaded successfully")
 				}
 			}
 		case err, ok := <-watcher.Errors:

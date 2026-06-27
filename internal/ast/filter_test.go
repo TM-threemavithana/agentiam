@@ -85,13 +85,13 @@ func TestApplyRules(t *testing.T) {
 		{
 			name:          "LIMIT $1 dynamic bypass",
 			sql:           "SELECT * FROM users LIMIT $1",
-			expectBlocked: true,
+			expectBlocked: false,
 			expectLimit:   false,
 		},
 		{
 			name:          "FETCH FIRST $1 ROWS ONLY dynamic bypass",
 			sql:           "SELECT * FROM users FETCH FIRST $1 ROWS ONLY",
-			expectBlocked: true,
+			expectBlocked: false,
 			expectLimit:   false,
 		},
 		{
@@ -176,7 +176,7 @@ func TestApplyRules(t *testing.T) {
 				testRules.AllowedStatements = []string{}
 			}
 
-			result, err := (&PostgresParser{}).ApplyRules(tt.sql, testRules, nil)
+			result, limitParams, err := (&PostgresParser{}).ApplyRules(tt.sql, testRules, nil)
 
 			if tt.expectBlocked {
 				if err == nil {
@@ -195,6 +195,12 @@ func TestApplyRules(t *testing.T) {
 			}
 			if !tt.expectLimit && strings.Contains(result, "LIMIT 100") {
 				t.Errorf("expected LIMIT 100 NOT to be injected, got: %s", result)
+			}
+			
+			if tt.name == "LIMIT $1 dynamic bypass" {
+				if len(limitParams) != 1 || limitParams[0] != 1 {
+					t.Errorf("expected limitParams to contain [1], got: %v", limitParams)
+				}
 			}
 		})
 	}
@@ -235,7 +241,7 @@ func TestApplyRules_Analytical_Queries_Bypass_Limit(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := (&PostgresParser{}).ApplyRules(tt.sql, rules, nil)
+			result, _, err := (&PostgresParser{}).ApplyRules(tt.sql, rules, nil)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}

@@ -17,12 +17,12 @@ func TestMaxConnectionsAndGoroutineCleanup(t *testing.T) {
 	tmpFile.Write([]byte("agents:\n  - name: dummy\n    key: dummy\n"))
 	tmpFile.Close()
 	defer os.Remove(tmpFile.Name())
-	store, _ := policy.NewStore(nil, tmpFile.Name(), "", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	store, _ := policy.NewStore(tmpFile.Name(), "", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	logger := NewLogger(io.Discard)
 	// We use a dummy upstream DSN since we won't actually dial it for rejected connections
 	handlers := make(map[ProtocolType]ProtocolHandler)
-	server := NewServer("127.0.0.1:0", "postgres://dummy", store, nil, logger, nil, handlers)
-	pgHandler := NewPostgresProtocolHandler("postgres://dummy", store, nil, logger, server)
+	server := NewServer("127.0.0.1:0", "postgres://dummy", store, nil, logger, nil, handlers, false)
+	pgHandler := NewPostgresProtocolHandler("postgres://dummy", store, nil, logger, server, false)
 	server.SetHandler(ProtocolPostgres, pgHandler)
 
 	// Force max connections to 5 for testing
@@ -45,7 +45,7 @@ func TestMaxConnectionsAndGoroutineCleanup(t *testing.T) {
 			select {
 			case server.sem <- struct{}{}:
 				go func(c net.Conn) {
-					session := NewSession(c, "postgres://dummy", store, nil, logger, server)
+					session := NewSession(c, "postgres://dummy", store, nil, logger, server, false)
 					defer session.Close()
 					session.Run()
 					<-server.sem
@@ -126,7 +126,7 @@ func TestStartupIterationLimit(t *testing.T) {
 	tmpFile.Write([]byte("agents:\n  - name: dummy\n    key: dummy\n"))
 	tmpFile.Close()
 	defer os.Remove(tmpFile.Name())
-	store, _ := policy.NewStore(nil, tmpFile.Name(), "", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	store, _ := policy.NewStore(tmpFile.Name(), "", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	// Use a dummy upstream DSN since we only care about the startup phase
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -143,10 +143,10 @@ func TestStartupIterationLimit(t *testing.T) {
 			go func(c net.Conn) {
 				logger := NewLogger(io.Discard)
 				handlers := make(map[ProtocolType]ProtocolHandler)
-				server := NewServer("127.0.0.1:0", "postgres://dummy", store, nil, logger, nil, handlers)
-				pgHandler := NewPostgresProtocolHandler("postgres://dummy", store, nil, logger, server)
+				server := NewServer("127.0.0.1:0", "postgres://dummy", store, nil, logger, nil, handlers, false)
+				pgHandler := NewPostgresProtocolHandler("postgres://dummy", store, nil, logger, server, false)
 				server.SetHandler(ProtocolPostgres, pgHandler)
-				session := NewSession(c, "postgres://dummy", store, nil, logger, server)
+				session := NewSession(c, "postgres://dummy", store, nil, logger, server, false)
 				defer session.Close()
 				_ = session.Run() // Run the session, which should hit the iteration limit
 			}(conn)

@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/binary"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,23 +22,26 @@ import (
 type PreparedStatement struct {
 	SQL           string
 	ParameterOIDs []uint32
+	LimitParams   []int
 }
 
 type PostgresProtocolHandler struct {
-	upstreamDSN string
-	store       *policy.Store
-	tlsConfig   *tls.Config
-	logger      *Logger
-	server      *Server
+	upstreamDSN  string
+	store        *policy.Store
+	tlsConfig    *tls.Config
+	logger       *Logger
+	server       *Server
+	insecureAuth bool
 }
 
-func NewPostgresProtocolHandler(upstreamDSN string, store *policy.Store, tlsConfig *tls.Config, logger *Logger, server *Server) *PostgresProtocolHandler {
+func NewPostgresProtocolHandler(upstreamDSN string, store *policy.Store, tlsConfig *tls.Config, logger *Logger, server *Server, insecureAuth bool) *PostgresProtocolHandler {
 	return &PostgresProtocolHandler{
-		upstreamDSN: upstreamDSN,
-		store:       store,
-		tlsConfig:   tlsConfig,
-		logger:      logger,
-		server:      server,
+		upstreamDSN:  upstreamDSN,
+		store:        store,
+		tlsConfig:    tlsConfig,
+		logger:       logger,
+		server:       server,
+		insecureAuth: insecureAuth,
 	}
 }
 
@@ -56,7 +61,7 @@ func (h *PostgresProtocolHandler) HandleSession(ctx context.Context, clientConn 
 		return nil
 	}
 
-	session := NewSession(clientConn, h.upstreamDSN, h.store, h.tlsConfig, h.logger, h.server)
+	session := NewSession(clientConn, h.upstreamDSN, h.store, h.tlsConfig, h.logger, h.server, h.insecureAuth)
 	session.clientBackend = clientBackend
 	session.startupMsg = startupMsg
 	defer session.Close()
@@ -73,6 +78,7 @@ type Session struct {
 	store  *policy.Store
 	logger *Logger
 	server *Server
+	insecureAuth bool
 
 	clientBackend *pgproto3.Backend
 
@@ -88,7 +94,7 @@ type Session struct {
 	preparedStatements map[string]PreparedStatement
 }
 
-func NewSession(clientConn net.Conn, upstreamDSN string, store *policy.Store, tlsConfig *tls.Config, logger *Logger, server *Server) *Session {
+func NewSession(clientConn net.Conn, upstreamDSN string, store *policy.Store, tlsConfig *tls.Config, logger *Logger, server *Server, insecureAuth bool) *Session {
 	return &Session{
 		clientConn:         clientConn,
 		upstreamDSN:        upstreamDSN,
@@ -96,6 +102,7 @@ func NewSession(clientConn net.Conn, upstreamDSN string, store *policy.Store, tl
 		tlsConfig:          tlsConfig,
 		logger:             logger,
 		server:             server,
+		insecureAuth:       insecureAuth,
 		clientBackend:      pgproto3.NewBackend(pgproto3.NewChunkReader(clientConn), clientConn),
 		preparedStatements: make(map[string]PreparedStatement),
 	}
@@ -197,6 +204,12 @@ func (s *Session) Run() error {
 				s.logger.Error("mTLS CN mismatch", "cn", cert.Subject.CommonName, "clientID", clientID)
 			}
 		}
+	}
+
+	if !mtlsVerified && !s.insecureAuth {
+		s.logger.Error("Client attempted cleartext authentication without --insecure-cleartext-auth flag")
+		s.clientBackend.Send(&pgproto3.ErrorResponse{Severity: "FATAL", Message: "mTLS is required. Cleartext auth is disabled."})
+		return fmt.Errorf("insecure auth rejected")
 	}
 
 	if !mtlsVerified {
@@ -453,7 +466,7 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 				continue
 			}
 
-			rewrittenSQL, err := (&ast.PostgresParser{}).ApplyRules(v.Query, s.rules, s.server.astCache)
+			rewrittenSQL, limitParams, err := (&ast.PostgresParser{}).ApplyRules(v.Query, s.rules, s.server.astCache)
 			if err != nil {
 				clientWriteCh <- &pgproto3.ErrorResponse{
 					Severity: "ERROR",
@@ -467,6 +480,7 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 			s.preparedStatements[v.Name] = PreparedStatement{
 				SQL:           rewrittenSQL,
 				ParameterOIDs: v.ParameterOIDs,
+				LimitParams:   limitParams,
 			}
 			v.Name = ""
 			v.Query = rewrittenSQL
@@ -498,6 +512,52 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 					Query:         ps.SQL,
 					ParameterOIDs: ps.ParameterOIDs,
 				})
+
+				if len(ps.LimitParams) > 0 && s.rules.EnforceSelectLimit > 0 {
+					for _, paramIdx := range ps.LimitParams {
+						pIdx := paramIdx - 1
+						if pIdx >= 0 && pIdx < len(v.Parameters) {
+							formatCode := uint16(0)
+							if len(v.ParameterFormatCodes) == 1 {
+								formatCode = uint16(v.ParameterFormatCodes[0])
+							} else if len(v.ParameterFormatCodes) > pIdx {
+								formatCode = uint16(v.ParameterFormatCodes[pIdx])
+							}
+
+							valBytes := v.Parameters[pIdx]
+							if len(valBytes) > 0 {
+								if formatCode == 0 { // Text
+									val, parseErr := strconv.ParseInt(string(valBytes), 10, 64)
+									if parseErr == nil && val > int64(s.rules.EnforceSelectLimit) {
+										v.Parameters[pIdx] = []byte(strconv.Itoa(s.rules.EnforceSelectLimit))
+									}
+								} else if formatCode == 1 { // Binary
+									var val int64
+									parsed := false
+									if len(valBytes) == 2 {
+										val = int64(int16(binary.BigEndian.Uint16(valBytes)))
+										parsed = true
+									} else if len(valBytes) == 4 {
+										val = int64(int32(binary.BigEndian.Uint32(valBytes)))
+										parsed = true
+									} else if len(valBytes) == 8 {
+										val = int64(binary.BigEndian.Uint64(valBytes))
+										parsed = true
+									}
+									if parsed && val > int64(s.rules.EnforceSelectLimit) {
+										if len(valBytes) == 2 {
+											binary.BigEndian.PutUint16(v.Parameters[pIdx], uint16(s.rules.EnforceSelectLimit))
+										} else if len(valBytes) == 4 {
+											binary.BigEndian.PutUint32(v.Parameters[pIdx], uint32(s.rules.EnforceSelectLimit))
+										} else if len(valBytes) == 8 {
+											binary.BigEndian.PutUint64(v.Parameters[pIdx], uint64(s.rules.EnforceSelectLimit))
+										}
+									}
+								}
+							}
+						}
+					}
+				}
 			}
 
 			v.PreparedStatement = ""
@@ -564,7 +624,7 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 
 		case *pgproto3.Query:
 			_, span := Tracer.Start(ctx, "proxy.Query")
-			rewrittenSQL, err := (&ast.PostgresParser{}).ApplyRules(v.String, s.rules, s.server.astCache)
+			rewrittenSQL, _, err := (&ast.PostgresParser{}).ApplyRules(v.String, s.rules, s.server.astCache)
 			if err != nil {
 				clientWriteCh <- &pgproto3.ErrorResponse{
 					Severity: "ERROR",
