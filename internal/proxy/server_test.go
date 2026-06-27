@@ -64,6 +64,7 @@ func TestMaxConnectionsAndGoroutineCleanup(t *testing.T) {
 
 	var wg sync.WaitGroup
 	var conns []net.Conn
+	var mu sync.Mutex
 
 	// Open 5 connections (the maximum allowed)
 	for i := 0; i < 5; i++ {
@@ -72,7 +73,9 @@ func TestMaxConnectionsAndGoroutineCleanup(t *testing.T) {
 			defer wg.Done()
 			conn, err := net.Dial("tcp", addr)
 			if err == nil {
+				mu.Lock()
 				conns = append(conns, conn)
+				mu.Unlock()
 			}
 		}()
 	}
