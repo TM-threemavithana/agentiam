@@ -1,8 +1,8 @@
 # AgentIAM
 
-**A Postgres wire proxy that blocks SQL injection from AI agents at the AST level.**
+**A PostgreSQL and MySQL wire proxy that blocks SQL injection from AI agents at the AST level.**
 
-Connecting Large Language Models (LLMs) directly to your database for "Text-to-SQL" functionality is incredibly dangerous. AgentIAM sits between your LangChain/LlamaIndex agent and your database, intercepting Postgres wire protocol traffic to parse and block destructive queries before they can execute.
+Connecting Large Language Models (LLMs) directly to your database for "Text-to-SQL" functionality is incredibly dangerous. AgentIAM sits between your LangChain/LlamaIndex agent and your database, intercepting PostgreSQL and MySQL wire protocol traffic to parse and block destructive queries before they can execute.
 
 [![CI](https://github.com/tm-threemavithana/agentiam/actions/workflows/ci.yml/badge.svg)](https://github.com/tm-threemavithana/agentiam/actions/workflows/ci.yml)
 [![Go Report Card](https://goreportcard.com/badge/github.com/tm-threemavithana/agentiam)](https://goreportcard.com/report/github.com/tm-threemavithana/agentiam)
@@ -28,10 +28,10 @@ Relying on "prompt engineering" or LLM safety rails to prevent this does not wor
 
 ## 🚀 How It Works
 
-**AgentIAM** is a specialized proxy written in Go, acting as a strict semantic firewall for PostgreSQL.
+**AgentIAM** is a specialized proxy written in Go, acting as a strict semantic firewall for PostgreSQL and MySQL.
 
-1. **Wire Protocol Interception:** The AI Agent connects to AgentIAM (default port `5433`). The proxy intercepts the incoming packets at the Postgres Extended Query protocol level.
-2. **AST Parsing:** The SQL is parsed into an Abstract Syntax Tree (AST) using `pg_query_go` (which wraps the native PostgreSQL C parser).
+1. **Wire Protocol Interception:** The AI Agent connects to AgentIAM. The proxy intercepts the incoming packets at the Postgres Extended Query or MySQL protocol level.
+2. **AST Parsing:** The SQL is parsed into an Abstract Syntax Tree (AST) using `pg_query_go` for PostgreSQL, or the `pingcap/tidb` parser for MySQL.
 3. **Deterministic Enforcement:** AgentIAM uses a recursive Visitor pattern to traverse the AST. If a blocked node (like a `DeleteStmt`) is detected—even if hidden deeply inside a CTE or subquery—the proxy instantly drops the query and returns a protocol error to the AI.
 4. **Self-Contained Policies:** The proxy enforces rules based on a localized policy store (YAML/SQLite). It deliberately has **zero external infrastructure dependencies** (no Redis, no external control planes) to minimize failure modes and attack surfaces.
 5. **AST Rewriting:** If an allowed `SelectStmt` lacks a limit, AgentIAM rewrites the AST to enforce a hard `LIMIT 100`, deparses it back to SQL, and forwards it to the real database.
@@ -59,6 +59,7 @@ version: "1"
 agents:
   - name: "langchain-bot"
     key: "$2a$10$..." # bcrypt hash of the agent's password
+    dialect: "postgres" # or "mysql"
     allowed_statements:
       - SELECT
       - SHOW
@@ -82,7 +83,7 @@ AgentIAM does not pool upstream connections; it maintains a 1:1 mapping between 
 `AI Agent -> AgentIAM Proxy -> PgBouncer -> Postgres`
 
 ### Security Boundaries
-- **Authentication:** The proxy currently uses `AuthenticationCleartextPassword` during the local handshake with the AI agent. It is designed to be deployed as a sidecar or within a secure internal network boundary.
+- **Authentication:** The proxy supports `AuthenticationCleartextPassword` for local connections, but now heavily emphasizes **mutual TLS (mTLS)** for secure authentication. Valid mTLS certificates can be configured to bypass standard password checks.
 - **Timing Oracles:** The proxy does not obfuscate latency during authentication or policy evaluation. An attacker on the same subnet could theoretically deduce valid agent keys by measuring `bcrypt` comparison time, and could detect SQLite hit vs miss latency for policy lookups.
 - **Parameterized LIMITs:** While the proxy automatically injects a `LIMIT` clause for unbounded `SELECT` statements, it deliberately rejects parameterized limits (e.g., `LIMIT $1`). Applications or ORMs that default to parameterized limits must disable them for proxy compliance.
 - **Semantic Logic:** The proxy prevents unauthorized tables from being queried, but does not currently enforce row-level security (RLS) or inject tenant isolation limits.
