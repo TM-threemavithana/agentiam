@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"sync"
 	"sync/atomic"
 
 	"github.com/jackc/pgproto3/v2"
@@ -34,7 +33,6 @@ type Pool struct {
 	size   int
 	logger *Logger
 	conns  chan *UpstreamConn
-	mu     sync.Mutex
 }
 
 func NewPool(dsn string, size int, logger *Logger) *Pool {

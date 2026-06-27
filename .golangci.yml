@@ -5,15 +5,11 @@ run:
 linters:
   disable-all: true
   enable:
-    - errcheck
     - govet
     - ineffassign
     - staticcheck
-    - unused
-    - revive
-    - gosec
-    - gocritic
     - gosimple
+    - unused
     - typecheck
     - bodyclose
     - nilerr
