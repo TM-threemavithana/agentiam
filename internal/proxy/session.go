@@ -96,6 +96,7 @@ func NewSession(clientConn net.Conn, upstreamDSN string, store *policy.Store, tl
 		tlsConfig:          tlsConfig,
 		logger:             logger,
 		server:             server,
+		clientBackend:      pgproto3.NewBackend(pgproto3.NewChunkReader(clientConn), clientConn),
 		preparedStatements: make(map[string]PreparedStatement),
 	}
 }
