@@ -55,7 +55,11 @@ func (h *MySQLProtocolHandler) HandleSession(ctx context.Context, clientConn net
 		h.logger.Error("MySQL Handshake failed", "error", err)
 		return err
 	}
-	defer conn.Close()
+	defer func() {
+		if conn != nil && !conn.Closed() {
+			conn.Close()
+		}
+	}()
 
 	for {
 		err := conn.HandleCommand()
