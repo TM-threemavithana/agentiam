@@ -34,8 +34,8 @@ func setupTestEnv(t *testing.T) (string, string, func()) {
 	ctx := context.Background()
 
 	// 1. Start Postgres Container
-	pgContainer, err := postgres.RunContainer(ctx,
-		testcontainers.WithImage("postgres:15-alpine"),
+	pgContainer, err := postgres.Run(ctx,
+		"postgres:15-alpine",
 		postgres.WithDatabase("testdb"),
 		postgres.WithUsername("app_user"),
 		postgres.WithPassword("app_password"),

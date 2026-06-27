@@ -140,7 +140,6 @@ func (s *Session) Run() error {
 				return fmt.Errorf("client attempted plaintext connection when TLS is enforced")
 			}
 			clientID = msg.Parameters["user"]
-			break
 
 		case *pgproto3.SSLRequest:
 			if s.tlsConfig == nil {
@@ -217,9 +216,7 @@ func (s *Session) Run() error {
 			}
 
 			clientFirstBare := string(saslInitial.Data)
-			if strings.HasPrefix(clientFirstBare, "n,,") {
-				clientFirstBare = clientFirstBare[3:]
-			}
+			clientFirstBare = strings.TrimPrefix(clientFirstBare, "n,,")
 
 			iters, salt, storedKey, serverKey, err := ParseSCRAMSecret(agentKey)
 			if err != nil {
@@ -596,7 +593,7 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 				if err != nil {
 					return err
 				}
-				u.Frontend.Send(msg.(pgproto3.FrontendMessage))
+				u.Frontend.Send(msg)
 			}
 		}
 	}

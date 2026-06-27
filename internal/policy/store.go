@@ -105,7 +105,7 @@ func (s *Store) loadPolicies() error {
 
 	// 2. Try HTTP API if Redis didn't yield agents
 	if len(py.Agents) == 0 && s.apiUrl != "" {
-		req, err := http.NewRequest("GET", s.apiUrl, nil)
+		req, err := http.NewRequestWithContext(context.Background(), "GET", s.apiUrl, nil)
 		if err != nil {
 			return fmt.Errorf("failed to create request: %w", err)
 		}

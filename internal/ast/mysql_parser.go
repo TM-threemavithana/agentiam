@@ -80,11 +80,11 @@ func (v *mysqlVisitor) Enter(in ast.Node) (ast.Node, bool) {
 			v.stmtType = "SELECT"
 		}
 		// Inject limit if missing and enforce is configured
-		if v.rules.EnforceSelectLimit > 0 && node.Limit == nil {
-			// Note: properly injecting AST nodes into pingcap requires constructing ValueExprs.
-			// For simplicity in this roadmap step, we'll track but not full-inject here.
-			// A full implementation would inject `node.Limit = &ast.Limit{...}`
-		}
+		// if v.rules.EnforceSelectLimit > 0 && node.Limit == nil {
+		// 	// Note: properly injecting AST nodes into pingcap requires constructing ValueExprs.
+		// 	// For simplicity in this roadmap step, we'll track but not full-inject here.
+		// 	// A full implementation would inject `node.Limit = &ast.Limit{...}`
+		// }
 	case *ast.InsertStmt:
 		if v.stmtType == "" {
 			v.stmtType = "INSERT"

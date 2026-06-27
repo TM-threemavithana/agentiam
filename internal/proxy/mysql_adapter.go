@@ -50,7 +50,7 @@ func (h *MySQLProtocolHandler) HandleSession(ctx context.Context, clientConn net
 	}
 	proxyHandler := &AgentIAMMySQLHandler{db: h.db, logger: h.logger}
 
-	conn, err := server.NewCustomizedConn(clientConn, serverConf, authHandler, proxyHandler)
+	conn, err := serverConf.NewCustomizedConn(clientConn, authHandler, proxyHandler)
 	if err != nil {
 		h.logger.Error("MySQL Handshake failed", "error", err)
 		return err
