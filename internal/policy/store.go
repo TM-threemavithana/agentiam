@@ -25,6 +25,7 @@ type AgentConfig struct {
 	Key                string   `yaml:"key" json:"key"` // bcrypt hash or SCRAM verifier
 	AllowedStatements  []string `yaml:"allowed_statements" json:"allowed_statements"`
 	AllowedTables      []string `yaml:"allowed_tables" json:"allowed_tables"`
+	BlockedFunctions   []string `yaml:"blocked_functions" json:"blocked_functions"`
 	SelectLimit        int      `yaml:"select_limit" json:"select_limit"`
 	MaxExecutionTimeMs int      `yaml:"max_execution_time_ms" json:"max_execution_time_ms"`
 	PoolMode           string   `yaml:"pool_mode" json:"pool_mode"`
@@ -258,6 +259,7 @@ func (s *Store) GetRulesForAgent(clientID string, suppliedPassword string) (ast.
 	return ast.Rules{
 		AllowedStatements:  state.config.AllowedStatements,
 		AllowedTables:      state.config.AllowedTables,
+		BlockedFunctions:   state.config.BlockedFunctions,
 		EnforceSelectLimit: limit,
 		MaxExecutionTimeMs: timeoutMs,
 		PoolMode:           state.config.PoolMode,

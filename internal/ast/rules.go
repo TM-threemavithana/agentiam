@@ -4,6 +4,7 @@ package ast
 type Rules struct {
 	AllowedStatements  []string
 	AllowedTables      []string
+	BlockedFunctions   []string
 	EnforceSelectLimit int
 	MaxExecutionTimeMs int
 	PoolMode           string

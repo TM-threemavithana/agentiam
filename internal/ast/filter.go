@@ -176,6 +176,18 @@ func enforceRules(node *pg_query.Node, rules Rules, depth int, limitParams *[]in
 		if !isAllowed("SHOW", rules.AllowedStatements) {
 			return fmt.Errorf("SHOW statements are not allowed by policy")
 		}
+	case *pg_query.Node_FuncCall:
+		for _, fn := range n.FuncCall.Funcname {
+			if strNode, ok := fn.Node.(*pg_query.Node_String_); ok {
+				fnName := strNode.String_.Sval
+				for _, blocked := range rules.BlockedFunctions {
+					if strings.EqualFold(fnName, blocked) {
+						return fmt.Errorf("function '%s' is not allowed by policy", fnName)
+					}
+				}
+			}
+		}
+
 	case *pg_query.Node_ExplainStmt:
 		for _, opt := range n.ExplainStmt.Options {
 			if defElem, ok := opt.Node.(*pg_query.Node_DefElem); ok && defElem.DefElem.Defname == "analyze" {

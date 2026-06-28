@@ -2,25 +2,15 @@ package main
 
 import (
 	"fmt"
-	"log"
-
-	"github.com/tm-threemavithana/agentiam/internal/ast"
+	"github.com/wasilibs/go-pgquery/parser"
+	pg_query "github.com/pganalyze/pg_query_go/v6"
+	"google.golang.org/protobuf/proto"
 )
 
 func main() {
-	sql := `SELECT pg_catalog.pg_class.relname FROM pg_catalog.pg_class JOIN pg_catalog.pg_namespace ON pg_catalog.pg_namespace.oid = pg_catalog.pg_class.relnamespace WHERE pg_catalog.pg_class.relkind = ANY (ARRAY['r', 'p']) AND pg_catalog.pg_class.relpersistence != 't' AND pg_catalog.pg_table_is_visible(pg_catalog.pg_class.oid) AND pg_catalog.pg_namespace.nspname != 'pg_catalog'`
-	
-	rules := ast.Rules{
-		AllowedStatements: []string{"SelectStmt"},
-		AllowedTables:     []string{"*"},
-		EnforceSelectLimit: 100,
-	}
-	
-	parser := &ast.PostgresParser{}
-	deparsed, _, err := parser.ApplyRules(sql, rules, nil)
-	if err != nil {
-		log.Fatal(err)
-	}
-	fmt.Println("Deparsed:")
-	fmt.Println(deparsed)
+	sql := "SELECT * FROM users WHERE id = 1 AND (SELECT pg_sleep(10)) IS NULL;"
+	b, _ := parser.ParseToProtobuf(sql)
+	var tree pg_query.ParseResult
+	proto.Unmarshal(b, &tree)
+	fmt.Printf("%+v\n", tree.Stmts[0].Stmt)
 }

@@ -20,7 +20,7 @@ if not DROPLET_IP:
 
 # Replace with the dummy user/password configured in your policies.yaml
 # By default, AgentIAM intercepts this and checks the policy before forwarding to Neon.
-DSN = f"postgresql://langchain-bot:test-agent-key@{DROPLET_IP}:5432/postgres"
+DSN = f"postgresql://langchain-bot:test-agent-key@{DROPLET_IP}:5433/postgres"
 
 print("╔════════════════════════════════════════════════════════════╗")
 print("║         AgentIAM Remote Deployment Load Test               ║")
