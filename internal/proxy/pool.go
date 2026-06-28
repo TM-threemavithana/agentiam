@@ -33,6 +33,7 @@ type Pool struct {
 	size   int
 	logger *Logger
 	conns  chan *UpstreamConn
+	ready  atomic.Bool
 }
 
 func NewPool(dsn string, size int, logger *Logger) *Pool {
@@ -44,6 +45,10 @@ func NewPool(dsn string, size int, logger *Logger) *Pool {
 	}
 }
 
+func (p *Pool) IsReady() bool {
+	return p.ready.Load()
+}
+
 func (p *Pool) Init(ctx context.Context) error {
 	for i := 0; i < p.size; i++ {
 		u, err := p.dial(ctx)
@@ -51,6 +56,9 @@ func (p *Pool) Init(ctx context.Context) error {
 			return fmt.Errorf("failed to dial upstream during pool init: %w", err)
 		}
 		p.conns <- u
+		if i == 0 {
+			p.ready.Store(true)
+		}
 	}
 	p.logger.Info("Upstream connection pool initialized", "size", p.size)
 	PoolTotalConnections.Set(float64(p.size))

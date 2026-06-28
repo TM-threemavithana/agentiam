@@ -146,11 +146,21 @@ func (s *Server) SetHandler(ptype ProtocolType, handler ProtocolHandler) {
 // Start begins listening on the configured TCP address.
 // It also spins up background goroutines for Prometheus metrics and policy revocation polling.
 func (s *Server) Start() error {
-	// Start metrics server explicitly on localhost
+	// Start metrics and health server explicitly on localhost
 	go func() {
-		http.Handle("/metrics", promhttp.Handler())
-		s.logger.Info("Starting Prometheus metrics endpoint", "addr", ":9090")
-		if err := http.ListenAndServe(":9090", nil); err != nil {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.Handler())
+		mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+			if s.pool.IsReady() {
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte("ok"))
+			} else {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				w.Write([]byte("pool not ready"))
+			}
+		})
+		s.logger.Info("Starting Prometheus metrics and health endpoint", "addr", ":9090")
+		if err := http.ListenAndServe(":9090", mux); err != nil {
 			s.logger.Error("Metrics server failed", "error", err)
 		}
 	}()
@@ -158,9 +168,11 @@ func (s *Server) Start() error {
 	// Start policy revocation poller
 	go s.pollPolicyUpdates()
 
-	if err := s.InitPool(context.Background()); err != nil {
-		s.logger.Error("failed to init upstream pool", "error", err)
-	}
+	go func() {
+		if err := s.InitPool(context.Background()); err != nil {
+			s.logger.Error("failed to init upstream pool", "error", err)
+		}
+	}()
 
 	l, err := net.Listen("tcp", s.listenAddr)
 	if err != nil {
