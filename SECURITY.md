@@ -1,24 +1,14 @@
 # Security Policy
 
-## Supported Versions
+## Known Vulnerabilities
 
-AgentIAM is currently in active development. Only the latest `main` branch and the most recent numbered release are officially supported for security updates. 
+### GO-2026-4518 (Denial of Service in `pgproto3/v2`)
+- **Status:** Unpatched / Known Risk
+- **Dependency:** `github.com/jackc/pgproto3/v2@v2.3.3`
+- **Advisory:** https://pkg.go.dev/vuln/GO-2026-4518
 
-| Version | Supported          |
-| ------- | ------------------ |
-| v0.x.x  | :white_check_mark: |
-| main    | :white_check_mark: |
+**Details:**
+The `govulncheck` tool flags a known denial-of-service vulnerability in `github.com/jackc/pgproto3/v2`. AgentIAM directly depends on this module for handling raw PostgreSQL wire protocol connections (specifically, using `pgproto3.Frontend.Receive` within the connection pool logic).
 
-## Reporting a Vulnerability
-
-If you discover a security vulnerability in AgentIAM, please DO NOT report it by opening a public GitHub issue.
-
-Instead, please send an email to `security@agentiam.io` with a description of the issue and the steps to reproduce it. We will acknowledge your email within 48 hours and provide a timeline for triage and resolution.
-
-## Threat Model & Security Boundaries
-
-AgentIAM operates as a strict semantic firewall designed to block specific classes of SQL attacks (e.g., destructive statements, unlimited `SELECT` queries, unauthorized table access). However, please note the following security boundaries:
-
-- **Authentication Timing Oracles:** We do not currently obfuscate latency during authentication. Timing attacks could theoretically deduce valid agent keys via `bcrypt` comparison time.
-- **Row-Level Security:** AgentIAM does not currently enforce RLS (Row-Level Security) natively; rely on your upstream database for row isolation.
-- **Connection Security:** AgentIAM supports `AuthenticationCleartextPassword`, but deploying it in production without `mTLS` or a secure internal boundary network is highly discouraged. You must explicitly opt in to cleartext authentication via the `--insecure-cleartext-auth` flag.
+**Mitigation & Future Work:**
+Currently, there is no upstream fix available for `v2.3.3`. We cannot simply drop the dependency without entirely rewriting the proxy's connection pool to utilize `pgx/v5` internal implementations. Until an upstream patch is released or the connection pool is rewritten, this remains an accepted known risk. Downstream deployments are advised to mitigate DoS risks using strict rate-limiting and a connection pooler like PgBouncer in front of the database.

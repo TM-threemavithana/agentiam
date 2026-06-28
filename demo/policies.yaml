@@ -12,4 +12,10 @@ agents:
       - orders
       - information_schema.tables
       - information_schema.columns
+      - pg_catalog.pg_class
+      - pg_catalog.pg_namespace
+      - pg_catalog.pg_attribute
+      - pg_catalog.pg_type
+      - pg_catalog.pg_am
+      - pg_catalog.pg_database
     select_limit: 100

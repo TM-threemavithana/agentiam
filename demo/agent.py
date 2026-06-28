@@ -27,15 +27,11 @@ agent = None
 if USE_MOCK:
     print("ℹ️  Running in MOCK mode (Simulating LLM SQL generation)")
 else:
-    if not os.getenv("OPENAI_API_KEY"):
-        print("❌ OPENAI_API_KEY is not set. To run the demo with a real LLM, export your API key.")
-        print("💡 Alternatively, run with mock mode: AGENTIAM_DEMO_MOCK=true docker-compose up")
-        sys.exit(1)
-    from langchain_openai import ChatOpenAI
-    from langchain.agents import create_sql_agent
-    print("ℹ️  Running with REAL OpenAI LLM (gpt-4o)")
-    llm = ChatOpenAI(model="gpt-4o", temperature=0)
-    agent = create_sql_agent(llm, db=db, agent_type="openai-tools", verbose=False)
+    from langchain_community.llms import Ollama
+    from langchain_community.agent_toolkits import create_sql_agent
+    print("ℹ️  Running with REAL Ollama LLM (qwen2.5-coder:3b)")
+    llm = Ollama(model="qwen2.5-coder:3b", base_url="http://host.docker.internal:11434")
+    agent = create_sql_agent(llm, db=db, agent_type="zero-shot-react-description", verbose=False)
 
 def run_scenario(title, prompt, expected_query):
     print(f"\n{title}: \"{prompt}\"")

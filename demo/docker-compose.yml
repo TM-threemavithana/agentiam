@@ -7,6 +7,8 @@ services:
       POSTGRES_USER: app_user
       POSTGRES_PASSWORD: supersecretpassword
       POSTGRES_DB: postgres
+    ports:
+      - "5434:5432"
     volumes:
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
@@ -22,6 +24,7 @@ services:
       context: .. # Build from root so we can access AgentIAM source
       dockerfile: Dockerfile
     environment:
+      - AGENTIAM_INSECURE_CLEARTEXT_AUTH=true
       - AGENTIAM_LISTEN_PORT=5432
       - AGENTIAM_UPSTREAM_DSN=postgres://app_user:supersecretpassword@postgres:5432/postgres?sslmode=disable
       - AGENTIAM_POLICY_FILE=/etc/agentiam/policies.yaml
@@ -29,7 +32,7 @@ services:
       - AGENTIAM_METRICS_PORT=9090
       - AGENTIAM_DEV_MODE=true
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - ./policies.yaml:/etc/agentiam/policies.yaml:ro
     depends_on:

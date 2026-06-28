@@ -33,7 +33,7 @@ Relying on "prompt engineering" or LLM safety rails to prevent this does not wor
 1. **Wire Protocol Interception:** The AI Agent connects to AgentIAM. The proxy intercepts the incoming packets at the Postgres Extended Query or MySQL protocol level.
 2. **AST Parsing:** The SQL is parsed into an Abstract Syntax Tree (AST) using `pg_query_go` for PostgreSQL, or the `pingcap/tidb` parser for MySQL.
 3. **Deterministic Enforcement:** AgentIAM uses a recursive Visitor pattern to traverse the AST. If a blocked node (like a `DeleteStmt`) is detected—even if hidden deeply inside a CTE or subquery—the proxy instantly drops the query and returns a protocol error to the AI.
-4. **Self-Contained Policies:** The proxy enforces rules based on a localized policy store (YAML/SQLite). It deliberately has **zero external infrastructure dependencies** (no Redis, no external control planes) to minimize failure modes and attack surfaces.
+4. **Policy Fetching via HTTP Polling:** The proxy enforces rules based on policies retrieved via an HTTP polling mechanism against a remote control plane. This replaces the legacy Redis-based architecture to reduce external infrastructure dependencies (like deploying a Redis cluster alongside the proxy), though it introduces polling overhead.
 5. **AST Rewriting:** If an allowed `SelectStmt` lacks a limit, AgentIAM rewrites the AST to enforce a hard `LIMIT 100`, deparses it back to SQL, and forwards it to the real database.
 
 ---
@@ -52,24 +52,17 @@ docker-compose up --build
 
 ## ⚙️ Configuration
 
-AgentIAM is configured via a local declarative YAML file. When starting the proxy, pass the path to your policy file.
+AgentIAM policies are fetched periodically from a remote control plane via HTTP polling. The proxy requires an API endpoint and a long-lived access token to bootstrap the configuration.
 
 ```yaml
 version: "1"
-agents:
-  - name: "langchain-bot"
-    key: "$2a$10$..." # bcrypt hash of the agent's password
-    dialect: "postgres" # or "mysql"
-    allowed_statements:
-      - SELECT
-      - SHOW
-    allowed_tables:
-      - users
-      - orders
-    select_limit: 100
+control_plane:
+  endpoint: "https://api.agentiam.io/v1/policies"
+  token: "secret-token-here"
+  poll_interval: "30s"
 ```
 
-When your AI connects, it uses `langchain-bot` as the database user. The proxy intercepts the handshake, verifies the password, reads the local policy, and establishes the session.
+When your AI connects, it uses `langchain-bot` as the database user. The proxy intercepts the handshake, verifies the password against the cached policies, and establishes the session.
 
 ---
 

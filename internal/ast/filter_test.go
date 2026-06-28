@@ -3,6 +3,7 @@ package ast
 import (
 	"strings"
 	"testing"
+	"github.com/tm-threemavithana/agentiam/internal/cache"
 )
 
 func TestApplyRules(t *testing.T) {
@@ -166,6 +167,48 @@ func TestApplyRules(t *testing.T) {
 			expectBlocked: false,
 			expectLimit:   true, // Limit is injected at the top level
 		},
+		{
+			name:          "Insert Statement",
+			sql:           "INSERT INTO users (id) VALUES (1)",
+			expectBlocked: true,
+			expectLimit:   false,
+		},
+		{
+			name:          "Update Statement",
+			sql:           "UPDATE users SET name='test' WHERE id=1",
+			expectBlocked: true,
+			expectLimit:   false,
+		},
+		{
+			name:          "Drop Statement",
+			sql:           "DROP TABLE users",
+			expectBlocked: true,
+			expectLimit:   false,
+		},
+		{
+			name:          "Truncate Statement",
+			sql:           "TRUNCATE TABLE users",
+			expectBlocked: true,
+			expectLimit:   false,
+		},
+		{
+			name:          "Create Statement",
+			sql:           "CREATE TABLE users (id int)",
+			expectBlocked: true,
+			expectLimit:   false,
+		},
+		{
+			name:          "Alter Statement",
+			sql:           "ALTER TABLE users ADD COLUMN name text",
+			expectBlocked: true,
+			expectLimit:   false,
+		},
+		{
+			name:          "Show Statement",
+			sql:           "SHOW config_file",
+			expectBlocked: true,
+			expectLimit:   false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -249,5 +292,37 @@ func TestApplyRules_Analytical_Queries_Bypass_Limit(t *testing.T) {
 				t.Errorf("expected %q, got %q", tt.expected, result)
 			}
 		})
+	}
+}
+
+func TestApplyRules_CacheAndErrors(t *testing.T) {
+	rules := Rules{
+		AllowedStatements:  []string{"SELECT"},
+		EnforceSelectLimit: 10,
+	}
+
+	c, _ := cache.NewLocalCache(100)
+	parser := &PostgresParser{}
+
+	// Test syntax error
+	_, _, err := parser.ApplyRules("SELECT * FROM", rules, c)
+	if err == nil {
+		t.Error("expected syntax error")
+	}
+
+	// Test cache miss and cache add
+	sql := "SELECT * FROM users"
+	_, _, err = parser.ApplyRules(sql, rules, c)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	// Test cache hit
+	result, _, err := parser.ApplyRules(sql, rules, c)
+	if err != nil {
+		t.Errorf("unexpected error on cache hit: %v", err)
+	}
+	if !strings.Contains(result, "LIMIT 10") {
+		t.Errorf("expected cached result to have limit: %v", result)
 	}
 }

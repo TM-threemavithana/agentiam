@@ -344,6 +344,28 @@ func (s *Session) getOrAcquireUpstream(ctx context.Context, clientWriteCh chan p
 				return
 			}
 
+			if dr, ok := msg.(*pgproto3.DataRow); ok {
+				newValues := make([][]byte, len(dr.Values))
+				for i, v := range dr.Values {
+					if v != nil {
+						newValues[i] = append([]byte(nil), v...)
+					}
+				}
+				msg = &pgproto3.DataRow{Values: newValues}
+			} else if rd, ok := msg.(*pgproto3.RowDescription); ok {
+				newFields := make([]pgproto3.FieldDescription, len(rd.Fields))
+				for i, f := range rd.Fields {
+					newFields[i] = f
+					if f.Name != nil {
+						newFields[i].Name = append([]byte(nil), f.Name...)
+					}
+				}
+				msg = &pgproto3.RowDescription{Fields: newFields}
+			} else if cc, ok := msg.(*pgproto3.CommandComplete); ok {
+				newTag := append([]byte(nil), cc.CommandTag...)
+				msg = &pgproto3.CommandComplete{CommandTag: newTag}
+			}
+
 			if _, ok := msg.(*pgproto3.ParseComplete); ok {
 				swallows := u.SwallowParseComplete.Load()
 				if swallows > 0 {
