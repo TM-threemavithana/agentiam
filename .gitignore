@@ -1,8 +1,8 @@
 # Compiled binaries
-agentiam
-agentiamctl
-agentiam.exe
-agentiamctl.exe
+/agentiam
+/agentiamctl
+/agentiam.exe
+/agentiamctl.exe
 *.exe
 
 # Build output
