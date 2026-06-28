@@ -1,6 +1,6 @@
 module github.com/tm-threemavithana/agentiam
 
-go 1.23.0
+go 1.25.0
 
 require (
 	github.com/fsnotify/fsnotify v1.10.1
@@ -96,7 +96,6 @@ require (
 	go.uber.org/atomic v1.11.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.28.0 // indirect
-	go.yaml.in/yaml/v2 v2.4.2 // indirect
 	golang.org/x/net v0.30.0 // indirect
 	golang.org/x/sys v0.46.0 // indirect
 	golang.org/x/text v0.38.0 // indirect
