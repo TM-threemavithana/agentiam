@@ -24,7 +24,7 @@ if __name__ == "__main__":
     port = os.environ.get("AGENTIAM_PORT", "5433")
     
     # We connect as langchain-bot, which only has SELECT/SHOW/SET/ROLLBACK on users/orders
-    dsn = f"postgresql://langchain-bot:test-agent-key@{droplet_ip}:{port}/postgres"
+    dsn = f"postgresql://langchain-bot:test-agent-key@{droplet_ip}:{port}/neondb?sslmode=require"
     engine = create_engine(dsn, pool_pre_ping=True)
     
     print("🔌 Connecting to AgentIAM Proxy for Security Audit...")
@@ -50,7 +50,7 @@ if __name__ == "__main__":
     attack3 = """
     SELECT 
         u.id, 
-        u.name, 
+        u.username, 
         AVG(r.rating) OVER (PARTITION BY u.id) as avg_rating
     FROM users u
     JOIN reviews r ON u.id = r.user_id;
@@ -58,7 +58,7 @@ if __name__ == "__main__":
 
     # We also do a successful query to prove it works
     success_query = """
-    SELECT id, name FROM users LIMIT 2;
+    SELECT id, username FROM users LIMIT 2;
     """
 
     print("\n--- BEGIN SECURITY AUDIT ---")
