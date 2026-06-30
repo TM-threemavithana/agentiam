@@ -91,6 +91,9 @@ type Session struct {
 	virtualPID uint32
 	virtualSec uint32
 
+	lastClientActivity atomic.Int64
+	queryRunning       atomic.Bool
+
 	preparedStatements map[string]PreparedStatement
 }
 
@@ -121,6 +124,28 @@ func (s *Session) CancelQuery() {
 func (s *Session) Run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	s.lastClientActivity.Store(time.Now().UnixNano())
+
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if !s.queryRunning.Load() {
+					last := time.Unix(0, s.lastClientActivity.Load())
+					if time.Since(last) > 5*time.Minute {
+						s.logger.Info("Closing idle connection", "client", s.clientConn.RemoteAddr())
+						s.Close()
+						return
+					}
+				}
+			}
+		}
+	}()
 
 	go func() {
 		<-ctx.Done()
@@ -298,8 +323,8 @@ func (s *Session) Run() error {
 
 	s.clientBackend.Send(&pgproto3.AuthenticationOk{})
 
-	s.virtualPID = uint32(time.Now().UnixNano())
-	s.virtualSec = uint32(time.Now().UnixNano() >> 32)
+	s.virtualPID, s.virtualSec = s.server.AllocateVirtualPID(s)
+	defer s.server.DeallocateVirtualPID(s.virtualPID)
 
 	s.server.RegisterSession(clientID, s, authVersion, cancel)
 	defer s.server.UnregisterSession(clientID, s)
@@ -397,6 +422,9 @@ func (s *Session) getOrAcquireUpstream(ctx context.Context, clientWriteCh chan p
 					continue
 				}
 
+				s.queryRunning.Store(false)
+				s.lastClientActivity.Store(time.Now().UnixNano())
+
 				u.TxStatus = rfq.TxStatus
 				if rfq.TxStatus == 'I' {
 					if s.rules.PoolMode != "session" {
@@ -464,14 +492,14 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 	}()
 
 	for {
-		s.clientConn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 		msg, err := s.clientBackend.Receive()
-		s.clientConn.SetReadDeadline(time.Time{})
 
 		if err != nil {
 			s.recoverBrokenTransaction()
 			return err
 		}
+
+		s.lastClientActivity.Store(time.Now().UnixNano())
 
 		select {
 		case <-ctx.Done():
@@ -615,6 +643,7 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 			span.End()
 
 		case *pgproto3.Execute:
+			s.queryRunning.Store(true)
 			_, span := Tracer.Start(ctx, "proxy.Execute")
 			if s.errorDiscard.Load() {
 				span.End()
@@ -630,10 +659,12 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 			span.End()
 
 		case *pgproto3.Sync:
+			s.queryRunning.Store(true)
 			_, span := Tracer.Start(ctx, "proxy.Sync")
 			if s.errorDiscard.Load() {
 				s.errorDiscard.Store(false)
 				clientWriteCh <- &pgproto3.ReadyForQuery{TxStatus: 'I'}
+				s.queryRunning.Store(false)
 			} else {
 				u, err := s.getOrAcquireUpstream(ctx, clientWriteCh)
 				if err != nil {
@@ -645,6 +676,7 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 			span.End()
 
 		case *pgproto3.Query:
+			s.queryRunning.Store(true)
 			_, span := Tracer.Start(ctx, "proxy.Query")
 			rewrittenSQL, _, err := (&ast.PostgresParser{}).ApplyRules(v.String, s.rules, s.server.astCache)
 			if err != nil {

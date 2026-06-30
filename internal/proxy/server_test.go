@@ -21,7 +21,7 @@ func TestMaxConnectionsAndGoroutineCleanup(t *testing.T) {
 	logger := NewLogger(io.Discard)
 	// We use a dummy upstream DSN since we won't actually dial it for rejected connections
 	handlers := make(map[ProtocolType]ProtocolHandler)
-	server := NewServer("127.0.0.1:0", "postgres://dummy", store, nil, logger, nil, handlers, false)
+	server := NewServer("127.0.0.1:0", "postgres://dummy", store, nil, logger, nil, handlers, false, ":0", 5)
 	pgHandler := NewPostgresProtocolHandler("postgres://dummy", store, nil, logger, server, false)
 	server.SetHandler(ProtocolPostgres, pgHandler)
 
@@ -143,7 +143,7 @@ func TestStartupIterationLimit(t *testing.T) {
 			go func(c net.Conn) {
 				logger := NewLogger(io.Discard)
 				handlers := make(map[ProtocolType]ProtocolHandler)
-				server := NewServer("127.0.0.1:0", "postgres://dummy", store, nil, logger, nil, handlers, false)
+				server := NewServer("127.0.0.1:0", "postgres://dummy", store, nil, logger, nil, handlers, false, ":0", 5)
 				pgHandler := NewPostgresProtocolHandler("postgres://dummy", store, nil, logger, server, false)
 				server.SetHandler(ProtocolPostgres, pgHandler)
 				session := NewSession(c, "postgres://dummy", store, nil, logger, server, false)

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 
 	"github.com/tm-threemavithana/agentiam/internal/cache"
 	"github.com/tm-threemavithana/agentiam/internal/policy"
@@ -66,8 +67,22 @@ func main() {
 	astCache = lc
 	logger.Info("Using local LRU for AST Cache")
 
+	metricsAddr := os.Getenv("AGENTIAM_METRICS_ADDR")
+	if metricsAddr == "" {
+		metricsAddr = ":9090"
+	}
+
+	poolSize := 50
+	if psStr := os.Getenv("AGENTIAM_POOL_SIZE"); psStr != "" {
+		if ps, err := strconv.Atoi(psStr); err == nil && ps > 0 {
+			poolSize = ps
+		} else {
+			logger.Warn("Invalid AGENTIAM_POOL_SIZE, falling back to default 50", "input", psStr)
+		}
+	}
+
 	handlers := make(map[proxy.ProtocolType]proxy.ProtocolHandler)
-	srv := proxy.NewServer(":"+listenPort, upstreamDSN, store, tlsConfig, logger, astCache, handlers, insecureAuth)
+	srv := proxy.NewServer(":"+listenPort, upstreamDSN, store, tlsConfig, logger, astCache, handlers, insecureAuth, metricsAddr, poolSize)
 
 	pgHandler := proxy.NewPostgresProtocolHandler(upstreamDSN, store, tlsConfig, logger, srv, insecureAuth)
 	mysqlHandler := proxy.NewMySQLProtocolHandler(store, logger, insecureAuth)
