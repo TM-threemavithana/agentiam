@@ -17,6 +17,7 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/time/rate"
 	"gopkg.in/yaml.v3"
 )
 
@@ -28,6 +29,8 @@ type AgentConfig struct {
 	BlockedFunctions   []string `yaml:"blocked_functions" json:"blocked_functions"`
 	SelectLimit        int      `yaml:"select_limit" json:"select_limit"`
 	MaxExecutionTimeMs int      `yaml:"max_execution_time_ms" json:"max_execution_time_ms"`
+	RateLimitRPM       int      `yaml:"rate_limit_rpm" json:"rate_limit_rpm"`
+	RateLimitBurst     int      `yaml:"rate_limit_burst" json:"rate_limit_burst"`
 	PoolMode           string   `yaml:"pool_mode" json:"pool_mode"`
 	Dialect            string   `yaml:"dialect" json:"dialect"`
 	CreatedAt          string   `yaml:"created_at" json:"created_at"`
@@ -43,6 +46,7 @@ type agentState struct {
 	version       int
 	cachedPwdHash [32]byte
 	hasCache      bool
+	limiter       *rate.Limiter
 }
 
 type Store struct {
@@ -140,11 +144,23 @@ func (s *Store) loadPolicies() error {
 			}
 		}
 
+		var limiter *rate.Limiter
+		if exists && oldState.config.RateLimitRPM == a.RateLimitRPM && oldState.config.RateLimitBurst == a.RateLimitBurst {
+			limiter = oldState.limiter
+		} else if a.RateLimitRPM > 0 {
+			burst := a.RateLimitBurst
+			if burst <= 0 {
+				burst = 1 // Default burst
+			}
+			limiter = rate.NewLimiter(rate.Limit(float64(a.RateLimitRPM)/60.0), burst)
+		}
+
 		newAgents[a.Name] = agentState{
 			config:        a,
 			version:       version,
 			hasCache:      hasCache,
 			cachedPwdHash: cachedPwdHash,
+			limiter:       limiter,
 		}
 	}
 
@@ -296,4 +312,22 @@ func (s *Store) GetAgentKey(clientID string) (string, error) {
 		return state.config.Key, nil
 	}
 	return "", fmt.Errorf("invalid client ID")
+}
+
+// CheckRateLimit deducts one token from the agent's bucket. Returns an error if the limit is exceeded.
+func (s *Store) CheckRateLimit(clientID string) error {
+	s.mu.RLock()
+	state, exists := s.agents[clientID]
+	s.mu.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("invalid client ID")
+	}
+
+	if state.limiter != nil {
+		if !state.limiter.Allow() {
+			return fmt.Errorf("rate limit exceeded for agent %s", clientID)
+		}
+	}
+	return nil
 }

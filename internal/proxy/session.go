@@ -95,6 +95,7 @@ type Session struct {
 	queryRunning       atomic.Bool
 
 	preparedStatements map[string]PreparedStatement
+	clientID           string
 }
 
 func NewSession(clientConn net.Conn, upstreamDSN string, store *policy.Store, tlsConfig *tls.Config, logger *Logger, server *Server, insecureAuth bool) *Session {
@@ -320,6 +321,7 @@ func (s *Session) Run() error {
 		return fmt.Errorf("password auth failed")
 	}
 	s.rules = rules
+	s.clientID = clientID
 
 	s.clientBackend.Send(&pgproto3.AuthenticationOk{})
 
@@ -548,6 +550,17 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 				span.End()
 				continue
 			}
+
+			if err := s.server.store.CheckRateLimit(s.clientID); err != nil {
+				clientWriteCh <- &pgproto3.ErrorResponse{
+					Severity: "ERROR",
+					Code:     "53400", // configuration_limit_exceeded
+					Message:  fmt.Sprintf("AgentIAM Policy Violation: %v", err),
+				}
+				s.errorDiscard.Store(true)
+				span.End()
+				continue
+			}
 			u, err := s.getOrAcquireUpstream(ctx, clientWriteCh)
 			if err != nil {
 				span.End()
@@ -678,6 +691,18 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 		case *pgproto3.Query:
 			s.queryRunning.Store(true)
 			_, span := Tracer.Start(ctx, "proxy.Query")
+
+			if err := s.server.store.CheckRateLimit(s.clientID); err != nil {
+				clientWriteCh <- &pgproto3.ErrorResponse{
+					Severity: "ERROR",
+					Code:     "53400",
+					Message:  fmt.Sprintf("AgentIAM Policy Violation: %v", err),
+				}
+				clientWriteCh <- &pgproto3.ReadyForQuery{TxStatus: 'I'}
+				span.End()
+				continue
+			}
+
 			rewrittenSQL, _, err := (&ast.PostgresParser{}).ApplyRules(v.String, s.rules, s.server.astCache)
 			if err != nil {
 				clientWriteCh <- &pgproto3.ErrorResponse{
