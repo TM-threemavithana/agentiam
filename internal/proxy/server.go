@@ -46,11 +46,12 @@ type Server struct {
 	nextPID        uint32
 	insecureAuth   bool
 	metricsAddr    string
+	Webhook        *WebhookDispatcher
 }
 
 // NewServer initializes a new Server instance.
 // It requires a pre-configured policy.Store, logger, AST cache, and a map of ProtocolHandlers.
-func NewServer(listenAddr, upstreamDSN string, store *policy.Store, tlsConfig *tls.Config, logger *Logger, astCache cache.ASTCache, handlers map[ProtocolType]ProtocolHandler, insecureAuth bool, metricsAddr string, poolSize int) *Server {
+func NewServer(listenAddr, upstreamDSN string, store *policy.Store, tlsConfig *tls.Config, logger *Logger, astCache cache.ASTCache, handlers map[ProtocolType]ProtocolHandler, insecureAuth bool, metricsAddr string, poolSize int, webhook *WebhookDispatcher) *Server {
 	maxConns := 10000
 	return &Server{
 		listenAddr:     listenAddr,
@@ -58,6 +59,7 @@ func NewServer(listenAddr, upstreamDSN string, store *policy.Store, tlsConfig *t
 		store:          store,
 		tlsConfig:      tlsConfig,
 		logger:         logger,
+		Webhook:        webhook,
 		maxConns:       maxConns,
 		pool:           NewPool(upstreamDSN, poolSize, logger),
 		astCache:       astCache,

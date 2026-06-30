@@ -520,6 +520,7 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 
 			rewrittenSQL, limitParams, err := (&ast.PostgresParser{}).ApplyRules(v.Query, s.rules, s.server.astCache)
 			if err != nil {
+				s.server.Webhook.Dispatch(AuditEvent{Event: EventPolicyBlocked, ClientID: s.clientID, SQL: v.Query, Status: "blocked", Error: err.Error()})
 				clientWriteCh <- &pgproto3.ErrorResponse{
 					Severity: "ERROR",
 					Message:  fmt.Sprintf("AgentIAM Policy Violation: %v", err),
@@ -536,6 +537,9 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 			}
 			v.Name = ""
 			v.Query = rewrittenSQL
+			
+			s.server.Webhook.Dispatch(AuditEvent{Event: EventQueryForwarded, ClientID: s.clientID, SQL: v.Query, Status: "success"})
+
 			u, err := s.getOrAcquireUpstream(ctx, clientWriteCh)
 			if err != nil {
 				span.End()
@@ -552,6 +556,7 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 			}
 
 			if err := s.server.store.CheckRateLimit(s.clientID); err != nil {
+				s.server.Webhook.Dispatch(AuditEvent{Event: EventPolicyBlocked, ClientID: s.clientID, Status: "rate_limited", Error: err.Error()})
 				clientWriteCh <- &pgproto3.ErrorResponse{
 					Severity: "ERROR",
 					Code:     "53400", // configuration_limit_exceeded
@@ -693,6 +698,7 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 			_, span := Tracer.Start(ctx, "proxy.Query")
 
 			if err := s.server.store.CheckRateLimit(s.clientID); err != nil {
+				s.server.Webhook.Dispatch(AuditEvent{Event: EventPolicyBlocked, ClientID: s.clientID, SQL: v.String, Status: "rate_limited", Error: err.Error()})
 				clientWriteCh <- &pgproto3.ErrorResponse{
 					Severity: "ERROR",
 					Code:     "53400",
@@ -705,6 +711,7 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 
 			rewrittenSQL, _, err := (&ast.PostgresParser{}).ApplyRules(v.String, s.rules, s.server.astCache)
 			if err != nil {
+				s.server.Webhook.Dispatch(AuditEvent{Event: EventPolicyBlocked, ClientID: s.clientID, SQL: v.String, Status: "blocked", Error: err.Error()})
 				clientWriteCh <- &pgproto3.ErrorResponse{
 					Severity: "ERROR",
 					Message:  fmt.Sprintf("AgentIAM Policy Violation: %v", err),
@@ -715,6 +722,9 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 			}
 
 			v.String = rewrittenSQL
+			
+			s.server.Webhook.Dispatch(AuditEvent{Event: EventQueryForwarded, ClientID: s.clientID, SQL: v.String, Status: "success"})
+
 			u, err := s.getOrAcquireUpstream(ctx, clientWriteCh)
 			if err != nil {
 				span.End()

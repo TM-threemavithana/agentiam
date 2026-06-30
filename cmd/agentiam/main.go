@@ -82,7 +82,10 @@ func main() {
 	}
 
 	handlers := make(map[proxy.ProtocolType]proxy.ProtocolHandler)
-	srv := proxy.NewServer(":"+listenPort, upstreamDSN, store, tlsConfig, logger, astCache, handlers, insecureAuth, metricsAddr, poolSize)
+	webhookUrl := os.Getenv("AGENTIAM_WEBHOOK_URL")
+	webhook := proxy.NewWebhookDispatcher(webhookUrl, logger.Logger)
+
+	srv := proxy.NewServer(":"+listenPort, upstreamDSN, store, tlsConfig, logger, astCache, handlers, insecureAuth, metricsAddr, poolSize, webhook)
 
 	pgHandler := proxy.NewPostgresProtocolHandler(upstreamDSN, store, tlsConfig, logger, srv, insecureAuth)
 	mysqlHandler := proxy.NewMySQLProtocolHandler(store, logger, insecureAuth)

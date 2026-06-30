@@ -45,7 +45,14 @@ var (
 	PoolTotalConnections = prometheus.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "agentiam_pool_total_connections",
-			Help: "Total configured size of the upstream pool.",
+			Help: "Total upstream database connections currently open.",
+		},
+	)
+
+	WebhookDroppedEventsTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "agentiam_webhook_dropped_events_total",
+			Help: "Total number of audit events dropped because the webhook queue was full.",
 		},
 	)
 )
@@ -57,4 +64,5 @@ func init() {
 	prometheus.MustRegister(BlockedQueriesTotal)
 	prometheus.MustRegister(PoolIdleConnections)
 	prometheus.MustRegister(PoolTotalConnections)
+	prometheus.MustRegister(WebhookDroppedEventsTotal)
 }
