@@ -3,6 +3,7 @@ package ast
 import (
 	"bytes"
 	"fmt"
+	"strings"
 
 	"github.com/tm-threemavithana/agentiam/internal/cache"
 
@@ -79,12 +80,12 @@ func (v *mysqlVisitor) Enter(in ast.Node) (ast.Node, bool) {
 		if v.stmtType == "" {
 			v.stmtType = "SELECT"
 		}
-		// Inject limit if missing and enforce is configured
-		// if v.rules.EnforceSelectLimit > 0 && node.Limit == nil {
-		// 	// Note: properly injecting AST nodes into pingcap requires constructing ValueExprs.
-		// 	// For simplicity in this roadmap step, we'll track but not full-inject here.
-		// 	// A full implementation would inject `node.Limit = &ast.Limit{...}`
-		// }
+		if v.rules.EnforceSelectLimit > 0 && node.Limit == nil {
+			pr := parser.New()
+			if dummyNodes, _, err := pr.Parse(fmt.Sprintf("SELECT 1 LIMIT %d", v.rules.EnforceSelectLimit), "", ""); err == nil {
+				node.Limit = dummyNodes[0].(*ast.SelectStmt).Limit
+			}
+		}
 	case *ast.InsertStmt:
 		if v.stmtType == "" {
 			v.stmtType = "INSERT"
@@ -100,6 +101,15 @@ func (v *mysqlVisitor) Enter(in ast.Node) (ast.Node, bool) {
 	case *ast.TableName:
 		// Extract table names
 		v.tables = append(v.tables, node.Name.O)
+	case *ast.FuncCallExpr:
+		funcName := node.FnName.O
+		for _, blocked := range v.rules.BlockedFunctions {
+			if strings.EqualFold(funcName, blocked) {
+				v.blocked = true
+				v.blockErr = fmt.Errorf("policy violation: function %s is blocked", funcName)
+				return in, true
+			}
+		}
 	}
 	return in, false
 }

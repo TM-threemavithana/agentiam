@@ -2,7 +2,9 @@ package proxy
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"net/http"
@@ -43,11 +45,12 @@ type Server struct {
 	sessionByPID   map[uint32]*Session
 	nextPID        uint32
 	insecureAuth   bool
+	metricsAddr    string
 }
 
 // NewServer initializes a new Server instance.
 // It requires a pre-configured policy.Store, logger, AST cache, and a map of ProtocolHandlers.
-func NewServer(listenAddr, upstreamDSN string, store *policy.Store, tlsConfig *tls.Config, logger *Logger, astCache cache.ASTCache, handlers map[ProtocolType]ProtocolHandler, insecureAuth bool) *Server {
+func NewServer(listenAddr, upstreamDSN string, store *policy.Store, tlsConfig *tls.Config, logger *Logger, astCache cache.ASTCache, handlers map[ProtocolType]ProtocolHandler, insecureAuth bool, metricsAddr string, poolSize int) *Server {
 	maxConns := 10000
 	return &Server{
 		listenAddr:     listenAddr,
@@ -56,13 +59,14 @@ func NewServer(listenAddr, upstreamDSN string, store *policy.Store, tlsConfig *t
 		tlsConfig:      tlsConfig,
 		logger:         logger,
 		maxConns:       maxConns,
-		pool:           NewPool(upstreamDSN, 50, logger),
+		pool:           NewPool(upstreamDSN, poolSize, logger),
 		astCache:       astCache,
 		handlers:       handlers,
 		sem:            make(chan struct{}, maxConns),
 		activeSessions: make(map[string]map[*Session]sessionMeta),
 		sessionByPID:   make(map[uint32]*Session),
 		insecureAuth:   insecureAuth,
+		metricsAddr:    metricsAddr,
 	}
 }
 
@@ -159,8 +163,8 @@ func (s *Server) Start() error {
 				w.Write([]byte("pool not ready"))
 			}
 		})
-		s.logger.Info("Starting Prometheus metrics and health endpoint", "addr", ":9090")
-		if err := http.ListenAndServe(":9090", mux); err != nil {
+		s.logger.Info("Starting Prometheus metrics and health endpoint", "addr", s.metricsAddr)
+		if err := http.ListenAndServe(s.metricsAddr, mux); err != nil {
 			s.logger.Error("Metrics server failed", "error", err)
 		}
 	}()
@@ -231,7 +235,17 @@ func (s *Server) AllocateVirtualPID(session *Session) (uint32, uint32) {
 	defer s.mu.Unlock()
 	s.nextPID++
 	pid := s.nextPID
-	secret := uint32(123456) // Simple for now
+	
+	// Generate a cryptographically secure random secret
+	var secret uint32
+	b := make([]byte, 4)
+	if _, err := rand.Read(b); err == nil {
+		secret = binary.BigEndian.Uint32(b)
+	} else {
+		// Fallback in the extremely unlikely event crypto/rand fails
+		secret = uint32(time.Now().UnixNano())
+	}
+
 	if s.sessionByPID == nil {
 		s.sessionByPID = make(map[uint32]*Session)
 	}

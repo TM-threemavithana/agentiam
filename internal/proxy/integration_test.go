@@ -25,6 +25,7 @@ import (
 	"github.com/tm-threemavithana/agentiam/internal/proxy"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -97,7 +98,7 @@ func setupTestEnv(t *testing.T) (string, string, func()) {
 
 	logger := proxy.NewLogger(os.Stdout)
 	handlers := make(map[proxy.ProtocolType]proxy.ProtocolHandler)
-	server := proxy.NewServer(l.Addr().String(), upstreamDSN, store, nil, logger, nil, handlers, false)
+	server := proxy.NewServer(l.Addr().String(), upstreamDSN, store, nil, logger, nil, handlers, false, ":0", 5)
 	pgHandler := proxy.NewPostgresProtocolHandler(upstreamDSN, store, nil, logger, server, true)
 	server.SetHandler(proxy.ProtocolPostgres, pgHandler)
 	server.InitPool(context.Background())
@@ -246,6 +247,47 @@ func TestProxyIntegration(t *testing.T) {
 		}
 	})
 
+	// Test 7: Out-of-band Cancellation
+	t.Run("7_Cancellation", func(t *testing.T) {
+		conn, err := pgx.Connect(ctx, proxyDSN)
+		if err != nil {
+			t.Fatalf("failed to connect via proxy: %v", err)
+		}
+		defer conn.Close(ctx)
+
+		errCh := make(chan error, 1)
+		go func() {
+			_, err := conn.Exec(ctx, "SELECT pg_sleep(10)")
+			errCh <- err
+		}()
+
+		// Wait a bit for the query to start
+		time.Sleep(500 * time.Millisecond)
+
+		// Send cancel request
+		err = conn.PgConn().CancelRequest(ctx)
+		if err != nil {
+			t.Fatalf("failed to send cancel request: %v", err)
+		}
+
+		// The Exec should return an error indicating cancellation
+		execErr := <-errCh
+		if execErr == nil {
+			t.Fatal("expected error from cancelled query, got success")
+		}
+
+		// The error should be 57014 (query_canceled) from postgres
+		if pgErr, ok := execErr.(*pgconn.PgError); ok {
+			if pgErr.Code != "57014" {
+				t.Fatalf("expected SQLSTATE 57014 (query_canceled), got %s", pgErr.Code)
+			}
+		} else {
+			// If pgx wraps it differently, just ensure it's not nil
+			// But postgres guarantees 57014
+			t.Logf("Query cancelled with error: %v", execErr)
+		}
+	})
+
 	// Test 6: SimpleQuery Error Recovery
 	t.Run("6_SimpleQuery_Discard", func(t *testing.T) {
 		conn, err := pgx.Connect(ctx, proxyDSN)
@@ -349,7 +391,7 @@ func TestTLSUpgradeAndEnforcement(t *testing.T) {
 			go func(c net.Conn) {
 				logger := proxy.NewLogger(os.Stdout)
 				handlers := make(map[proxy.ProtocolType]proxy.ProtocolHandler)
-				server := proxy.NewServer("127.0.0.1:0", upstreamDSN, store, tlsConfig, logger, nil, handlers, false)
+				server := proxy.NewServer("127.0.0.1:0", upstreamDSN, store, tlsConfig, logger, nil, handlers, false, ":0", 5)
 				pgHandler := proxy.NewPostgresProtocolHandler(upstreamDSN, store, tlsConfig, logger, server, true)
 				server.SetHandler(proxy.ProtocolPostgres, pgHandler)
 				session := proxy.NewSession(c, upstreamDSN, store, tlsConfig, logger, server, true)

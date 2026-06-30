@@ -6,24 +6,29 @@ import (
 
 func TestMySQLParser_ApplyRules(t *testing.T) {
 	rules := Rules{
-		AllowedStatements: []string{"SELECT", "INSERT", "UPDATE"},
-		AllowedTables:     []string{"users", "orders"},
+		AllowedStatements:  []string{"SELECT", "INSERT", "UPDATE"},
+		AllowedTables:      []string{"users", "orders"},
+		BlockedFunctions:   []string{"sleep"},
+		EnforceSelectLimit: 10,
 	}
 
 	tests := []struct {
 		name          string
 		sql           string
 		expectBlocked bool
+		expectSQL     string
 	}{
 		{
 			name:          "Allowed SELECT on allowed table",
 			sql:           "SELECT * FROM users",
 			expectBlocked: false,
+			expectSQL:     "SELECT * FROM `users` LIMIT 10",
 		},
 		{
 			name:          "Allowed INSERT on allowed table",
 			sql:           "INSERT INTO orders (id) VALUES (1)",
 			expectBlocked: false,
+			expectSQL:     "INSERT INTO `orders` (`id`) VALUES (1)",
 		},
 		{
 			name:          "Blocked DELETE statement",
@@ -45,13 +50,23 @@ func TestMySQLParser_ApplyRules(t *testing.T) {
 			sql:           "SELECT * FROM",
 			expectBlocked: true,
 		},
+		{
+			name:          "Blocked function sleep",
+			sql:           "SELECT sleep(10)",
+			expectBlocked: true,
+		},
+		{
+			name:          "CTE Smuggling Attempt",
+			sql:           "WITH x AS (DELETE FROM users WHERE id=1) SELECT * FROM x",
+			expectBlocked: true, // Should fail at parser level in MySQL
+		},
 	}
 
 	parser := &MySQLParser{}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, _, err := parser.ApplyRules(tt.sql, rules, nil)
+			rewritten, _, err := parser.ApplyRules(tt.sql, rules, nil)
 			if tt.expectBlocked {
 				if err == nil {
 					t.Errorf("expected query to be blocked, but it was allowed: %s", tt.sql)
@@ -59,6 +74,9 @@ func TestMySQLParser_ApplyRules(t *testing.T) {
 			} else {
 				if err != nil {
 					t.Errorf("unexpected error for query %s: %v", tt.sql, err)
+				}
+				if tt.expectSQL != "" && rewritten != tt.expectSQL {
+					t.Errorf("expected %s, got %s", tt.expectSQL, rewritten)
 				}
 			}
 		})
