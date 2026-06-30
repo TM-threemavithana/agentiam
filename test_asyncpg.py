@@ -75,5 +75,26 @@ async def run_pipeline():
         print(f"FAILED with exception: {e}")
         sys.exit(1)
 
+import os
+import subprocess
+import time
+
+async def main():
+    env = os.environ.copy()
+    env["AGENTIAM_POLICY_FILE"] = "policies_asyncpg.yaml"
+    env["AGENTIAM_UPSTREAM_DSN"] = "postgres://postgres:postgres@127.0.0.1:5434/postgres?sslmode=disable"
+    env["AGENTIAM_DEV_MODE"] = "true"
+    env["AGENTIAM_INSECURE_CLEARTEXT_AUTH"] = "true"
+    
+    print("Starting proxy...")
+    proxy = subprocess.Popen(["./agentiam.exe"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(0.5)
+    
+    try:
+        await run_pipeline()
+    finally:
+        proxy.terminate()
+        proxy.wait()
+
 if __name__ == '__main__':
-    asyncio.run(run_pipeline())
+    asyncio.run(main())

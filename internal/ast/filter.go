@@ -57,6 +57,9 @@ func (p *PostgresParser) ApplyRules(sql string, rules Rules, astCache cache.ASTC
 		if err != nil {
 			return "", nil, err
 		}
+		if err := MaskData(stmt.Stmt, rules); err != nil {
+			return "", nil, fmt.Errorf("masking blocked query: %w", err)
+		}
 	}
 
 	deparseBytes, err := proto.Marshal(&tree)
@@ -157,7 +160,7 @@ func enforceRules(node *pg_query.Node, rules Rules, depth int, limitParams *[]in
 		if !isAllowed("TRUNCATE", rules.AllowedStatements) {
 			return fmt.Errorf("TRUNCATE statements are not allowed by policy")
 		}
-	case *pg_query.Node_CreateStmt, *pg_query.Node_IndexStmt:
+	case *pg_query.Node_CreateStmt, *pg_query.Node_IndexStmt, *pg_query.Node_ViewStmt:
 		if !isAllowed("CREATE", rules.AllowedStatements) {
 			return fmt.Errorf("CREATE statements are not allowed by policy")
 		}

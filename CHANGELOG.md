@@ -1,6 +1,20 @@
 # Changelog
 
-## [2026-06-28] - Security, Performance, and Coverage Overhaul
+## [v0.3.0] - Rate Limiting, Audit Webhooks, and Data Masking
+
+### Security
+- **Data Masking via AST Semantic Analysis**: Implemented a Fail-Closed semantic analysis engine to enforce data masking across complex queries dynamically without catalog lookups.
+  - Replaces sensitive columns (e.g., `ssn`) with `[REDACTED]` string literals in the AST before passing queries upstream.
+  - Successfully masks data across direct aliasing, CTEs, subqueries, set operations (`UNION`), and string functions (`concat`, `substring`).
+  - **Strict Mode (Fail-Closed)**: Explicitly blocks implicit expansions (`SELECT *`), table-qualified wildcards (`SELECT u.*`), whole-row references (`row_to_json`), and any unhandled AST nodes (e.g., `GROUPING SETS`) within a masked scope to prevent data leakage.
+  - **Known Bypass**: Views wrapping masked tables are not resolved dynamically and will leak masked data if queried directly. Mitigate by enforcing view permissions downstream. Documented in `SECURITY.md`.
+
+### Reliability
+- **Token Bucket Rate Limiting**: Added `RateLimitRPM` and `RateLimitBurst` constraints to `AgentConfig`. Enforces per-agent rate limiting inside the AST traversal loop (`ApplyRules`) using a shared, mutex-protected Token Bucket. Properly returns an `ErrorResponse` and prevents upstream connection exhaustion during DoS attacks.
+- **Fixed `asyncpg` Pipelining Data Aliasing**: Identified and resolved a memory aliasing vulnerability in the proxy's `DataRow` forwarding path. Reusing the same byte buffer for pipelined responses caused silent data corruption (duplicate rows) under high concurrency without throwing exceptions. Verified fix with a robust 10,000 row integration test.
+
+### Auditing
+- **Asynchronous Webhook Egress**: Added non-blocking HTTP audit webhook streaming for policy blocks and successful queries. Employs a buffered channel (`buffer_size=1000`) to prevent downstream SIEM latency from pausing the proxy. Included local metrics for tracking silent drops if the queue fills during bursts.## [2026-06-28] - Security, Performance, and Coverage Overhaul
 
 ### Security
 - **Patched Standard Library Vulnerabilities**: Updated Go toolchain from `1.25.0` to `1.25.11` in `go.mod`.
