@@ -49,6 +49,13 @@ func (p *Pool) IsReady() bool {
 	return p.ready.Load()
 }
 
+func (p *Pool) GetActiveCount() int {
+	if p == nil || p.conns == nil {
+		return 0
+	}
+	return p.size - len(p.conns)
+}
+
 func (p *Pool) Init(ctx context.Context) error {
 	for i := 0; i < p.size; i++ {
 		u, err := p.dial(ctx)

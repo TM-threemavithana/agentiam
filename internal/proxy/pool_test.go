@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -42,7 +43,7 @@ func TestPool_DialFailureRecovery(t *testing.T) {
 	l := mockUpstream(t, "127.0.0.1:0")
 	dsn := "postgres://user:pass@" + l.Addr().String() + "/db?sslmode=disable"
 	
-	logger := NewLogger(nil)
+	logger := NewLogger(io.Discard)
 	pool := NewPool(dsn, 2, logger)
 	
 	ctx := context.Background()

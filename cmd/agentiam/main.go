@@ -12,6 +12,7 @@ import (
 	"flag"
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/tm-threemavithana/agentiam"
 	"github.com/tm-threemavithana/agentiam/internal/cache"
 	"github.com/tm-threemavithana/agentiam/internal/policy"
 	"github.com/tm-threemavithana/agentiam/internal/proxy"
@@ -100,7 +101,12 @@ func main() {
 	webhookUrl := os.Getenv("AGENTIAM_WEBHOOK_URL")
 	webhook := proxy.NewWebhookDispatcher(webhookUrl, logger.Logger)
 
-	srv := proxy.NewServer(":"+listenPort, upstreamDSN, store, tlsConfig, logger, astCache, handlers, insecureAuth, metricsAddr, poolSize, webhook)
+	uiFS, err := agentiam.GetUIFS()
+	if err != nil {
+		logger.Warn("UI embedded filesystem not found, dashboard will be disabled", "error", err)
+	}
+
+	srv := proxy.NewServer(":"+listenPort, upstreamDSN, store, tlsConfig, logger, astCache, handlers, insecureAuth, metricsAddr, poolSize, webhook, uiFS)
 
 	pgHandler := proxy.NewPostgresProtocolHandler(upstreamDSN, store, tlsConfig, logger, srv, insecureAuth)
 	mysqlHandler := proxy.NewMySQLProtocolHandler(store, logger, insecureAuth)

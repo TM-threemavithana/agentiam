@@ -47,11 +47,13 @@ type Server struct {
 	insecureAuth   bool
 	metricsAddr    string
 	Webhook        *WebhookDispatcher
+	uiBuffer       *UIRingBuffer
+	uiFS           http.FileSystem
 }
 
 // NewServer initializes a new Server instance.
 // It requires a pre-configured policy.Store, logger, AST cache, and a map of ProtocolHandlers.
-func NewServer(listenAddr, upstreamDSN string, store *policy.Store, tlsConfig *tls.Config, logger *Logger, astCache cache.ASTCache, handlers map[ProtocolType]ProtocolHandler, insecureAuth bool, metricsAddr string, poolSize int, webhook *WebhookDispatcher) *Server {
+func NewServer(listenAddr, upstreamDSN string, store *policy.Store, tlsConfig *tls.Config, logger *Logger, astCache cache.ASTCache, handlers map[ProtocolType]ProtocolHandler, insecureAuth bool, metricsAddr string, poolSize int, webhook *WebhookDispatcher, uiFS http.FileSystem) *Server {
 	maxConns := 10000
 	return &Server{
 		listenAddr:     listenAddr,
@@ -69,6 +71,8 @@ func NewServer(listenAddr, upstreamDSN string, store *policy.Store, tlsConfig *t
 		sessionByPID:   make(map[uint32]*Session),
 		insecureAuth:   insecureAuth,
 		metricsAddr:    metricsAddr,
+		uiBuffer:       NewUIRingBuffer(100),
+		uiFS:           uiFS,
 	}
 }
 
@@ -165,6 +169,12 @@ func (s *Server) Start() error {
 				w.Write([]byte("pool not ready"))
 			}
 		})
+		
+		mux.HandleFunc("/api/status", s.HandleUIStatus)
+		if s.uiFS != nil {
+			mux.Handle("/", http.FileServer(s.uiFS))
+		}
+		
 		s.logger.Info("Starting Prometheus metrics and health endpoint", "addr", s.metricsAddr)
 		if err := http.ListenAndServe(s.metricsAddr, mux); err != nil {
 			s.logger.Error("Metrics server failed", "error", err)

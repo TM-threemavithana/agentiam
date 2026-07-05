@@ -3,7 +3,11 @@
 BINARY_NAME=agentiam
 CMD_PATH=./cmd/agentiam
 
-build:
+build-ui:
+	@echo "==> Building Observability Dashboard..."
+	cd web && npm run build
+
+build: build-ui
 	@echo "==> Building AgentIAM Proxy..."
 	go build -o bin/$(BINARY_NAME) $(CMD_PATH)
 

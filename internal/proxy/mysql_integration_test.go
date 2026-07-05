@@ -55,7 +55,7 @@ func TestMySQLAdapterIntegration(t *testing.T) {
 	})
 
 	handlers := make(map[proxy.ProtocolType]proxy.ProtocolHandler)
-	srv := proxy.NewServer("127.0.0.1:3308", upstreamDSN, store, nil, logger, nil, handlers, false, ":0", 5, nil)
+	srv := proxy.NewServer("127.0.0.1:3308", upstreamDSN, store, nil, logger, nil, handlers, false, ":0", 5, nil, nil)
 	mysqlHandler := proxy.NewMySQLProtocolHandler(store, logger, false)
 	srv.SetHandler(proxy.ProtocolMySQL, mysqlHandler)
 	go srv.Start()

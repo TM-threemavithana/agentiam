@@ -138,7 +138,7 @@ func TestMutualTLSAuthentication(t *testing.T) {
 
 	logger := NewLogger(os.Stdout)
 	handlers := make(map[ProtocolType]ProtocolHandler)
-	server := NewServer("127.0.0.1:"+port, "postgres://dummy:5432", store, tlsConfig, logger, nil, handlers, false, ":0", 5, nil)
+	server := NewServer("127.0.0.1:"+port, "postgres://dummy:5432", store, tlsConfig, logger, nil, handlers, false, ":0", 5, nil, nil)
 	pgHandler := NewPostgresProtocolHandler("postgres://dummy:5432", store, tlsConfig, logger, server, false)
 	server.SetHandler(ProtocolPostgres, pgHandler)
 

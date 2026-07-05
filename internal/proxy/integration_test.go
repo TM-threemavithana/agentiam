@@ -98,7 +98,7 @@ func setupTestEnv(t *testing.T) (string, string, func()) {
 
 	logger := proxy.NewLogger(os.Stdout)
 	handlers := make(map[proxy.ProtocolType]proxy.ProtocolHandler)
-	server := proxy.NewServer(l.Addr().String(), upstreamDSN, store, nil, logger, nil, handlers, false, ":0", 5, nil)
+	server := proxy.NewServer(l.Addr().String(), upstreamDSN, store, nil, logger, nil, handlers, false, ":0", 5, nil, nil)
 	pgHandler := proxy.NewPostgresProtocolHandler(upstreamDSN, store, nil, logger, server, true)
 	server.SetHandler(proxy.ProtocolPostgres, pgHandler)
 	server.InitPool(context.Background())
@@ -391,7 +391,7 @@ func TestTLSUpgradeAndEnforcement(t *testing.T) {
 			go func(c net.Conn) {
 				logger := proxy.NewLogger(os.Stdout)
 				handlers := make(map[proxy.ProtocolType]proxy.ProtocolHandler)
-				server := proxy.NewServer("127.0.0.1:0", upstreamDSN, store, tlsConfig, logger, nil, handlers, false, ":0", 5, nil)
+				server := proxy.NewServer("127.0.0.1:0", upstreamDSN, store, tlsConfig, logger, nil, handlers, false, ":0", 5, nil, nil)
 				pgHandler := proxy.NewPostgresProtocolHandler(upstreamDSN, store, tlsConfig, logger, server, true)
 				server.SetHandler(proxy.ProtocolPostgres, pgHandler)
 				session := proxy.NewSession(c, upstreamDSN, store, tlsConfig, logger, server, true)
