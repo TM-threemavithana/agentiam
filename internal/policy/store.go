@@ -25,9 +25,10 @@ type AgentConfig struct {
 	Name               string   `yaml:"name" json:"name"`
 	Key                string   `yaml:"key" json:"key"` // bcrypt hash or SCRAM verifier
 	AllowedStatements  []string `yaml:"allowed_statements" json:"allowed_statements"`
-	AllowedTables      []string `yaml:"allowed_tables" json:"allowed_tables"`
-	BlockedFunctions   []string `yaml:"blocked_functions" json:"blocked_functions"`
-	SelectLimit        int      `yaml:"select_limit" json:"select_limit"`
+	AllowedTables      []string            `yaml:"allowed_tables" json:"allowed_tables"`
+	BlockedFunctions   []string            `yaml:"blocked_functions" json:"blocked_functions"`
+	MaskedColumns      map[string][]string `yaml:"masked_columns" json:"masked_columns"`
+	SelectLimit        int                 `yaml:"select_limit" json:"select_limit"`
 	MaxExecutionTimeMs int      `yaml:"max_execution_time_ms" json:"max_execution_time_ms"`
 	RateLimitRPM       int      `yaml:"rate_limit_rpm" json:"rate_limit_rpm"`
 	RateLimitBurst     int      `yaml:"rate_limit_burst" json:"rate_limit_burst"`
@@ -276,6 +277,7 @@ func (s *Store) GetRulesForAgent(clientID string, suppliedPassword string) (ast.
 		AllowedStatements:  state.config.AllowedStatements,
 		AllowedTables:      state.config.AllowedTables,
 		BlockedFunctions:   state.config.BlockedFunctions,
+		MaskedColumns:      state.config.MaskedColumns,
 		EnforceSelectLimit: limit,
 		MaxExecutionTimeMs: timeoutMs,
 		PoolMode:           state.config.PoolMode,

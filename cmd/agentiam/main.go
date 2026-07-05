@@ -9,12 +9,27 @@ import (
 	"os"
 	"strconv"
 
+	"flag"
+	"golang.org/x/crypto/bcrypt"
+
 	"github.com/tm-threemavithana/agentiam/internal/cache"
 	"github.com/tm-threemavithana/agentiam/internal/policy"
 	"github.com/tm-threemavithana/agentiam/internal/proxy"
 )
 
 func main() {
+	hashPassword := flag.String("hash-password", "", "Generate a bcrypt hash for the provided password and exit")
+	flag.Parse()
+
+	if *hashPassword != "" {
+		hash, err := bcrypt.GenerateFromPassword([]byte(*hashPassword), bcrypt.DefaultCost)
+		if err != nil {
+			log.Fatalf("Failed to hash password: %v", err)
+		}
+		fmt.Printf("%s\n", string(hash))
+		os.Exit(0)
+	}
+
 	if _, err := proxy.InitTracer(); err != nil {
 		log.Printf("Failed to initialize OpenTelemetry Tracer: %v", err)
 	}

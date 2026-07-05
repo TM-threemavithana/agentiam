@@ -1,0 +1,11 @@
+agents:
+  - name: test-agent
+    key: "$2a$10$OAiS23oL4WZ0Db/N74SFW.0S/HCJrAVcczAC.PfJV92vnu2nKiGnK"
+    allowed_statements: ["SELECT", "INSERT", "UPDATE", "DROP", "CREATE"]
+    select_limit: 20000
+    rate_limit_rpm: 6000
+    rate_limit_burst: 1000
+    masked_columns:
+      users:
+        - "ssn"
+        - "email"

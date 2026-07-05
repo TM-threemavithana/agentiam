@@ -33,7 +33,7 @@ Relying on "prompt engineering" or LLM safety rails to prevent this does not wor
 1. **Wire Protocol Interception:** The AI Agent connects to AgentIAM. The proxy intercepts the incoming packets at the Postgres Extended Query or MySQL protocol level.
 2. **AST Parsing:** The SQL is parsed into an Abstract Syntax Tree (AST) using `pg_query_go` for PostgreSQL, or the `pingcap/tidb` parser for MySQL.
 3. **Deterministic Enforcement:** AgentIAM uses a recursive Visitor pattern to traverse the AST. If a blocked node (like a `DeleteStmt`) is detected—even if hidden deeply inside a CTE or subquery—the proxy instantly drops the query and returns a protocol error to the AI.
-4. **Policy Fetching via HTTP Polling:** The proxy enforces rules based on policies retrieved via an HTTP polling mechanism against a remote control plane. This replaces the legacy Redis-based architecture to reduce external infrastructure dependencies (like deploying a Redis cluster alongside the proxy), though it introduces polling overhead.
+4. **Policy Fetching via Local YAML:** The proxy enforces rules based on policies configured in a local `policies.yaml` file (with an optional HTTP polling fallback for enterprise control planes). 
 5. **AST Rewriting:** If an allowed `SelectStmt` lacks a limit, AgentIAM rewrites the AST to enforce a hard `LIMIT 100`, deparses it back to SQL, and forwards it to the real database.
 
 ---
@@ -46,20 +46,33 @@ You can try the full Go-To-Market demo locally using Docker Compose. It spins up
 cd demo/
 docker-compose up --build
 ```
-*Note: The demo runs in `AGENTIAM_DEMO_MOCK=true` mode by default so you don't need an OpenAI API key to see it work. To use a real LLM, `export OPENAI_API_KEY="sk-..."` before running.*
+*Note: The demo runs in `AGENTIAM_DEMO_MOCK=true` mode by default so you don't need an OpenAI API key or a local Ollama instance to see it work. To use a real LLM, set `AGENTIAM_DEMO_MOCK=false` and provide your credentials.*
+
+### Bare-Metal Execution
+If you don't have Docker installed, you can build and run the proxy from source:
+```bash
+go build -o agentiam ./cmd/agentiam
+./agentiam
+```
 
 ---
 
 ## ⚙️ Configuration
 
-AgentIAM policies are fetched periodically from a remote control plane via HTTP polling. The proxy requires an API endpoint and a long-lived access token to bootstrap the configuration.
+AgentIAM policies are configured via a local `policies.yaml` file. The proxy supports hot-reloading policy changes.
 
 ```yaml
 version: "1"
-control_plane:
-  endpoint: "https://api.agentiam.io/v1/policies"
-  token: "secret-token-here"
-  poll_interval: "30s"
+agents:
+  - name: "langchain-bot"
+    key: "$2a$10$..." # Bcrypt hash of the agent's password
+    allowed_statements:
+      - SELECT
+```
+
+To generate a valid bcrypt hash for a new agent password, use the built-in CLI flag:
+```bash
+./agentiam --hash-password "your-super-secret-password"
 ```
 
 When your AI connects, it uses `langchain-bot` as the database user. The proxy intercepts the handshake, verifies the password against the cached policies, and establishes the session.

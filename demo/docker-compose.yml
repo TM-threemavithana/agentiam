@@ -53,7 +53,7 @@ services:
       dockerfile: Dockerfile
     environment:
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - AGENTIAM_DEMO_MOCK=${AGENTIAM_DEMO_MOCK:-false}
+      - AGENTIAM_DEMO_MOCK=${AGENTIAM_DEMO_MOCK:-true}
       - PYTHONUNBUFFERED=1
     depends_on:
       agentiam:
