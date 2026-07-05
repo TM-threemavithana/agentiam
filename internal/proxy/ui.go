@@ -180,7 +180,8 @@ func (s *Server) HandleGenerateCredentials(w http.ResponseWriter, r *http.Reques
 	}
 
 	var req struct {
-		AgentID string `json:"agent_id"`
+		AgentID    string `json:"agent_id"`
+		TTLSeconds int    `json:"ttl_seconds,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request", http.StatusBadRequest)
@@ -189,6 +190,11 @@ func (s *Server) HandleGenerateCredentials(w http.ResponseWriter, r *http.Reques
 	if req.AgentID == "" {
 		http.Error(w, "agent_id is required", http.StatusBadRequest)
 		return
+	}
+	
+	ttl := req.TTLSeconds
+	if ttl <= 0 {
+		ttl = 3600 // Default 1 hour
 	}
 
 	// Generate a secure random password for the agent
@@ -225,12 +231,13 @@ func (s *Server) HandleGenerateCredentials(w http.ResponseWriter, r *http.Reques
 		base64.StdEncoding.EncodeToString(storedKey), 
 		base64.StdEncoding.EncodeToString(serverKey))
 
-	s.store.AddEphemeralAgent(req.AgentID, scramSecret)
+	s.store.AddEphemeralAgent(req.AgentID, scramSecret, ttl)
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
+	json.NewEncoder(w).Encode(map[string]interface{}{
 		"agent_id": req.AgentID,
 		"password": password,
+		"ttl_seconds": ttl,
 	})
 }
 

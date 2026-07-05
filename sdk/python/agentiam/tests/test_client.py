@@ -1,16 +1,18 @@
 import unittest
+import os
 from unittest.mock import patch, Mock
-from agentiam.client import AgentIAMClient
+import asyncio
+from agentiam.client import AgentIAMClient, AsyncAgentIAMClient
 
 class TestAgentIAMClient(unittest.TestCase):
     
-    @patch('requests.post')
+    @patch('httpx.Client.post')
     def test_generate_credentials(self, mock_post):
-        # Mock the HTTP response from the proxy
         mock_response = Mock()
         mock_response.json.return_value = {
             "agent_id": "test_agent",
-            "password": "test_password_123"
+            "password": "test_password_123",
+            "ttl_seconds": 3600
         }
         mock_post.return_value = mock_response
         
@@ -21,8 +23,7 @@ class TestAgentIAMClient(unittest.TestCase):
         self.assertEqual(creds["password"], "test_password_123")
         mock_post.assert_called_once_with(
             "http://test:9090/api/credentials",
-            json={"agent_id": "test_agent"},
-            timeout=5
+            json={"agent_id": "test_agent", "ttl_seconds": 3600}
         )
         
     @patch('agentiam.client.AgentIAMClient.generate_credentials')
@@ -37,6 +38,27 @@ class TestAgentIAMClient(unittest.TestCase):
         
         expected = "postgresql+psycopg2://test_agent:super_secret_password@127.0.0.1:5435/my_db"
         self.assertEqual(conn_str, expected)
+        
+    @patch('httpx.AsyncClient.post')
+    def test_async_generate_credentials(self, mock_post):
+        mock_response = Mock()
+        mock_response.json.return_value = {
+            "agent_id": "async_agent",
+            "password": "async_password_123"
+        }
+        mock_post.return_value = mock_response
+        
+        client = AsyncAgentIAMClient(base_url="http://test:9090")
+        creds = asyncio.run(client.generate_credentials("async_agent"))
+        
+        self.assertEqual(creds["agent_id"], "async_agent")
+        self.assertEqual(creds["password"], "async_password_123")
+        
+    def test_env_var_configuration(self):
+        os.environ["AGENTIAM_URL"] = "http://env-test:8080"
+        client = AgentIAMClient()
+        self.assertEqual(client.base_url, "http://env-test:8080")
+        del os.environ["AGENTIAM_URL"]
 
 if __name__ == '__main__':
     unittest.main()

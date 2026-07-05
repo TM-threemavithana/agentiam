@@ -5,7 +5,7 @@ Summary: Official Python SDK for AgentIAM: AI Database Proxy
 License: Apache-2.0
 Requires-Python: >=3.8
 Description-Content-Type: text/markdown
-Requires-Dist: requests>=2.28.0
+Requires-Dist: httpx>=0.24.0
 Requires-Dist: SQLAlchemy>=2.0.0
 Provides-Extra: langchain
 Requires-Dist: langchain>=0.1.0; extra == "langchain"

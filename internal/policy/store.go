@@ -334,11 +334,10 @@ func (s *Store) CheckRateLimit(clientID string) error {
 	return nil
 }
 
-// AddEphemeralAgent dynamically adds an agent config in memory (useful for SDK auto-provisioning)
-func (s *Store) AddEphemeralAgent(agentID, scramSecret string) {
+// AddEphemeralAgent dynamically adds an agent config in memory with a Time-To-Live (TTL).
+func (s *Store) AddEphemeralAgent(agentID, scramSecret string, ttlSeconds int) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
+	
 	state := agentState{
 		config: AgentConfig{
 			Name: agentID,
@@ -354,4 +353,14 @@ func (s *Store) AddEphemeralAgent(agentID, scramSecret string) {
 		limiter: rate.NewLimiter(rate.Limit(600/60.0), 50),
 	}
 	s.agents[agentID] = state
+	s.mu.Unlock()
+
+	if ttlSeconds > 0 {
+		time.AfterFunc(time.Duration(ttlSeconds)*time.Second, func() {
+			s.mu.Lock()
+			delete(s.agents, agentID)
+			s.mu.Unlock()
+			s.logger.Info("Revoked ephemeral credential due to TTL expiration", "agent_id", agentID)
+		})
+	}
 }
