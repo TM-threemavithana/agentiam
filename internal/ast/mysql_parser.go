@@ -33,6 +33,10 @@ func (p *MySQLParser) ApplyRules(sql string, rules Rules, astCache cache.ASTCach
 
 	stmt := stmtNodes[0]
 
+	if err := InjectMySQLTenantIsolation(stmt, rules); err != nil {
+		return "", nil, fmt.Errorf("tenant isolation failed: %w", err)
+	}
+
 	v := &mysqlVisitor{rules: rules}
 	stmt.Accept(v)
 
