@@ -2,14 +2,18 @@ package policy
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,6 +21,7 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/crypto/pbkdf2"
 	"golang.org/x/time/rate"
 	"gopkg.in/yaml.v3"
 )
@@ -242,9 +247,30 @@ func (s *Store) GetRulesForAgent(clientID string, suppliedPassword string) (ast.
 	} else if state.hasCache && subtle.ConstantTimeCompare(state.cachedPwdHash[:], pwdHash[:]) == 1 {
 		// Valid!
 	} else {
-		// Slow path: bcrypt
-		if err := bcrypt.CompareHashAndPassword([]byte(state.config.Key), []byte(suppliedPassword)); err != nil {
-			return ast.Rules{}, 0, fmt.Errorf("invalid client ID or password")
+		// Slow path
+		if strings.HasPrefix(state.config.Key, "SCRAM-SHA-256$") {
+			// Verify plaintext against SCRAM secret
+			iters, salt, storedKey, _, err := parseSCRAMSecret(state.config.Key)
+			if err != nil {
+				return ast.Rules{}, 0, fmt.Errorf("invalid server configuration")
+			}
+			// pbkdf2
+			saltedPassword := pbkdf2.Key([]byte(suppliedPassword), salt, iters, 32, sha256.New)
+			macClient := hmac.New(sha256.New, saltedPassword)
+			macClient.Write([]byte("Client Key"))
+			clientKey := macClient.Sum(nil)
+			hashStored := sha256.New()
+			hashStored.Write(clientKey)
+			expectedStoredKey := hashStored.Sum(nil)
+
+			if subtle.ConstantTimeCompare(expectedStoredKey, storedKey) != 1 {
+				return ast.Rules{}, 0, fmt.Errorf("invalid client ID or password")
+			}
+		} else {
+			// bcrypt
+			if err := bcrypt.CompareHashAndPassword([]byte(state.config.Key), []byte(suppliedPassword)); err != nil {
+				return ast.Rules{}, 0, fmt.Errorf("invalid client ID or password")
+			}
 		}
 
 		// Update cache
@@ -363,4 +389,42 @@ func (s *Store) AddEphemeralAgent(agentID, scramSecret string, ttlSeconds int) {
 			s.logger.Info("Revoked ephemeral credential due to TTL expiration", "agent_id", agentID)
 		})
 	}
+}
+
+func parseSCRAMSecret(secret string) (iterations int, salt []byte, storedKey []byte, serverKey []byte, err error) {
+	if !strings.HasPrefix(secret, "SCRAM-SHA-256$") {
+		return 0, nil, nil, nil, fmt.Errorf("invalid prefix")
+	}
+	parts := strings.SplitN(secret[14:], "$", 2)
+	if len(parts) != 2 {
+		return 0, nil, nil, nil, fmt.Errorf("invalid format")
+	}
+
+	part1 := strings.SplitN(parts[0], ":", 2)
+	if len(part1) != 2 {
+		return 0, nil, nil, nil, fmt.Errorf("invalid format")
+	}
+	iterations, err = strconv.Atoi(part1[0])
+	if err != nil {
+		return 0, nil, nil, nil, err
+	}
+	salt, err = base64.StdEncoding.DecodeString(part1[1])
+	if err != nil {
+		return 0, nil, nil, nil, err
+	}
+
+	part2 := strings.SplitN(parts[1], ":", 2)
+	if len(part2) != 2 {
+		return 0, nil, nil, nil, fmt.Errorf("invalid format")
+	}
+	storedKey, err = base64.StdEncoding.DecodeString(part2[0])
+	if err != nil {
+		return 0, nil, nil, nil, err
+	}
+	serverKey, err = base64.StdEncoding.DecodeString(part2[1])
+	if err != nil {
+		return 0, nil, nil, nil, err
+	}
+
+	return iterations, salt, storedKey, serverKey, nil
 }

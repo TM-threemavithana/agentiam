@@ -6,8 +6,10 @@ import (
 	"crypto/x509"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"strconv"
+	"strings"
 
 	"flag"
 	"golang.org/x/crypto/bcrypt"
@@ -113,6 +115,31 @@ func main() {
 
 	srv.SetHandler(proxy.ProtocolPostgres, pgHandler)
 	srv.SetHandler(proxy.ProtocolMySQL, mysqlHandler)
+
+	edwHttpPort := os.Getenv("AGENTIAM_EDW_HTTP_PORT")
+	if edwHttpPort == "" {
+		edwHttpPort = "8080"
+	}
+	
+	edwUpstreamAuth := os.Getenv("AGENTIAM_EDW_UPSTREAM_AUTH")
+	if edwUpstreamAuth == "" && strings.Contains(upstreamDSN, "http") {
+		logger.Warn("AGENTIAM_EDW_UPSTREAM_AUTH is not set, EDW proxy will not inject upstream auth")
+	}
+
+	if strings.Contains(upstreamDSN, "http") {
+		httpInterceptor, err := proxy.NewHTTPInterceptorProxy(upstreamDSN, store, logger, astCache, edwUpstreamAuth)
+		if err != nil {
+			logger.Error("Failed to init HTTP Proxy", "error", err)
+			os.Exit(1)
+		}
+		
+		go func() {
+			logger.Info("Starting HTTP EDW Interceptor...", "port", edwHttpPort)
+			if err := http.ListenAndServe(":"+edwHttpPort, httpInterceptor); err != nil {
+				logger.Error("HTTP Proxy failed", "error", err)
+			}
+		}()
+	}
 
 	logger.Info("AgentIAM starting with Unified Port Multiplexer...", "port", listenPort)
 	if err := srv.Start(); err != nil {
