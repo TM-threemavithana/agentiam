@@ -1,0 +1,36 @@
+# AgentIAM Python SDK
+
+The official Python SDK for [AgentIAM](https://github.com/TM-threemavithana/agentiam).
+
+AgentIAM is an AI-Native Database Proxy that provides Row-Level Security (RLS), AST-level filtering, and connection multiplexing for AI agents (LangChain, LlamaIndex, etc.).
+
+This SDK makes it completely trivial to securely connect your LLM agents to your database without dealing with complex credential management or connection strings.
+
+## Installation
+
+```bash
+# Core package (just the client)
+pip install agentiam
+
+# With LangChain support
+pip install "agentiam[langchain]"
+
+# With LlamaIndex support
+pip install "agentiam[llamaindex]"
+```
+
+## Quick Start (LangChain)
+
+```python
+from agentiam.client import AgentIAMClient
+from agentiam.langchain import create_langchain_db
+
+# 1. Connect to the AgentIAM Control Plane (defaults to http://localhost:8080)
+client = AgentIAMClient(base_url="http://localhost:8080")
+
+# 2. Automatically provision an ephemeral credential for this agent and create a LangChain SQLDatabase
+db = create_langchain_db(client, agent_id="agent_123", db_name="my_database")
+
+# 3. Use it in your LangChain toolkit!
+# toolkit = SQLDatabaseToolkit(db=db, llm=llm)
+```

@@ -1,10 +1,17 @@
 package proxy
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"sync"
 	"time"
+
+	"golang.org/x/crypto/pbkdf2"
 )
 
 type UIAuditEvent struct {
@@ -164,6 +171,67 @@ func (s *Server) RecordLatency(ms float64) {
 	if s.latencyBuffer != nil {
 		s.latencyBuffer.Add(ms)
 	}
+}
+
+func (s *Server) HandleGenerateCredentials(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		AgentID string `json:"agent_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+	if req.AgentID == "" {
+		http.Error(w, "agent_id is required", http.StatusBadRequest)
+		return
+	}
+
+	// Generate a secure random password for the agent
+	passwordBytes := make([]byte, 16)
+	_, _ = rand.Read(passwordBytes)
+	password := base64.URLEncoding.EncodeToString(passwordBytes)
+
+	// Create SCRAM secret
+	salt := make([]byte, 16)
+	_, _ = rand.Read(salt)
+	iters := 4096
+	
+	// pbkdf2
+	saltedPassword := pbkdf2.Key([]byte(password), salt, iters, 32, sha256.New)
+	
+	// ClientKey = HMAC(SaltedPassword, "Client Key")
+	macClient := hmac.New(sha256.New, saltedPassword)
+	macClient.Write([]byte("Client Key"))
+	clientKey := macClient.Sum(nil)
+	
+	// StoredKey = HASH(ClientKey)
+	hashStored := sha256.New()
+	hashStored.Write(clientKey)
+	storedKey := hashStored.Sum(nil)
+	
+	// ServerKey = HMAC(SaltedPassword, "Server Key")
+	macServer := hmac.New(sha256.New, saltedPassword)
+	macServer.Write([]byte("Server Key"))
+	serverKey := macServer.Sum(nil)
+
+	scramSecret := fmt.Sprintf("SCRAM-SHA-256$%d:%s$%s:%s", 
+		iters, 
+		base64.StdEncoding.EncodeToString(salt), 
+		base64.StdEncoding.EncodeToString(storedKey), 
+		base64.StdEncoding.EncodeToString(serverKey))
+
+	s.store.AddEphemeralAgent(req.AgentID, scramSecret)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"agent_id": req.AgentID,
+		"password": password,
+	})
 }
 
 // DispatchAudit pushes an event to the local UI ring buffer and the remote webhook

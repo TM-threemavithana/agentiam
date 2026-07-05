@@ -333,3 +333,25 @@ func (s *Store) CheckRateLimit(clientID string) error {
 	}
 	return nil
 }
+
+// AddEphemeralAgent dynamically adds an agent config in memory (useful for SDK auto-provisioning)
+func (s *Store) AddEphemeralAgent(agentID, scramSecret string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	state := agentState{
+		config: AgentConfig{
+			Name: agentID,
+			Key:  scramSecret,
+			AllowedStatements: []string{"SELECT", "UPDATE", "INSERT", "DELETE"},
+			AllowedTables:     []string{"*"},
+			SelectLimit:       100,
+			RateLimitRPM:      600,
+			RateLimitBurst:    50,
+			PoolMode:          "transaction",
+		},
+		version: 1,
+		limiter: rate.NewLimiter(rate.Limit(600/60.0), 50),
+	}
+	s.agents[agentID] = state
+}

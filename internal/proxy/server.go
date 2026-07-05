@@ -173,6 +173,7 @@ func (s *Server) Start() error {
 		})
 		
 		mux.HandleFunc("/api/status", s.HandleUIStatus)
+		mux.HandleFunc("/api/credentials", s.HandleGenerateCredentials)
 		if s.uiFS != nil {
 			mux.Handle("/", http.FileServer(s.uiFS))
 		}
