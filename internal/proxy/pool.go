@@ -100,6 +100,9 @@ func (p *Pool) Acquire(ctx context.Context) (*UpstreamConn, error) {
 			u.Close()
 			newU, err := p.dial(ctx)
 			if err != nil {
+				broken := &UpstreamConn{}
+				broken.Broken.Store(true)
+				p.conns <- broken
 				return nil, err
 			}
 			newU.InUse.Store(true)
@@ -125,8 +128,10 @@ func (p *Pool) Release(u *UpstreamConn) {
 			newU, err := p.dial(context.Background())
 			if err != nil {
 				p.logger.Error("Failed to re-dial broken connection", "error", err)
-				// Put a broken one back so next acquire will retry dialing
-				p.conns <- &UpstreamConn{}
+				// Put a explicitly broken one back so next acquire will retry dialing safely
+				broken := &UpstreamConn{}
+				broken.Broken.Store(true)
+				p.conns <- broken
 				return
 			}
 			p.conns <- newU
@@ -143,7 +148,9 @@ func (p *Pool) Release(u *UpstreamConn) {
 				p.logger.Error("Failed to DISCARD ALL on release", "error", err)
 				u.Broken.Store(true)
 				u.Close()
-				p.conns <- &UpstreamConn{}
+				broken := &UpstreamConn{}
+				broken.Broken.Store(true)
+				p.conns <- broken
 				return
 			}
 			if _, ok := msg.(*pgproto3.ReadyForQuery); ok {
