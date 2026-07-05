@@ -47,8 +47,6 @@ func (r *UIRingBuffer) Get() []UIAuditEvent {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	res := make([]UIAuditEvent, 0, r.count)
-	// Iterate from oldest to newest, but wait, UI might want newest to oldest?
-	// The frontend appends to bottom, so it expects oldest to newest.
 	idx := r.head
 	if r.count < r.size {
 		idx = 0
@@ -57,6 +55,91 @@ func (r *UIRingBuffer) Get() []UIAuditEvent {
 		res = append(res, r.events[idx])
 		idx = (idx + 1) % r.size
 	}
+	return res
+}
+
+type UILatencyPoint struct {
+	Time    string  `json:"time"`
+	ValueMs float64 `json:"value"`
+}
+
+type UILatencyRingBuffer struct {
+	mu     sync.RWMutex
+	points []UILatencyPoint
+	size   int
+	head   int
+	count  int
+	currentSecond string
+	currentSum    float64
+	currentCount  int
+}
+
+func NewUILatencyRingBuffer(size int) *UILatencyRingBuffer {
+	return &UILatencyRingBuffer{
+		points: make([]UILatencyPoint, size),
+		size:   size,
+	}
+}
+
+func (r *UILatencyRingBuffer) Add(ms float64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	now := time.Now().UTC()
+	sec := now.Format("15:04:05")
+
+	if r.currentSecond == "" {
+		r.currentSecond = sec
+	}
+
+	if sec != r.currentSecond {
+		// Flush previous second
+		avg := 0.0
+		if r.currentCount > 0 {
+			avg = r.currentSum / float64(r.currentCount)
+		}
+		
+		r.points[r.head] = UILatencyPoint{
+			Time:    r.currentSecond,
+			ValueMs: avg,
+		}
+		r.head = (r.head + 1) % r.size
+		if r.count < r.size {
+			r.count++
+		}
+
+		// Reset for new second
+		r.currentSecond = sec
+		r.currentSum = 0
+		r.currentCount = 0
+	}
+
+	r.currentSum += ms
+	r.currentCount++
+}
+
+func (r *UILatencyRingBuffer) Get() []UILatencyPoint {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	res := make([]UILatencyPoint, 0, r.count+1)
+	
+	idx := r.head
+	if r.count < r.size {
+		idx = 0
+	}
+	for i := 0; i < r.count; i++ {
+		res = append(res, r.points[idx])
+		idx = (idx + 1) % r.size
+	}
+	
+	// Append the currently aggregating second
+	if r.currentCount > 0 {
+		res = append(res, UILatencyPoint{
+			Time:    r.currentSecond,
+			ValueMs: r.currentSum / float64(r.currentCount),
+		})
+	}
+	
 	return res
 }
 
@@ -70,10 +153,17 @@ func (s *Server) HandleUIStatus(w http.ResponseWriter, r *http.Request) {
 		"pool_connections":   s.pool.GetActiveCount(),
 		"pool_ready":         s.pool.IsReady(),
 		"events":             s.uiBuffer.Get(),
+		"latency_series":     s.latencyBuffer.Get(),
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(status)
+}
+
+func (s *Server) RecordLatency(ms float64) {
+	if s.latencyBuffer != nil {
+		s.latencyBuffer.Add(ms)
+	}
 }
 
 // DispatchAudit pushes an event to the local UI ring buffer and the remote webhook

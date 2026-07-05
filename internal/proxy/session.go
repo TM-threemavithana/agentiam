@@ -96,6 +96,7 @@ type Session struct {
 
 	lastClientActivity atomic.Int64
 	queryRunning       atomic.Bool
+	queryStartTime     atomic.Int64
 
 	preparedStatements map[string]PreparedStatement
 	sessionVars        map[string]string
@@ -442,6 +443,12 @@ func (s *Session) getOrAcquireUpstream(ctx context.Context, clientWriteCh chan p
 				s.queryRunning.Store(false)
 				s.lastClientActivity.Store(time.Now().UnixNano())
 
+				if start := s.queryStartTime.Load(); start > 0 {
+					ms := float64(time.Now().UnixNano()-start) / float64(time.Millisecond)
+					s.server.RecordLatency(ms)
+					s.queryStartTime.Store(0)
+				}
+
 				u.TxStatus = rfq.TxStatus
 				if rfq.TxStatus == 'I' {
 					if s.rules.PoolMode != "session" {
@@ -677,6 +684,7 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 
 		case *pgproto3.Execute:
 			s.queryRunning.Store(true)
+			s.queryStartTime.Store(time.Now().UnixNano())
 			_, span := Tracer.Start(ctx, "proxy.Execute")
 			if s.errorDiscard.Load() {
 				span.End()
@@ -707,6 +715,7 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 
 		case *pgproto3.Sync:
 			s.queryRunning.Store(true)
+			s.queryStartTime.Store(time.Now().UnixNano())
 			_, span := Tracer.Start(ctx, "proxy.Sync")
 			if s.errorDiscard.Load() {
 				s.errorDiscard.Store(false)
@@ -724,6 +733,7 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 
 		case *pgproto3.Query:
 			s.queryRunning.Store(true)
+			s.queryStartTime.Store(time.Now().UnixNano())
 			_, span := Tracer.Start(ctx, "proxy.Query")
 
 			if err := s.server.store.CheckRateLimit(s.clientID); err != nil {

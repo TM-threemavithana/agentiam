@@ -10,14 +10,30 @@ interface AuditEvent {
   reason?: string;
 }
 
+interface LatencyPoint {
+  time: string;
+  value: number;
+}
+
 interface StatusResponse {
   active_connections: number;
   pool_connections: number;
   total_allowed: number;
   total_blocked: number;
   events: AuditEvent[];
+  latency_series: LatencyPoint[];
   pool_ready: boolean;
 }
+
+import {
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  ResponsiveContainer,
+} from 'recharts';
 
 function App() {
   const [status, setStatus] = useState<StatusResponse>({
@@ -26,6 +42,7 @@ function App() {
     total_allowed: 0,
     total_blocked: 0,
     events: [],
+    latency_series: [],
     pool_ready: false,
   });
 
@@ -38,6 +55,10 @@ function App() {
         const res = await fetch('/api/status');
         if (res.ok) {
           const data = await res.json();
+          // Ensure latency_series is at least an empty array
+          if (!data.latency_series) {
+            data.latency_series = [];
+          }
           setStatus(data);
           setConnected(true);
         } else {
@@ -110,6 +131,42 @@ function App() {
           <span className="stat-value" style={{ color: status.total_blocked > 0 ? 'var(--danger-color)' : 'inherit' }}>
             {status.total_blocked}
           </span>
+        </div>
+      </div>
+
+      <div className="glass-panel feed-container" style={{ minHeight: '300px', marginBottom: '1.5rem', display: 'flex', flexDirection: 'column' }}>
+        <div className="feed-header">
+          <h2 className="feed-title">Query Latency (Real-time)</h2>
+          <span style={{ fontSize: '0.875rem', color: 'var(--text-secondary)' }}>Rolling 60s Average Latency</span>
+        </div>
+        <div style={{ flex: 1, minHeight: '200px', width: '100%', marginTop: '1rem' }}>
+          <ResponsiveContainer width="100%" height="100%">
+            <LineChart data={status.latency_series} margin={{ top: 5, right: 20, bottom: 5, left: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" vertical={false} />
+              <XAxis dataKey="time" stroke="#6b7280" tick={{ fill: '#6b7280', fontSize: 12 }} minTickGap={30} />
+              <YAxis 
+                stroke="#6b7280" 
+                tick={{ fill: '#6b7280', fontSize: 12 }}
+                tickFormatter={(val) => `${val}ms`}
+                domain={['auto', 'auto']}
+              />
+              <Tooltip 
+                contentStyle={{ backgroundColor: '#111827', borderColor: '#374151', borderRadius: '8px' }}
+                itemStyle={{ color: '#60a5fa' }}
+                formatter={(value: any) => [`${Number(value).toFixed(1)} ms`, 'Latency']}
+                labelStyle={{ color: '#9ca3af' }}
+              />
+              <Line 
+                type="monotone" 
+                dataKey="value" 
+                stroke="var(--accent-color)" 
+                strokeWidth={2}
+                dot={false}
+                activeDot={{ r: 6, fill: 'var(--accent-color)' }}
+                isAnimationActive={false}
+              />
+            </LineChart>
+          </ResponsiveContainer>
         </div>
       </div>
 

@@ -48,6 +48,7 @@ type Server struct {
 	metricsAddr    string
 	Webhook        *WebhookDispatcher
 	uiBuffer       *UIRingBuffer
+	latencyBuffer  *UILatencyRingBuffer
 	uiFS           http.FileSystem
 }
 
@@ -72,6 +73,7 @@ func NewServer(listenAddr, upstreamDSN string, store *policy.Store, tlsConfig *t
 		insecureAuth:   insecureAuth,
 		metricsAddr:    metricsAddr,
 		uiBuffer:       NewUIRingBuffer(100),
+		latencyBuffer:  NewUILatencyRingBuffer(60), // 60 seconds of history
 		uiFS:           uiFS,
 	}
 }
