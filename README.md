@@ -14,6 +14,14 @@ Connecting Large Language Models (LLMs) directly to your database for "Text-to-S
 
 ---
 
+## ✨ New in v1.0.0
+- **Embedded Observability Dashboard:** Access real-time streaming telemetry and audit logs via the built-in React dashboard at `:9090`.
+- **True M:N Transaction Multiplexing:** Built-in connection pooling preserves 100% of session state (like `SET timezone`) across multiplexed transactions, eliminating the need for external poolers like PgBouncer.
+- **AST Tenant Isolation (RLS Rewriting):** The proxy automatically rewrites queries to inject multi-tenant `LEFT JOIN` access controls with cardinality protection.
+- **Zero-Dependency Demo Mode:** Test the full system via Docker Compose without needing Ollama or an OpenAI API key!
+
+---
+
 ## 🛑 The Problem
 
 If you give an AI Agent a database connection, it *will* eventually try to delete data or overwhelm your database.
@@ -33,8 +41,9 @@ Relying on "prompt engineering" or LLM safety rails to prevent this does not wor
 1. **Wire Protocol Interception:** The AI Agent connects to AgentIAM. The proxy intercepts the incoming packets at the Postgres Extended Query or MySQL protocol level.
 2. **AST Parsing:** The SQL is parsed into an Abstract Syntax Tree (AST) using `pg_query_go` for PostgreSQL, or the `pingcap/tidb` parser for MySQL.
 3. **Deterministic Enforcement:** AgentIAM uses a recursive Visitor pattern to traverse the AST. If a blocked node (like a `DeleteStmt`) is detected—even if hidden deeply inside a CTE or subquery—the proxy instantly drops the query and returns a protocol error to the AI.
-4. **Policy Fetching via Local YAML:** The proxy enforces rules based on policies configured in a local `policies.yaml` file (with an optional HTTP polling fallback for enterprise control planes). 
-5. **AST Rewriting:** If an allowed `SelectStmt` lacks a limit, AgentIAM rewrites the AST to enforce a hard `LIMIT 100`, deparses it back to SQL, and forwards it to the real database.
+4. **AST Rewriting & Tenant Isolation:** The proxy dynamically rewrites allowed queries. It injects a hard `LIMIT 100` on unbounded `SELECT` statements, and securely injects Row-Level Security (RLS) tenant isolations directly into the AST structure.
+5. **Policy Fetching via Local YAML:** The proxy enforces rules based on policies configured in a local `policies.yaml` file (with an optional HTTP polling fallback for enterprise control planes).
+6. **M:N Connection Multiplexing:** Validated queries are dispatched using AgentIAM's native transaction-level connection pool, complete with transparent in-memory Session State Replay.
 
 ---
 
@@ -83,16 +92,14 @@ When your AI connects, it uses `langchain-bot` as the database user. The proxy i
 
 AgentIAM provides strong mitigations against specific classes of attacks, but it is important to understand its boundaries.
 
-### ⚠️ Topology Warning: PgBouncer
-AgentIAM does not pool upstream connections; it maintains a 1:1 mapping between incoming client connections and upstream database connections. To prevent overwhelming your database in high-concurrency environments, you should deploy **PgBouncer** *downstream* of AgentIAM:
-
-`AI Agent -> AgentIAM Proxy -> PgBouncer -> Postgres`
+### ⚡ High-Performance Architecture
+AgentIAM is designed as a drop-in replacement for traditional connection poolers.
+- **Native Transaction Multiplexing:** AgentIAM manages its own highly concurrent physical connection pool to the upstream database. It multiplexes thousands of incoming AI agents across a small number of upstream connections, safely replaying session state dynamically.
 
 ### Security Boundaries
 - **Authentication:** The proxy supports `AuthenticationCleartextPassword` for local connections, but now heavily emphasizes **mutual TLS (mTLS)** for secure authentication. Valid mTLS certificates can be configured to bypass standard password checks.
 - **Timing Oracles:** The proxy does not obfuscate latency during authentication or policy evaluation. An attacker on the same subnet could theoretically deduce valid agent keys by measuring `bcrypt` comparison time, and could detect SQLite hit vs miss latency for policy lookups.
 - **Parameterized LIMITs:** While the proxy automatically injects a `LIMIT` clause for unbounded `SELECT` statements, it deliberately rejects parameterized limits (e.g., `LIMIT $1`). Applications or ORMs that default to parameterized limits must disable them for proxy compliance.
-- **Semantic Logic:** The proxy prevents unauthorized tables from being queried, but does not currently enforce row-level security (RLS) or inject tenant isolation limits.
 - **Policy Configuration:** AgentIAM enforces what you configure. A misconfigured policy is still a misconfigured policy. If you whitelist sensitive tables or functions, the proxy will allow access to them.
 - **Concurrency & DDoS Protection:** The proxy utilizes a strict `AGENTIAM_MAX_CONNECTIONS` concurrency semaphore and guarantees no goroutine leaks when handling connection drops under extreme load.
 
