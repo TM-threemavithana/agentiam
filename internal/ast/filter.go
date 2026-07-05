@@ -57,6 +57,9 @@ func (p *PostgresParser) ApplyRules(sql string, rules Rules, astCache cache.ASTC
 		if err != nil {
 			return "", nil, err
 		}
+		if err := InjectTenantIsolation(stmt.Stmt, rules); err != nil {
+			return "", nil, fmt.Errorf("tenant isolation blocked query: %w", err)
+		}
 		if err := MaskData(stmt.Stmt, rules); err != nil {
 			return "", nil, fmt.Errorf("masking blocked query: %w", err)
 		}
