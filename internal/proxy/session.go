@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,6 +19,8 @@ import (
 
 	"github.com/jackc/pgproto3/v2"
 )
+
+var setCmdRegex = regexp.MustCompile(`(?i)^\s*SET\s+([a-zA-Z0-9_]+)\s*(?:TO|=)\s*(.+)$`)
 
 type PreparedStatement struct {
 	SQL           string
@@ -95,6 +98,7 @@ type Session struct {
 	queryRunning       atomic.Bool
 
 	preparedStatements map[string]PreparedStatement
+	sessionVars        map[string]string
 	clientID           string
 }
 
@@ -109,6 +113,7 @@ func NewSession(clientConn net.Conn, upstreamDSN string, store *policy.Store, tl
 		insecureAuth:       insecureAuth,
 		clientBackend:      pgproto3.NewBackend(pgproto3.NewChunkReader(clientConn), clientConn),
 		preparedStatements: make(map[string]PreparedStatement),
+		sessionVars:        make(map[string]string),
 	}
 }
 
@@ -357,8 +362,18 @@ func (s *Session) getOrAcquireUpstream(ctx context.Context, clientWriteCh chan p
 	if timeout <= 0 {
 		timeout = 5000 // default fallback
 	}
-	u.SwallowSetTimeout.Add(1)
-	u.Frontend.Send(&pgproto3.Query{String: fmt.Sprintf("SET statement_timeout = '%dms'", timeout)})
+	
+	// Prepare state replay queries
+	stateQueries := make([]string, 0, len(s.sessionVars)+1)
+	stateQueries = append(stateQueries, fmt.Sprintf("SET statement_timeout = '%dms'", timeout))
+	for k, v := range s.sessionVars {
+		stateQueries = append(stateQueries, fmt.Sprintf("SET %s = %s", k, v))
+	}
+
+	for _, q := range stateQueries {
+		u.SwallowSetTimeout.Add(1)
+		u.Frontend.Send(&pgproto3.Query{String: q})
+	}
 
 	s.uconn = u
 
@@ -676,6 +691,20 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 			u.Frontend.Send(v)
 			span.End()
 
+		case *pgproto3.Close:
+			_, span := Tracer.Start(ctx, "proxy.Close")
+			if v.ObjectType == 'S' {
+				delete(s.preparedStatements, v.Name)
+			}
+			if !s.errorDiscard.Load() {
+				u, err := s.getOrAcquireUpstream(ctx, clientWriteCh)
+				if err == nil {
+					v.Name = ""
+					u.Frontend.Send(v)
+				}
+			}
+			span.End()
+
 		case *pgproto3.Sync:
 			s.queryRunning.Store(true)
 			_, span := Tracer.Start(ctx, "proxy.Sync")
@@ -722,6 +751,15 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 			}
 
 			v.String = rewrittenSQL
+			
+			if matches := setCmdRegex.FindStringSubmatch(v.String); matches != nil {
+				key := matches[1]
+				val := matches[2]
+				val = strings.TrimRight(val, ";")
+				s.uconnMu.Lock()
+				s.sessionVars[key] = val
+				s.uconnMu.Unlock()
+			}
 			
 			s.server.DispatchAudit(AuditEvent{Event: EventQueryForwarded, ClientID: s.clientID, SQL: v.String, Status: "success"})
 
