@@ -23,7 +23,7 @@ func TestUnifiedPortMultiplexer(t *testing.T) {
 	server := NewServer("127.0.0.1:0", "postgres://dummy", store, nil, logger, nil, handlers, false, ":0", 5, nil, nil)
 
 	pgHandler := NewPostgresProtocolHandler("postgres://dummy", store, nil, logger, server, false)
-	mysqlHandler := NewMySQLProtocolHandler(store, logger, false)
+	mysqlHandler := NewMySQLProtocolHandler(store, logger, server, false)
 
 	server.SetHandler(ProtocolPostgres, pgHandler)
 	server.SetHandler(ProtocolMySQL, mysqlHandler)

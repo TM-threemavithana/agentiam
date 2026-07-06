@@ -111,7 +111,7 @@ func main() {
 	srv := proxy.NewServer(":"+listenPort, upstreamDSN, store, tlsConfig, logger, astCache, handlers, insecureAuth, metricsAddr, poolSize, webhook, uiFS)
 
 	pgHandler := proxy.NewPostgresProtocolHandler(upstreamDSN, store, tlsConfig, logger, srv, insecureAuth)
-	mysqlHandler := proxy.NewMySQLProtocolHandler(store, logger, insecureAuth)
+	mysqlHandler := proxy.NewMySQLProtocolHandler(store, logger, srv, insecureAuth)
 
 	srv.SetHandler(proxy.ProtocolPostgres, pgHandler)
 	srv.SetHandler(proxy.ProtocolMySQL, mysqlHandler)

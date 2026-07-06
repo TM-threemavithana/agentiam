@@ -1,11 +1,14 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"fmt"
 	"net"
 
+	"github.com/tm-threemavithana/agentiam/internal/ast"
 	"github.com/tm-threemavithana/agentiam/internal/policy"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
@@ -19,12 +22,13 @@ type MySQLProtocolHandler struct {
 	logger       *Logger
 	upstreamDSN  string
 	db           *sql.DB
+	server       *Server
 	insecureAuth bool
 }
 
 // NewMySQLProtocolHandler creates a new handler capable of routing and parsing MySQL client connections.
-func NewMySQLProtocolHandler(store *policy.Store, logger *Logger, insecureAuth bool) *MySQLProtocolHandler {
-	return &MySQLProtocolHandler{store: store, logger: logger, upstreamDSN: "root@tcp(127.0.0.1:3306)/", insecureAuth: insecureAuth}
+func NewMySQLProtocolHandler(store *policy.Store, logger *Logger, server *Server, insecureAuth bool) *MySQLProtocolHandler {
+	return &MySQLProtocolHandler{store: store, logger: logger, upstreamDSN: "root@tcp(127.0.0.1:3306)/", server: server, insecureAuth: insecureAuth}
 }
 
 // InitPool initializes the upstream *sql.DB connection pool.
@@ -43,14 +47,29 @@ func (h *MySQLProtocolHandler) InitPool() error {
 func (h *MySQLProtocolHandler) HandleSession(ctx context.Context, clientConn net.Conn) error {
 	h.logger.Info("MySQL connection accepted", "remote_addr", clientConn.RemoteAddr().String())
 
-	authHandler := &AgentIAMAuthHandler{store: h.store, logger: h.logger, insecureAuth: h.insecureAuth}
-	serverConf := server.NewDefaultServer()
+	proxyHandler := &AgentIAMMySQLHandler{
+		db:     h.db,
+		logger: h.logger,
+		server: h.server,
+	}
+
+	authHandler := &AgentIAMAuthHandler{
+		store:        h.store,
+		logger:       h.logger,
+		insecureAuth: h.insecureAuth,
+		mysqlHandler: proxyHandler,
+	}
+
+	var tlsCfg *tls.Config
+	if h.server != nil && h.server.tlsConfig != nil {
+		tlsCfg = h.server.tlsConfig
+	}
+	serverConf := server.NewServer("8.0.11", 255, "mysql_native_password", nil, tlsCfg)
 
 	// Initialize the MySQL Proxy handler
 	if h.db == nil {
 		_ = h.InitPool()
 	}
-	proxyHandler := &AgentIAMMySQLHandler{db: h.db, logger: h.logger}
 
 	conn, err := serverConf.NewCustomizedConn(clientConn, authHandler, proxyHandler)
 	if err != nil {
@@ -76,15 +95,69 @@ type AgentIAMAuthHandler struct {
 	store        *policy.Store
 	logger       *Logger
 	insecureAuth bool
+	mysqlHandler *AgentIAMMySQLHandler
+}
+
+// Authenticate implements server.AuthenticationProvider.
+func (a *AgentIAMAuthHandler) Authenticate(c *server.Conn, authPluginName string, clientAuthData []byte) error {
+	clientID := c.GetUser()
+	a.logger.Info("MySQL Authenticate attempt", "user", clientID, "plugin", authPluginName)
+
+	var mtlsVerified bool
+	var suppliedPassword string
+
+	if c.Conn != nil && c.Conn.Conn != nil {
+		if tlsConn, ok := c.Conn.Conn.(*tls.Conn); ok {
+			state := tlsConn.ConnectionState()
+			if len(state.PeerCertificates) > 0 {
+				cert := state.PeerCertificates[0]
+				if cert.Subject.CommonName == clientID {
+					mtlsVerified = true
+					suppliedPassword = "mTLS_VERIFIED"
+				} else {
+					a.logger.Error("MySQL mTLS CN mismatch", "cn", cert.Subject.CommonName, "clientID", clientID)
+				}
+			}
+		}
+	}
+
+	if !mtlsVerified && !a.insecureAuth {
+		a.logger.Error("Client attempted cleartext authentication without --insecure-cleartext-auth flag")
+		return fmt.Errorf("mTLS is required. Cleartext auth is disabled.")
+	}
+
+	if !mtlsVerified {
+		if authPluginName == "mysql_clear_password" {
+			suppliedPassword = string(bytes.TrimRight(clientAuthData, "\x00"))
+		} else if authPluginName == "mysql_native_password" {
+			if clientID == "root" && len(clientAuthData) == 0 {
+				suppliedPassword = ""
+			} else {
+				return fmt.Errorf("authentication plugin %s not supported without mTLS (use mysql_clear_password for password auth)", authPluginName)
+			}
+		} else {
+			return fmt.Errorf("authentication plugin %s not supported", authPluginName)
+		}
+	}
+
+	rules, _, err := a.store.GetRulesForAgent(clientID, suppliedPassword)
+	if err != nil {
+		a.logger.Error("MySQL Authentication failed", "user", clientID, "error", err)
+		return fmt.Errorf("invalid Agent Credentials: %w", err)
+	}
+
+	if a.mysqlHandler != nil {
+		a.mysqlHandler.clientID = clientID
+		a.mysqlHandler.rules = rules
+	}
+
+	a.logger.Info("MySQL Authentication successful", "user", clientID)
+	return nil
 }
 
 // GetCredential retrieves the password for a given user.
 func (a *AgentIAMAuthHandler) GetCredential(username string) (server.Credential, bool, error) {
-	if !a.insecureAuth {
-		return server.Credential{}, false, fmt.Errorf("insecure auth rejected. mTLS is required")
-	}
-
-	if username == "root" {
+	if a.insecureAuth && username == "root" {
 		return server.Credential{Passwords: []string{""}, AuthPluginName: "mysql_native_password"}, true, nil
 	}
 	return server.Credential{}, false, nil
@@ -117,8 +190,11 @@ func (a *AgentIAMAuthHandler) OnAuthFailure(conn *server.Conn, err error) {
 //     Reference: https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_query_response_text_resultset.html
 type AgentIAMMySQLHandler struct {
 	server.EmptyHandler
-	db     *sql.DB
-	logger *Logger
+	db       *sql.DB
+	logger   *Logger
+	server   *Server
+	clientID string
+	rules    ast.Rules
 }
 
 // HandleQuery processes a raw SQL string received via COM_QUERY, applying policy rules, executing it upstream, and returning the result.
@@ -127,8 +203,34 @@ func (h *AgentIAMMySQLHandler) HandleQuery(query string) (*mysql.Result, error) 
 	// and hands us the raw SQL query string from the payload.
 	h.logger.Info("Intercepted COM_QUERY", "query", query)
 
+	var rewritten string
+	var err error
+
+	if h.server != nil {
+		parser := &ast.MySQLParser{}
+		rewritten, _, err = parser.ApplyRules(query, h.rules, h.server.astCache)
+		if err != nil {
+			h.server.DispatchAudit(AuditEvent{
+				Event:    EventPolicyBlocked,
+				ClientID: h.clientID,
+				SQL:      query,
+				Status:   "blocked",
+				Error:    err.Error(),
+			})
+			return nil, err
+		}
+		h.server.DispatchAudit(AuditEvent{
+			Event:    EventQueryForwarded,
+			ClientID: h.clientID,
+			SQL:      rewritten,
+			Status:   "success",
+		})
+	} else {
+		rewritten = query
+	}
+
 	// Execute on upstream
-	rows, err := h.db.Query(query)
+	rows, err := h.db.Query(rewritten)
 	if err != nil {
 		return nil, err
 	}

@@ -307,6 +307,7 @@ func (s *Store) GetRulesForAgent(clientID string, suppliedPassword string) (ast.
 		EnforceSelectLimit: limit,
 		MaxExecutionTimeMs: timeoutMs,
 		PoolMode:           state.config.PoolMode,
+		Dialect:            state.config.Dialect,
 	}, state.version, nil
 }
 

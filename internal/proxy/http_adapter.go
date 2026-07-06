@@ -105,7 +105,18 @@ func (h *HTTPInterceptor) interceptSQLPayload(w http.ResponseWriter, r *http.Req
 	}
 
 	// 3. Parse AST and Apply Policies
-	astParser := &ast.PostgresParser{}
+	var astParser ast.ASTParser = &ast.PostgresParser{}
+	dialect := strings.ToLower(rules.Dialect)
+	if dialect == "mysql" || dialect == "mariadb" {
+		astParser = &ast.MySQLParser{}
+	} else if dialect == "" {
+		// Fallback check on request path
+		path := strings.ToLower(r.URL.Path)
+		if strings.Contains(path, "snowflake") || strings.Contains(path, "databricks") {
+			astParser = &ast.MySQLParser{}
+		}
+	}
+
 	rewrittenSQL, _, err := astParser.ApplyRules(rawSQL, rules, h.astCache)
 	if err != nil {
 		h.logger.Warn("Policy violation in HTTP proxy", "agent", agentID, "sql", rawSQL, "error", err)

@@ -9,6 +9,7 @@ type Rules struct {
 	EnforceSelectLimit int                 `yaml:"enforce_select_limit"`
 	MaxExecutionTimeMs int      `yaml:"max_execution_time_ms"`
 	PoolMode           string   `yaml:"pool_mode"`
+	Dialect            string   `yaml:"dialect"`
 	TenantIsolation    *TenantIsolationRule `yaml:"tenant_isolation,omitempty"`
 }
 
