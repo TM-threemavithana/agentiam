@@ -576,7 +576,9 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 				span.End()
 				continue
 			}
-
+			if s.server.pool != nil {
+				s.server.store.SetPoolLatency(s.server.pool.GetAvgAcquireDuration())
+			}
 			if err := s.server.store.CheckRateLimit(s.clientID); err != nil {
 				s.server.DispatchAudit(AuditEvent{Event: EventPolicyBlocked, ClientID: s.clientID, Status: "rate_limited", Error: err.Error()})
 				clientWriteCh <- &pgproto3.ErrorResponse{
@@ -735,7 +737,9 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 			s.queryRunning.Store(true)
 			s.queryStartTime.Store(time.Now().UnixNano())
 			_, span := Tracer.Start(ctx, "proxy.Query")
-
+			if s.server.pool != nil {
+				s.server.store.SetPoolLatency(s.server.pool.GetAvgAcquireDuration())
+			}
 			if err := s.server.store.CheckRateLimit(s.clientID); err != nil {
 				s.server.DispatchAudit(AuditEvent{Event: EventPolicyBlocked, ClientID: s.clientID, SQL: v.String, Status: "rate_limited", Error: err.Error()})
 				clientWriteCh <- &pgproto3.ErrorResponse{

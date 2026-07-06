@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"sync/atomic"
+	"time"
 
 	"github.com/jackc/pgproto3/v2"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -29,11 +30,12 @@ func (u *UpstreamConn) Close() {
 }
 
 type Pool struct {
-	dsn    string
-	size   int
-	logger *Logger
-	conns  chan *UpstreamConn
-	ready  atomic.Bool
+	dsn                  string
+	size                 int
+	logger               *Logger
+	conns                chan *UpstreamConn
+	ready                atomic.Bool
+	avgAcquireDurationNs atomic.Int64
 }
 
 func NewPool(dsn string, size int, logger *Logger) *Pool {
@@ -98,11 +100,35 @@ func (p *Pool) dial(ctx context.Context) (*UpstreamConn, error) {
 	}, nil
 }
 
+func (p *Pool) GetAvgAcquireDuration() time.Duration {
+	return time.Duration(p.avgAcquireDurationNs.Load())
+}
+
+func (p *Pool) updateAvgAcquireDuration(d time.Duration) {
+	ns := d.Nanoseconds()
+	for {
+		current := p.avgAcquireDurationNs.Load()
+		var next int64
+		if current == 0 {
+			next = ns
+		} else {
+			next = int64(float64(current)*0.9 + float64(ns)*0.1)
+		}
+		if p.avgAcquireDurationNs.CompareAndSwap(current, next) {
+			break
+		}
+	}
+}
+
 func (p *Pool) Acquire(ctx context.Context) (*UpstreamConn, error) {
+	start := time.Now()
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case u := <-p.conns:
+		duration := time.Since(start)
+		p.updateAvgAcquireDuration(duration)
+
 		if u.Broken.Load() {
 			u.Close()
 			newU, err := p.dial(ctx)

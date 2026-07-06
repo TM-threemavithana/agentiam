@@ -15,9 +15,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tm-threemavithana/agentiam/internal/ast"
+	"github.com/tm-threemavithana/agentiam/internal/controlplane"
 
 	"github.com/fsnotify/fsnotify"
 	"golang.org/x/crypto/bcrypt"
@@ -65,14 +67,15 @@ type agentState struct {
 }
 
 type Store struct {
-	mu         sync.RWMutex
-	agents     map[string]agentState
-	auditSinks []AuditSinkConfig
-	dummyHash  []byte
-	filePath   string
-	apiUrl     string
-	logger     *slog.Logger
-	httpClient *http.Client
+	mu            sync.RWMutex
+	agents        map[string]agentState
+	auditSinks    []AuditSinkConfig
+	poolLatencyNs atomic.Int64
+	dummyHash     []byte
+	filePath      string
+	apiUrl        string
+	logger        *slog.Logger
+	httpClient    *http.Client
 }
 
 func (s *Store) GetAuditSinks() []AuditSinkConfig {
@@ -389,9 +392,20 @@ func (s *Store) GetAgentVersions() (map[string]int, error) {
 func (s *Store) SetAgentPolicy(clientID string, config AgentConfig) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	var limiter *rate.Limiter
+	if config.RateLimitRPM > 0 {
+		burst := config.RateLimitBurst
+		if burst <= 0 {
+			burst = 1
+		}
+		limiter = rate.NewLimiter(rate.Limit(float64(config.RateLimitRPM)/60.0), burst)
+	}
+
 	s.agents[clientID] = agentState{
 		config:  config,
 		version: 1,
+		limiter: limiter,
 	}
 }
 
@@ -407,6 +421,10 @@ func (s *Store) GetAgentKey(clientID string) (string, error) {
 	return "", fmt.Errorf("invalid client ID")
 }
 
+func (s *Store) SetPoolLatency(d time.Duration) {
+	s.poolLatencyNs.Store(d.Nanoseconds())
+}
+
 // CheckRateLimit deducts one token from the agent's bucket. Returns an error if the limit is exceeded.
 func (s *Store) CheckRateLimit(clientID string) error {
 	s.mu.RLock()
@@ -418,8 +436,16 @@ func (s *Store) CheckRateLimit(clientID string) error {
 	}
 
 	if state.limiter != nil {
-		if !state.limiter.Allow() {
-			return fmt.Errorf("rate limit exceeded for agent %s", clientID)
+		latency := time.Duration(s.poolLatencyNs.Load())
+		cost := 1
+		if latency > 500*time.Millisecond {
+			cost = 4
+		} else if latency > 150*time.Millisecond {
+			cost = 2
+		}
+
+		if !state.limiter.AllowN(time.Now(), cost) {
+			return fmt.Errorf("rate limit exceeded for agent %s (pool latency: %s, token cost: %d)", clientID, latency.String(), cost)
 		}
 	}
 	return nil
@@ -492,4 +518,68 @@ func parseSCRAMSecret(secret string) (iterations int, salt []byte, storedKey []b
 	}
 
 	return iterations, salt, storedKey, serverKey, nil
+}
+
+func (s *Store) ConnectControlPlane(addr string) {
+	if addr == "" {
+		return
+	}
+	s.logger.Info("Starting Control Plane client integration", "addr", addr)
+	client := controlplane.NewClient(addr, s.logger, func(payload []byte) {
+		s.logger.Info("Control plane push received, updating policies")
+		var py PoliciesYAML
+		// Try parsing as JSON first, then fallback to YAML if needed
+		if err := json.Unmarshal(payload, &py); err != nil {
+			if errY := yaml.Unmarshal(payload, &py); errY != nil {
+				s.logger.Error("Failed to unmarshal control plane policy update", "error", errY)
+				return
+			}
+		}
+
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		newAgents := make(map[string]agentState)
+		for _, a := range py.Agents {
+			oldState, exists := s.agents[a.Name]
+
+			version := 1
+			hasCache := false
+			var cachedPwdHash [32]byte
+
+			if exists {
+				version = oldState.version
+				if oldState.config.Key != a.Key {
+					version++
+				} else {
+					hasCache = oldState.hasCache
+					cachedPwdHash = oldState.cachedPwdHash
+				}
+			}
+
+			var limiter *rate.Limiter
+			if exists && oldState.config.RateLimitRPM == a.RateLimitRPM && oldState.config.RateLimitBurst == a.RateLimitBurst {
+				limiter = oldState.limiter
+			} else if a.RateLimitRPM > 0 {
+				burst := a.RateLimitBurst
+				if burst <= 0 {
+					burst = 1
+				}
+				limiter = rate.NewLimiter(rate.Limit(float64(a.RateLimitRPM)/60.0), burst)
+			}
+
+			newAgents[a.Name] = agentState{
+				config:        a,
+				version:       version,
+				hasCache:      hasCache,
+				cachedPwdHash: cachedPwdHash,
+				limiter:       limiter,
+			}
+		}
+
+		s.agents = newAgents
+		s.auditSinks = py.AuditSinks
+		s.logger.Info("Policies successfully hot-reloaded from Control Plane stream", "count", len(s.agents))
+	})
+	client.Start()
 }

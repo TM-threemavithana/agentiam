@@ -277,6 +277,22 @@ func (h *AgentIAMMySQLHandler) HandleQuery(query string) (*mysql.Result, error) 
 	var rewritten string
 	var err error
 
+	if h.server != nil && h.server.store != nil {
+		if h.server.pool != nil {
+			h.server.store.SetPoolLatency(h.server.pool.GetAvgAcquireDuration())
+		}
+		if err := h.server.store.CheckRateLimit(h.clientID); err != nil {
+			h.server.DispatchAudit(AuditEvent{
+				Event:    EventPolicyBlocked,
+				ClientID: h.clientID,
+				SQL:      query,
+				Status:   "rate_limited",
+				Error:    err.Error(),
+			})
+			return nil, err
+		}
+	}
+
 	if h.server != nil {
 		parser := &ast.MySQLParser{}
 		rewritten, _, err = parser.ApplyRules(query, h.rules, h.server.astCache)

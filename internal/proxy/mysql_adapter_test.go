@@ -21,6 +21,10 @@ func TestMySQLHandler_HandleQuery_RulesEnforced(t *testing.T) {
 	lc, _ := cache.NewLocalCache(10)
 	srv := NewServer("127.0.0.1:0", "postgres://dummy", store, nil, NewLogger(io.Discard), lc, handlers, false, ":0", 5, nil, nil)
 
+	store.SetAgentPolicy("test-agent", policy.AgentConfig{
+		Name: "test-agent",
+	})
+
 	handler := &AgentIAMMySQLHandler{
 		db:       nil, // we won't query unless rules pass
 		logger:   NewLogger(io.Discard),
