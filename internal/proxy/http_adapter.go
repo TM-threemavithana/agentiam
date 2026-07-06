@@ -107,13 +107,24 @@ func (h *HTTPInterceptor) interceptSQLPayload(w http.ResponseWriter, r *http.Req
 	// 3. Parse AST and Apply Policies
 	var astParser ast.ASTParser = &ast.PostgresParser{}
 	dialect := strings.ToLower(rules.Dialect)
-	if dialect == "mysql" || dialect == "mariadb" {
+	switch dialect {
+	case "mysql", "mariadb", "mysql5", "mysql8":
 		astParser = &ast.MySQLParser{}
-	} else if dialect == "" {
+	case "snowflake":
+		astParser = &ast.SnowflakeParser{}
+	case "bigquery", "google":
+		astParser = &ast.BigQueryParser{}
+	case "databricks", "spark", "hive":
+		astParser = &ast.DatabricksParser{}
+	case "":
 		// Fallback check on request path
 		path := strings.ToLower(r.URL.Path)
-		if strings.Contains(path, "snowflake") || strings.Contains(path, "databricks") {
-			astParser = &ast.MySQLParser{}
+		if strings.Contains(path, "snowflake") {
+			astParser = &ast.SnowflakeParser{}
+		} else if strings.Contains(path, "bigquery") || strings.Contains(path, "google") {
+			astParser = &ast.BigQueryParser{}
+		} else if strings.Contains(path, "databricks") || strings.Contains(path, "spark") {
+			astParser = &ast.DatabricksParser{}
 		}
 	}
 

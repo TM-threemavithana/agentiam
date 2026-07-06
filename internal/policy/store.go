@@ -230,85 +230,129 @@ func (s *Store) Watch(ctx context.Context) {
 }
 
 func (s *Store) GetRulesForAgent(clientID string, suppliedPassword string) (ast.Rules, int, error) {
+	var start time.Time
+	isPasswordAuth := suppliedPassword != "SCRAM_VERIFIED" && suppliedPassword != "mTLS_VERIFIED"
+	if isPasswordAuth {
+		start = time.Now()
+	}
+
 	s.mu.RLock()
 	state, exists := s.agents[clientID]
 	s.mu.RUnlock()
 
 	pwdHash := sha256.Sum256([]byte(suppliedPassword))
 
+	var err error
+	var rules ast.Rules
+	var version int
+
 	if !exists {
 		bcrypt.CompareHashAndPassword(s.dummyHash, []byte(suppliedPassword)) // mitigates timing oracle
-		return ast.Rules{}, 0, fmt.Errorf("invalid client ID or password")
-	}
-
-	// Fast path: Auth verified securely via SCRAM or mTLS in session layer
-	if suppliedPassword == "SCRAM_VERIFIED" || suppliedPassword == "mTLS_VERIFIED" {
-		// Valid!
+		err = fmt.Errorf("invalid client ID or password")
+	} else if suppliedPassword == "SCRAM_VERIFIED" || suppliedPassword == "mTLS_VERIFIED" {
+		// Fast path: pre-verified
+		rules = ast.Rules{
+			AllowedStatements:  state.config.AllowedStatements,
+			AllowedTables:      state.config.AllowedTables,
+			BlockedFunctions:   state.config.BlockedFunctions,
+			MaskedColumns:      state.config.MaskedColumns,
+			EnforceSelectLimit: state.config.SelectLimit,
+			MaxExecutionTimeMs: state.config.MaxExecutionTimeMs,
+			PoolMode:           state.config.PoolMode,
+			Dialect:            state.config.Dialect,
+		}
+		if rules.EnforceSelectLimit <= 0 {
+			rules.EnforceSelectLimit = 100
+		}
+		if rules.MaxExecutionTimeMs <= 0 {
+			rules.MaxExecutionTimeMs = 5000
+		}
+		version = state.version
 	} else if state.hasCache && subtle.ConstantTimeCompare(state.cachedPwdHash[:], pwdHash[:]) == 1 {
-		// Valid!
+		// Fast path: Cached password
+		rules = ast.Rules{
+			AllowedStatements:  state.config.AllowedStatements,
+			AllowedTables:      state.config.AllowedTables,
+			BlockedFunctions:   state.config.BlockedFunctions,
+			MaskedColumns:      state.config.MaskedColumns,
+			EnforceSelectLimit: state.config.SelectLimit,
+			MaxExecutionTimeMs: state.config.MaxExecutionTimeMs,
+			PoolMode:           state.config.PoolMode,
+			Dialect:            state.config.Dialect,
+		}
+		if rules.EnforceSelectLimit <= 0 {
+			rules.EnforceSelectLimit = 100
+		}
+		if rules.MaxExecutionTimeMs <= 0 {
+			rules.MaxExecutionTimeMs = 5000
+		}
+		version = state.version
 	} else {
 		// Slow path
 		if strings.HasPrefix(state.config.Key, "SCRAM-SHA-256$") {
-			// Verify plaintext against SCRAM secret
-			iters, salt, storedKey, _, err := parseSCRAMSecret(state.config.Key)
-			if err != nil {
-				return ast.Rules{}, 0, fmt.Errorf("invalid server configuration")
-			}
-			// pbkdf2
-			saltedPassword := pbkdf2.Key([]byte(suppliedPassword), salt, iters, 32, sha256.New)
-			macClient := hmac.New(sha256.New, saltedPassword)
-			macClient.Write([]byte("Client Key"))
-			clientKey := macClient.Sum(nil)
-			hashStored := sha256.New()
-			hashStored.Write(clientKey)
-			expectedStoredKey := hashStored.Sum(nil)
+			iters, salt, storedKey, _, parseErr := parseSCRAMSecret(state.config.Key)
+			if parseErr != nil {
+				err = fmt.Errorf("invalid server configuration")
+			} else {
+				saltedPassword := pbkdf2.Key([]byte(suppliedPassword), salt, iters, 32, sha256.New)
+				macClient := hmac.New(sha256.New, saltedPassword)
+				macClient.Write([]byte("Client Key"))
+				clientKey := macClient.Sum(nil)
+				hashStored := sha256.New()
+				hashStored.Write(clientKey)
+				expectedStoredKey := hashStored.Sum(nil)
 
-			if subtle.ConstantTimeCompare(expectedStoredKey, storedKey) != 1 {
-				return ast.Rules{}, 0, fmt.Errorf("invalid client ID or password")
+				if subtle.ConstantTimeCompare(expectedStoredKey, storedKey) != 1 {
+					err = fmt.Errorf("invalid client ID or password")
+				}
 			}
 		} else {
-			// bcrypt
-			if err := bcrypt.CompareHashAndPassword([]byte(state.config.Key), []byte(suppliedPassword)); err != nil {
-				return ast.Rules{}, 0, fmt.Errorf("invalid client ID or password")
+			if bcryptErr := bcrypt.CompareHashAndPassword([]byte(state.config.Key), []byte(suppliedPassword)); bcryptErr != nil {
+				err = fmt.Errorf("invalid client ID or password")
 			}
 		}
 
-		// Update cache
-		s.mu.Lock()
-		if st, ok := s.agents[clientID]; ok {
-			st.hasCache = true
-			st.cachedPwdHash = pwdHash
-			s.agents[clientID] = st
+		if err == nil {
+			rules = ast.Rules{
+				AllowedStatements:  state.config.AllowedStatements,
+				AllowedTables:      state.config.AllowedTables,
+				BlockedFunctions:   state.config.BlockedFunctions,
+				MaskedColumns:      state.config.MaskedColumns,
+				EnforceSelectLimit: state.config.SelectLimit,
+				MaxExecutionTimeMs: state.config.MaxExecutionTimeMs,
+				PoolMode:           state.config.PoolMode,
+				Dialect:            state.config.Dialect,
+			}
+			if rules.EnforceSelectLimit <= 0 {
+				rules.EnforceSelectLimit = 100
+			}
+			if rules.MaxExecutionTimeMs <= 0 {
+				rules.MaxExecutionTimeMs = 5000
+			}
+			version = state.version
+
+			// Update cache
+			s.mu.Lock()
+			if st, ok := s.agents[clientID]; ok {
+				st.hasCache = true
+				st.cachedPwdHash = pwdHash
+				s.agents[clientID] = st
+			}
+			s.mu.Unlock()
 		}
-		s.mu.Unlock()
 	}
 
-	// Always get the LATEST rules from memory (even if auth was cached) to ensure mid-session policy tightening applies on the next query.
-	s.mu.RLock()
-	state = s.agents[clientID]
-	s.mu.RUnlock()
-
-	limit := state.config.SelectLimit
-	if limit <= 0 {
-		limit = 100 // default fallback
+	if isPasswordAuth {
+		elapsed := time.Since(start)
+		if elapsed < 150*time.Millisecond {
+			time.Sleep(150*time.Millisecond - elapsed)
+		}
 	}
 
-	timeoutMs := state.config.MaxExecutionTimeMs
-	if timeoutMs <= 0 {
-		timeoutMs = 5000 // default 5 seconds
+	if err != nil {
+		return ast.Rules{}, 0, err
 	}
-
-	// Return fully assembled AST rules
-	return ast.Rules{
-		AllowedStatements:  state.config.AllowedStatements,
-		AllowedTables:      state.config.AllowedTables,
-		BlockedFunctions:   state.config.BlockedFunctions,
-		MaskedColumns:      state.config.MaskedColumns,
-		EnforceSelectLimit: limit,
-		MaxExecutionTimeMs: timeoutMs,
-		PoolMode:           state.config.PoolMode,
-		Dialect:            state.config.Dialect,
-	}, state.version, nil
+	return rules, version, nil
 }
 
 func (s *Store) GetAgentVersions() (map[string]int, error) {

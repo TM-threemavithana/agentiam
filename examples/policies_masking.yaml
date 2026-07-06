@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=../policies.schema.json
 agents:
   - name: test-agent
     key: "$2a$10$OAiS23oL4WZ0Db/N74SFW.0S/HCJrAVcczAC.PfJV92vnu2nKiGnK"

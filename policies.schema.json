@@ -1,0 +1,96 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AgentIAM Policies Configuration Schema",
+  "type": "object",
+  "properties": {
+    "version": {
+      "type": "string",
+      "description": "Configuration version"
+    },
+    "agents": {
+      "type": "array",
+      "description": "List of configuration settings for AI agents",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Unique identifier (client ID) for the agent"
+          },
+          "key": {
+            "type": "string",
+            "description": "Authentication credential (bcrypt hash or SCRAM verifier)"
+          },
+          "allowed_statements": {
+            "type": "array",
+            "description": "List of allowed SQL statement types (e.g. SELECT, INSERT, UPDATE)",
+            "items": {
+              "type": "string"
+            }
+          },
+          "allowed_tables": {
+            "type": "array",
+            "description": "List of tables that the agent is allowed to access. If empty, all tables are allowed.",
+            "items": {
+              "type": "string"
+            }
+          },
+          "blocked_functions": {
+            "type": "array",
+            "description": "List of functions that are blocked from execution (e.g. sleep, pg_sleep)",
+            "items": {
+              "type": "string"
+            }
+          },
+          "masked_columns": {
+            "type": "object",
+            "description": "Map of tables to columns that should be masked (anonymized) in results",
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "select_limit": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Max rows returned by a SELECT query"
+          },
+          "max_execution_time_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Max execution time in milliseconds allowed for a query"
+          },
+          "rate_limit_rpm": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Max requests allowed per minute"
+          },
+          "rate_limit_burst": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Max burst size for rate limiting"
+          },
+          "pool_mode": {
+            "type": "string",
+            "enum": ["transaction", "session"],
+            "description": "Connection pool mode"
+          },
+          "dialect": {
+            "type": "string",
+            "enum": ["postgres", "mysql", "mariadb"],
+            "description": "SQL dialect parser dialect to use for checking query AST"
+          },
+          "created_at": {
+            "type": "string",
+            "description": "Timestamp when the agent configuration was created"
+          }
+        },
+        "required": ["name", "key"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["agents"]
+}
