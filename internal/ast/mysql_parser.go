@@ -37,6 +37,14 @@ func (p *MySQLParser) ApplyRules(sql string, rules Rules, astCache cache.ASTCach
 		return "", nil, fmt.Errorf("tenant isolation failed: %w", err)
 	}
 
+	if rules.MaxComplexity > 0 {
+		cv := &complexityVisitor{}
+		stmt.Accept(cv)
+		if cv.score > rules.MaxComplexity {
+			return "", nil, fmt.Errorf("policy violation: query complexity %d exceeds maximum of %d", cv.score, rules.MaxComplexity)
+		}
+	}
+
 	v := &mysqlVisitor{rules: rules}
 	stmt.Accept(v)
 
@@ -119,5 +127,34 @@ func (v *mysqlVisitor) Enter(in ast.Node) (ast.Node, bool) {
 }
 
 func (v *mysqlVisitor) Leave(in ast.Node) (ast.Node, bool) {
+	return in, true
+}
+
+type complexityVisitor struct {
+	score int
+}
+
+func (v *complexityVisitor) Enter(in ast.Node) (ast.Node, bool) {
+	switch node := in.(type) {
+	case *ast.Join:
+		if node.Right != nil {
+			v.score += 5
+		}
+	case *ast.SelectStmt:
+		v.score += 2
+		if node.Where != nil {
+			v.score += 1
+		}
+		if node.OrderBy != nil {
+			v.score += 2
+		}
+		if node.GroupBy != nil {
+			v.score += 3
+		}
+	}
+	return in, false
+}
+
+func (v *complexityVisitor) Leave(in ast.Node) (ast.Node, bool) {
 	return in, true
 }

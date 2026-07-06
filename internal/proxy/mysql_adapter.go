@@ -3,10 +3,16 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
+	"crypto/sha256"
 	"crypto/tls"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"net"
+	"reflect"
+	"strings"
+	"unsafe"
 
 	"github.com/tm-threemavithana/agentiam/internal/ast"
 	"github.com/tm-threemavithana/agentiam/internal/policy"
@@ -127,16 +133,81 @@ func (a *AgentIAMAuthHandler) Authenticate(c *server.Conn, authPluginName string
 	}
 
 	if !mtlsVerified {
-		if authPluginName == "mysql_clear_password" {
-			suppliedPassword = string(bytes.TrimRight(clientAuthData, "\x00"))
-		} else if authPluginName == "mysql_native_password" {
-			if clientID == "root" && len(clientAuthData) == 0 {
-				suppliedPassword = ""
-			} else {
-				return fmt.Errorf("authentication plugin %s not supported without mTLS (use mysql_clear_password for password auth)", authPluginName)
+		var isNativeAuth bool
+		// Attempt challenge-response verification if key matches format
+		if authPluginName == "mysql_native_password" || authPluginName == "caching_sha2_password" {
+			key, keyErr := a.store.GetAgentKey(clientID)
+			if keyErr == nil {
+				var salt []byte
+				v := reflect.ValueOf(c).Elem()
+				saltField := v.FieldByName("salt")
+				if saltField.IsValid() {
+					ptr := unsafe.Pointer(saltField.UnsafeAddr())
+					salt = *(*[]byte)(ptr)
+				}
+
+				if authPluginName == "mysql_native_password" && strings.HasPrefix(key, "mysql_native_password$") {
+					hexHash := strings.TrimPrefix(key, "mysql_native_password$")
+					doubleSHA1, decodeErr := hex.DecodeString(hexHash)
+					if decodeErr == nil && len(salt) >= 20 && len(clientAuthData) >= 20 {
+						h := sha1.New()
+						h.Write(salt[:20])
+						h.Write(doubleSHA1)
+						saltHash := h.Sum(nil)
+
+						sha1Password := make([]byte, 20)
+						for i := 0; i < 20; i++ {
+							sha1Password[i] = clientAuthData[i] ^ saltHash[i]
+						}
+
+						h2 := sha1.New()
+						h2.Write(sha1Password)
+						calculatedDoubleSHA1 := h2.Sum(nil)
+
+						if bytes.Equal(calculatedDoubleSHA1, doubleSHA1) {
+							isNativeAuth = true
+							suppliedPassword = "mTLS_VERIFIED"
+						}
+					}
+				} else if authPluginName == "caching_sha2_password" && strings.HasPrefix(key, "caching_sha2_password$") {
+					hexHash := strings.TrimPrefix(key, "caching_sha2_password$")
+					doubleSHA256, decodeErr := hex.DecodeString(hexHash)
+					if decodeErr == nil && len(salt) >= 20 && len(clientAuthData) >= 32 {
+						h := sha256.New()
+						h.Write(doubleSHA256)
+						h.Write(salt[:20])
+						saltHash := h.Sum(nil)
+
+						sha256Password := make([]byte, 32)
+						for i := 0; i < 32; i++ {
+							sha256Password[i] = clientAuthData[i] ^ saltHash[i]
+						}
+
+						h2 := sha256.New()
+						h2.Write(sha256Password)
+						calculatedDoubleSHA256 := h2.Sum(nil)
+
+						if bytes.Equal(calculatedDoubleSHA256, doubleSHA256) {
+							isNativeAuth = true
+							suppliedPassword = "mTLS_VERIFIED"
+						}
+					}
+				}
 			}
-		} else {
-			return fmt.Errorf("authentication plugin %s not supported", authPluginName)
+		}
+
+		if !isNativeAuth {
+			if authPluginName == "mysql_clear_password" {
+				suppliedPassword = string(bytes.TrimRight(clientAuthData, "\x00"))
+			} else if authPluginName == "mysql_native_password" {
+				if clientID == "root" && len(clientAuthData) == 0 {
+					suppliedPassword = ""
+				} else {
+					return fmt.Errorf("authentication plugin %s not supported without mTLS (use mysql_clear_password for password auth)", authPluginName)
+				}
+			} else {
+				return fmt.Errorf("authentication plugin %s not supported", authPluginName)
+			}
 		}
 	}
 

@@ -10,6 +10,7 @@ type Rules struct {
 	MaxExecutionTimeMs int      `yaml:"max_execution_time_ms"`
 	PoolMode           string   `yaml:"pool_mode"`
 	Dialect            string   `yaml:"dialect"`
+	MaxComplexity      int      `yaml:"max_complexity"`
 	TenantIsolation    *TenantIsolationRule `yaml:"tenant_isolation,omitempty"`
 }
 

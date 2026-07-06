@@ -243,8 +243,12 @@ func (s *Server) HandleGenerateCredentials(w http.ResponseWriter, r *http.Reques
 
 // DispatchAudit pushes an event to the local UI ring buffer and the remote webhook
 func (s *Server) DispatchAudit(event AuditEvent) {
+	if event.Timestamp == "" {
+		event.Timestamp = time.Now().Format(time.RFC3339)
+	}
+
 	s.uiBuffer.Add(UIAuditEvent{
-		Time:     event.Timestamp, // might be empty, UI buffer will set it
+		Time:     event.Timestamp,
 		ClientID: event.ClientID,
 		SQL:      event.SQL,
 		Status:   event.Status,
@@ -253,5 +257,13 @@ func (s *Server) DispatchAudit(event AuditEvent) {
 
 	if s.Webhook != nil {
 		s.Webhook.Dispatch(event)
+	}
+
+	for _, sink := range s.auditSinks {
+		go func(sk AuditSink) {
+			if err := sk.Write(event); err != nil {
+				s.logger.Error("Failed to write to audit sink", "error", err)
+			}
+		}(sink)
 	}
 }

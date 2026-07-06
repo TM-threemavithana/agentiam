@@ -57,6 +57,12 @@ func (p *PostgresParser) ApplyRules(sql string, rules Rules, astCache cache.ASTC
 		if err != nil {
 			return "", nil, err
 		}
+		if rules.MaxComplexity > 0 {
+			complexity := CalculatePostgresComplexity(stmt.Stmt)
+			if complexity > rules.MaxComplexity {
+				return "", nil, fmt.Errorf("policy violation: query complexity %d exceeds maximum of %d", complexity, rules.MaxComplexity)
+			}
+		}
 		if err := InjectTenantIsolation(stmt.Stmt, rules); err != nil {
 			return "", nil, fmt.Errorf("tenant isolation blocked query: %w", err)
 		}
@@ -362,4 +368,100 @@ func hasAnalyticalNodes(v interface{}) bool {
 		}
 	}
 	return false
+}
+
+func CalculatePostgresComplexity(node *pg_query.Node) int {
+	if node == nil || node.Node == nil {
+		return 0
+	}
+
+	score := 0
+
+	switch n := node.Node.(type) {
+	case *pg_query.Node_JoinExpr:
+		score += 5
+	case *pg_query.Node_SelectStmt:
+		sel := n.SelectStmt
+		if len(sel.FromClause) > 1 {
+			score += (len(sel.FromClause) - 1) * 5
+		}
+		if sel.WhereClause != nil {
+			score += 1
+		}
+		if len(sel.SortClause) > 0 {
+			score += 2
+		}
+		if len(sel.GroupClause) > 0 {
+			score += 3
+		}
+	case *pg_query.Node_FuncCall:
+		fc := n.FuncCall
+		if fc.Over != nil {
+			score += 4
+		}
+	}
+
+	val := reflect.ValueOf(node.Node)
+	if val.Kind() == reflect.Ptr && !val.IsNil() {
+		val = val.Elem()
+	}
+	if val.Kind() == reflect.Struct {
+		for i := 0; i < val.NumField(); i++ {
+			field := val.Field(i)
+			if !field.CanInterface() {
+				continue
+			}
+			if field.Kind() == reflect.Ptr && !field.IsNil() {
+				if childNode, ok := field.Interface().(*pg_query.Node); ok {
+					score += CalculatePostgresComplexity(childNode)
+				} else {
+					score += calculateGenericReflectComplexity(field.Interface())
+				}
+			} else {
+				score += calculateGenericReflectComplexity(field.Interface())
+			}
+		}
+	}
+
+	return score
+}
+
+func calculateGenericReflectComplexity(valInterface interface{}) int {
+	if valInterface == nil {
+		return 0
+	}
+	val := reflect.ValueOf(valInterface)
+	if val.Kind() == reflect.Ptr || val.Kind() == reflect.Interface {
+		if val.IsNil() {
+			return 0
+		}
+		return calculateGenericReflectComplexity(val.Elem().Interface())
+	}
+
+	score := 0
+	if val.Kind() == reflect.Struct {
+		for i := 0; i < val.NumField(); i++ {
+			field := val.Field(i)
+			if !field.CanInterface() {
+				continue
+			}
+			if field.Kind() == reflect.Ptr && !field.IsNil() {
+				if childNode, ok := field.Interface().(*pg_query.Node); ok {
+					score += CalculatePostgresComplexity(childNode)
+				}
+			}
+			score += calculateGenericReflectComplexity(field.Interface())
+		}
+	} else if val.Kind() == reflect.Slice {
+		for i := 0; i < val.Len(); i++ {
+			elem := val.Index(i)
+			if elem.Kind() == reflect.Ptr && !elem.IsNil() {
+				if childNode, ok := elem.Interface().(*pg_query.Node); ok {
+					score += CalculatePostgresComplexity(childNode)
+				}
+			}
+			score += calculateGenericReflectComplexity(elem.Interface())
+		}
+	}
+	return score
 }

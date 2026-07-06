@@ -35,6 +35,7 @@ type AgentConfig struct {
 	MaskedColumns      map[string][]string `yaml:"masked_columns" json:"masked_columns"`
 	SelectLimit        int                 `yaml:"select_limit" json:"select_limit"`
 	MaxExecutionTimeMs int      `yaml:"max_execution_time_ms" json:"max_execution_time_ms"`
+	MaxComplexity      int      `yaml:"max_complexity" json:"max_complexity"`
 	RateLimitRPM       int      `yaml:"rate_limit_rpm" json:"rate_limit_rpm"`
 	RateLimitBurst     int      `yaml:"rate_limit_burst" json:"rate_limit_burst"`
 	PoolMode           string   `yaml:"pool_mode" json:"pool_mode"`
@@ -42,9 +43,17 @@ type AgentConfig struct {
 	CreatedAt          string   `yaml:"created_at" json:"created_at"`
 }
 
+type AuditSinkConfig struct {
+	Type    string `yaml:"type" json:"type"`
+	Path    string `yaml:"path" json:"path"`
+	Network string `yaml:"network" json:"network"`
+	Address string `yaml:"address" json:"address"`
+}
+
 type PoliciesYAML struct {
-	Version string        `yaml:"version" json:"version"`
-	Agents  []AgentConfig `yaml:"agents" json:"agents"`
+	Version    string            `yaml:"version" json:"version"`
+	AuditSinks []AuditSinkConfig `yaml:"audit_sinks" json:"audit_sinks"`
+	Agents     []AgentConfig     `yaml:"agents" json:"agents"`
 }
 
 type agentState struct {
@@ -58,11 +67,18 @@ type agentState struct {
 type Store struct {
 	mu         sync.RWMutex
 	agents     map[string]agentState
+	auditSinks []AuditSinkConfig
 	dummyHash  []byte
 	filePath   string
 	apiUrl     string
 	logger     *slog.Logger
 	httpClient *http.Client
+}
+
+func (s *Store) GetAuditSinks() []AuditSinkConfig {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.auditSinks
 }
 
 func NewStore(filePath string, apiUrl string, logger *slog.Logger) (*Store, error) {
@@ -171,6 +187,7 @@ func (s *Store) loadPolicies() error {
 	}
 
 	s.agents = newAgents
+	s.auditSinks = py.AuditSinks
 	s.logger.Info("Loaded policies", "count", len(s.agents), "source", s.apiUrl)
 	return nil
 }
@@ -260,6 +277,7 @@ func (s *Store) GetRulesForAgent(clientID string, suppliedPassword string) (ast.
 			MaxExecutionTimeMs: state.config.MaxExecutionTimeMs,
 			PoolMode:           state.config.PoolMode,
 			Dialect:            state.config.Dialect,
+			MaxComplexity:      state.config.MaxComplexity,
 		}
 		if rules.EnforceSelectLimit <= 0 {
 			rules.EnforceSelectLimit = 100
@@ -279,6 +297,7 @@ func (s *Store) GetRulesForAgent(clientID string, suppliedPassword string) (ast.
 			MaxExecutionTimeMs: state.config.MaxExecutionTimeMs,
 			PoolMode:           state.config.PoolMode,
 			Dialect:            state.config.Dialect,
+			MaxComplexity:      state.config.MaxComplexity,
 		}
 		if rules.EnforceSelectLimit <= 0 {
 			rules.EnforceSelectLimit = 100
@@ -322,6 +341,7 @@ func (s *Store) GetRulesForAgent(clientID string, suppliedPassword string) (ast.
 				MaxExecutionTimeMs: state.config.MaxExecutionTimeMs,
 				PoolMode:           state.config.PoolMode,
 				Dialect:            state.config.Dialect,
+				MaxComplexity:      state.config.MaxComplexity,
 			}
 			if rules.EnforceSelectLimit <= 0 {
 				rules.EnforceSelectLimit = 100

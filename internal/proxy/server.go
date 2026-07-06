@@ -50,12 +50,38 @@ type Server struct {
 	uiBuffer       *UIRingBuffer
 	latencyBuffer  *UILatencyRingBuffer
 	uiFS           http.FileSystem
+	auditSinks     []AuditSink
 }
 
 // NewServer initializes a new Server instance.
 // It requires a pre-configured policy.Store, logger, AST cache, and a map of ProtocolHandlers.
 func NewServer(listenAddr, upstreamDSN string, store *policy.Store, tlsConfig *tls.Config, logger *Logger, astCache cache.ASTCache, handlers map[ProtocolType]ProtocolHandler, insecureAuth bool, metricsAddr string, poolSize int, webhook *WebhookDispatcher, uiFS http.FileSystem) *Server {
 	maxConns := 10000
+
+	var auditSinks []AuditSink
+	if store != nil {
+		for _, cfg := range store.GetAuditSinks() {
+			switch cfg.Type {
+			case "file":
+				sink, err := NewFileAuditSink(cfg.Path)
+				if err != nil {
+					logger.Error("Failed to initialize File Audit Sink", "error", err, "path", cfg.Path)
+				} else {
+					auditSinks = append(auditSinks, sink)
+					logger.Info("Registered File Audit Sink", "path", cfg.Path)
+				}
+			case "network":
+				sink, err := NewNetworkAuditSink(cfg.Network, cfg.Address)
+				if err != nil {
+					logger.Error("Failed to initialize Network Audit Sink", "error", err, "address", cfg.Address)
+				} else {
+					auditSinks = append(auditSinks, sink)
+					logger.Info("Registered Network Audit Sink", "network", cfg.Network, "address", cfg.Address)
+				}
+			}
+		}
+	}
+
 	return &Server{
 		listenAddr:     listenAddr,
 		upstreamDSN:    upstreamDSN,
@@ -75,6 +101,7 @@ func NewServer(listenAddr, upstreamDSN string, store *policy.Store, tlsConfig *t
 		uiBuffer:       NewUIRingBuffer(100),
 		latencyBuffer:  NewUILatencyRingBuffer(60), // 60 seconds of history
 		uiFS:           uiFS,
+		auditSinks:     auditSinks,
 	}
 }
 
