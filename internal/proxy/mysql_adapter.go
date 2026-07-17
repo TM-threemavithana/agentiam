@@ -3,16 +3,9 @@ package proxy
 import (
 	"bytes"
 	"context"
-	"crypto/sha1"
-	"crypto/sha256"
 	"crypto/tls"
-	"database/sql"
-	"encoding/hex"
 	"fmt"
 	"net"
-	"reflect"
-	"strings"
-	"unsafe"
 
 	"github.com/tm-threemavithana/agentiam/internal/ast"
 	"github.com/tm-threemavithana/agentiam/internal/policy"
@@ -27,7 +20,7 @@ type MySQLProtocolHandler struct {
 	store        *policy.Store
 	logger       *Logger
 	upstreamDSN  string
-	db           *sql.DB
+	pool         *MySQLPool
 	server       *Server
 	insecureAuth bool
 }
@@ -39,12 +32,11 @@ func NewMySQLProtocolHandler(store *policy.Store, logger *Logger, server *Server
 
 // InitPool initializes the upstream *sql.DB connection pool.
 func (h *MySQLProtocolHandler) InitPool() error {
-	db, err := sql.Open("mysql", h.upstreamDSN)
-	if err != nil {
+	p := NewMySQLPool("127.0.0.1:3306", "root", "", "", 50, h.logger)
+	if err := p.Init(context.Background()); err != nil {
 		return err
 	}
-	db.SetMaxOpenConns(50)
-	h.db = db
+	h.pool = p
 	return nil
 }
 
@@ -54,7 +46,7 @@ func (h *MySQLProtocolHandler) HandleSession(ctx context.Context, clientConn net
 	h.logger.Info("MySQL connection accepted", "remote_addr", clientConn.RemoteAddr().String())
 
 	proxyHandler := &AgentIAMMySQLHandler{
-		db:     h.db,
+		pool:   h.pool,
 		logger: h.logger,
 		server: h.server,
 	}
@@ -70,10 +62,10 @@ func (h *MySQLProtocolHandler) HandleSession(ctx context.Context, clientConn net
 	if h.server != nil && h.server.tlsConfig != nil {
 		tlsCfg = h.server.tlsConfig
 	}
-	serverConf := server.NewServer("8.0.11", 255, "mysql_native_password", nil, tlsCfg)
+	serverConf := server.NewServer("8.0.11", 255, "mysql_clear_password", nil, tlsCfg)
 
 	// Initialize the MySQL Proxy handler
-	if h.db == nil {
+	if h.pool == nil {
 		_ = h.InitPool()
 	}
 
@@ -133,81 +125,16 @@ func (a *AgentIAMAuthHandler) Authenticate(c *server.Conn, authPluginName string
 	}
 
 	if !mtlsVerified {
-		var isNativeAuth bool
-		// Attempt challenge-response verification if key matches format
-		if authPluginName == "mysql_native_password" || authPluginName == "caching_sha2_password" {
-			key, keyErr := a.store.GetAgentKey(clientID)
-			if keyErr == nil {
-				var salt []byte
-				v := reflect.ValueOf(c).Elem()
-				saltField := v.FieldByName("salt")
-				if saltField.IsValid() {
-					ptr := unsafe.Pointer(saltField.UnsafeAddr())
-					salt = *(*[]byte)(ptr)
-				}
-
-				if authPluginName == "mysql_native_password" && strings.HasPrefix(key, "mysql_native_password$") {
-					hexHash := strings.TrimPrefix(key, "mysql_native_password$")
-					doubleSHA1, decodeErr := hex.DecodeString(hexHash)
-					if decodeErr == nil && len(salt) >= 20 && len(clientAuthData) >= 20 {
-						h := sha1.New()
-						h.Write(salt[:20])
-						h.Write(doubleSHA1)
-						saltHash := h.Sum(nil)
-
-						sha1Password := make([]byte, 20)
-						for i := 0; i < 20; i++ {
-							sha1Password[i] = clientAuthData[i] ^ saltHash[i]
-						}
-
-						h2 := sha1.New()
-						h2.Write(sha1Password)
-						calculatedDoubleSHA1 := h2.Sum(nil)
-
-						if bytes.Equal(calculatedDoubleSHA1, doubleSHA1) {
-							isNativeAuth = true
-							suppliedPassword = "mTLS_VERIFIED"
-						}
-					}
-				} else if authPluginName == "caching_sha2_password" && strings.HasPrefix(key, "caching_sha2_password$") {
-					hexHash := strings.TrimPrefix(key, "caching_sha2_password$")
-					doubleSHA256, decodeErr := hex.DecodeString(hexHash)
-					if decodeErr == nil && len(salt) >= 20 && len(clientAuthData) >= 32 {
-						h := sha256.New()
-						h.Write(doubleSHA256)
-						h.Write(salt[:20])
-						saltHash := h.Sum(nil)
-
-						sha256Password := make([]byte, 32)
-						for i := 0; i < 32; i++ {
-							sha256Password[i] = clientAuthData[i] ^ saltHash[i]
-						}
-
-						h2 := sha256.New()
-						h2.Write(sha256Password)
-						calculatedDoubleSHA256 := h2.Sum(nil)
-
-						if bytes.Equal(calculatedDoubleSHA256, doubleSHA256) {
-							isNativeAuth = true
-							suppliedPassword = "mTLS_VERIFIED"
-						}
-					}
-				}
-			}
-		}
-
-		if !isNativeAuth {
-			if authPluginName == "mysql_clear_password" {
-				suppliedPassword = string(bytes.TrimRight(clientAuthData, "\x00"))
-			} else if authPluginName == "mysql_native_password" {
-				if clientID == "root" && len(clientAuthData) == 0 {
-					suppliedPassword = ""
-				} else {
-					return fmt.Errorf("authentication plugin %s not supported without mTLS (use mysql_clear_password for password auth)", authPluginName)
-				}
+		if authPluginName == "mysql_clear_password" {
+			suppliedPassword = string(bytes.TrimRight(clientAuthData, "\x00"))
+		} else if authPluginName == "mysql_native_password" {
+			if clientID == "root" && len(clientAuthData) == 0 {
+				suppliedPassword = ""
 			} else {
-				return fmt.Errorf("authentication plugin %s not supported", authPluginName)
+				return fmt.Errorf("authentication plugin %s not supported without mTLS (use mysql_clear_password for password auth)", authPluginName)
 			}
+		} else {
+			return fmt.Errorf("authentication plugin %s not supported", authPluginName)
 		}
 	}
 
@@ -261,7 +188,7 @@ func (a *AgentIAMAuthHandler) OnAuthFailure(conn *server.Conn, err error) {
 //     Reference: https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_query_response_text_resultset.html
 type AgentIAMMySQLHandler struct {
 	server.EmptyHandler
-	db       *sql.DB
+	pool     *MySQLPool
 	logger   *Logger
 	server   *Server
 	clientID string
@@ -316,45 +243,17 @@ func (h *AgentIAMMySQLHandler) HandleQuery(query string) (*mysql.Result, error) 
 		rewritten = query
 	}
 
-	// Execute on upstream
-	rows, err := h.db.Query(rewritten)
+	// Execute on upstream using custom pool
+	conn, err := h.pool.Acquire(context.Background())
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer h.pool.Release(conn)
 
-	cols, _ := rows.Columns()
-	var values [][]interface{}
-
-	for rows.Next() {
-		columns := make([]interface{}, len(cols))
-		columnPointers := make([]interface{}, len(cols))
-		for i := range columns {
-			columnPointers[i] = &columns[i]
-		}
-
-		if err := rows.Scan(columnPointers...); err != nil {
-			return nil, err
-		}
-
-		rowValues := make([]interface{}, len(cols))
-		for i, val := range columns {
-			b, ok := val.([]byte)
-			if ok {
-				rowValues[i] = string(b)
-			} else {
-				rowValues[i] = val
-			}
-		}
-		values = append(values, rowValues)
-	}
-
-	// Construct the Text Resultset response stream.
-	// This generates the Column Definition block, encodes the strings, and handles the trailing OK/EOF.
-	resultset, err := mysql.BuildSimpleTextResultset(cols, values)
+	res, err := conn.Conn.Execute(rewritten)
 	if err != nil {
 		return nil, err
 	}
 
-	return mysql.NewResult(resultset), nil
+	return res, nil
 }

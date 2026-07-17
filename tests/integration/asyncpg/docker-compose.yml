@@ -25,6 +25,8 @@ services:
       - AGENTIAM_UPSTREAM_DSN=postgres://postgres:postgres@postgres:5432/agentiam?sslmode=disable
       - AGENTIAM_POLICY_FILE=/etc/agentiam/policies.yaml
       - AGENTIAM_POLL_INTERVAL=5s
+      - AGENTIAM_DEV_MODE=true
+      - AGENTIAM_ADMIN_TOKEN=test-token
     ports:
       - "15432:5432"
     volumes:

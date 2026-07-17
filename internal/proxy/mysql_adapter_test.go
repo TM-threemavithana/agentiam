@@ -26,7 +26,7 @@ func TestMySQLHandler_HandleQuery_RulesEnforced(t *testing.T) {
 	})
 
 	handler := &AgentIAMMySQLHandler{
-		db:       nil, // we won't query unless rules pass
+		pool:     nil, // we won't query unless rules pass
 		logger:   NewLogger(io.Discard),
 		server:   srv,
 		clientID: "test-agent",

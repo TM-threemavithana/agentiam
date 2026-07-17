@@ -1,6 +1,9 @@
 package controlplane
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"io"
 	"log/slog"
@@ -13,16 +16,18 @@ import (
 type Server struct {
 	addr     string
 	logger   *slog.Logger
+	token    string
 	listener net.Listener
 	mu       sync.Mutex
 	clients  map[net.Conn]struct{}
 	stopCh   chan struct{}
 }
 
-func NewServer(addr string, logger *slog.Logger) *Server {
+func NewServer(addr string, logger *slog.Logger, token string) *Server {
 	return &Server{
 		addr:    addr,
 		logger:  logger,
+		token:   token,
 		clients: make(map[net.Conn]struct{}),
 		stopCh:  make(chan struct{}),
 	}
@@ -48,8 +53,14 @@ func (s *Server) Start() error {
 					continue
 				}
 			}
-			s.registerClient(conn)
-			go s.handleClient(conn)
+			go func(c net.Conn) {
+				if s.authenticateClient(c) {
+					s.registerClient(c)
+					s.handleClient(c)
+				} else {
+					c.Close()
+				}
+			}(conn)
 		}
 	}()
 	return nil
@@ -68,6 +79,28 @@ func (s *Server) unregisterClient(conn net.Conn) {
 	delete(s.clients, conn)
 	conn.Close()
 	s.logger.Info("Control Plane Client disconnected", "remote", conn.RemoteAddr().String())
+}
+
+func (s *Server) authenticateClient(conn net.Conn) bool {
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	nonce := make([]byte, 32)
+	if _, err := io.ReadFull(conn, nonce); err != nil {
+		s.logger.Error("Control Plane Server failed to read nonce", "error", err)
+		return false
+	}
+
+	h := hmac.New(sha256.New, []byte(s.token))
+	h.Write(nonce)
+	expectedMAC := h.Sum(nil)
+
+	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if _, err := conn.Write(expectedMAC); err != nil {
+		s.logger.Error("Control Plane Server failed to write MAC", "error", err)
+		return false
+	}
+
+	conn.SetDeadline(time.Time{})
+	return true
 }
 
 func (s *Server) handleClient(conn net.Conn) {
@@ -128,14 +161,16 @@ func (s *Server) Close() {
 type Client struct {
 	addr     string
 	logger   *slog.Logger
+	token    string
 	onUpdate func([]byte)
 	stopCh   chan struct{}
 }
 
-func NewClient(addr string, logger *slog.Logger, onUpdate func([]byte)) *Client {
+func NewClient(addr string, logger *slog.Logger, token string, onUpdate func([]byte)) *Client {
 	return &Client{
 		addr:     addr,
 		logger:   logger,
+		token:    token,
 		onUpdate: onUpdate,
 		stopCh:   make(chan struct{}),
 	}
@@ -157,7 +192,39 @@ func (c *Client) Start() {
 				continue
 			}
 
-			c.logger.Info("Control Plane Client connected to server", "addr", c.addr)
+			// Handshake
+			conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			nonce := make([]byte, 32)
+			rand.Read(nonce)
+			if _, err := conn.Write(nonce); err != nil {
+				c.logger.Error("Control Plane Client failed to write nonce", "error", err)
+				conn.Close()
+				time.Sleep(2 * time.Second)
+				continue
+			}
+
+			mac := make([]byte, 32)
+			conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			if _, err := io.ReadFull(conn, mac); err != nil {
+				c.logger.Error("Control Plane Client failed to read MAC", "error", err)
+				conn.Close()
+				time.Sleep(2 * time.Second)
+				continue
+			}
+
+			h := hmac.New(sha256.New, []byte(c.token))
+			h.Write(nonce)
+			expectedMAC := h.Sum(nil)
+			if !hmac.Equal(mac, expectedMAC) {
+				c.logger.Error("Control Plane Client authentication failed (bad MAC)")
+				conn.Close()
+				time.Sleep(2 * time.Second)
+				continue
+			}
+
+			conn.SetDeadline(time.Time{})
+
+			c.logger.Info("Control Plane Client connected and authenticated to server", "addr", c.addr)
 			err = c.readStream(conn)
 			if err != nil {
 				c.logger.Error("Control Plane Client stream error", "error", err)

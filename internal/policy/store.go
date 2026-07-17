@@ -508,7 +508,8 @@ func (s *Store) ConnectControlPlane(addr string) {
 		return
 	}
 	s.logger.Info("Starting Control Plane client integration", "addr", addr)
-	client := controlplane.NewClient(addr, s.logger, func(payload []byte) {
+	token := os.Getenv("AGENTIAM_ADMIN_TOKEN")
+	client := controlplane.NewClient(addr, s.logger, token, func(payload []byte) {
 		s.logger.Info("Control plane push received, updating policies")
 		var py PoliciesYAML
 		// Try parsing as JSON first, then fallback to YAML if needed

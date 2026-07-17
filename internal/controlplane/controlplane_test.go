@@ -12,7 +12,7 @@ func TestControlPlaneStreaming(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	// Start server on a dynamic port
-	server := NewServer("127.0.0.1:0", logger)
+	server := NewServer("127.0.0.1:0", logger, "test-token")
 	err := server.Start()
 	if err != nil {
 		t.Fatalf("failed to start server: %v", err)
@@ -26,7 +26,7 @@ func TestControlPlaneStreaming(t *testing.T) {
 	wg.Add(1)
 
 	var receivedData []byte
-	client := NewClient(addr, logger, func(payload []byte) {
+	client := NewClient(addr, logger, "test-token", func(payload []byte) {
 		receivedData = payload
 		wg.Done()
 	})
