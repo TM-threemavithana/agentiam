@@ -4,10 +4,13 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -176,6 +179,28 @@ func (s *Server) RecordLatency(ms float64) {
 func (s *Server) HandleGenerateCredentials(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// S2: Require admin token authentication.
+	// Set AGENTIAM_ADMIN_TOKEN in the environment to secure this endpoint.
+	adminToken := os.Getenv("AGENTIAM_ADMIN_TOKEN")
+	if adminToken == "" {
+		http.Error(w, "credential generation is disabled: AGENTIAM_ADMIN_TOKEN is not set", http.StatusServiceUnavailable)
+		return
+	}
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
+		s.logger.Warn("Unauthenticated credential generation attempt", "remote", r.RemoteAddr)
+		AuthFailuresTotal.Inc()
+		http.Error(w, "unauthorized: Bearer token required", http.StatusUnauthorized)
+		return
+	}
+	supplied := strings.TrimPrefix(authHeader, "Bearer ")
+	if subtle.ConstantTimeCompare([]byte(supplied), []byte(adminToken)) != 1 {
+		s.logger.Warn("Invalid admin token in credential generation attempt", "remote", r.RemoteAddr)
+		AuthFailuresTotal.Inc()
+		http.Error(w, "unauthorized: invalid token", http.StatusUnauthorized)
 		return
 	}
 

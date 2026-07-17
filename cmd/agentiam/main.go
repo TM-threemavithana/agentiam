@@ -8,8 +8,11 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
 	"flag"
 	"golang.org/x/crypto/bcrypt"
@@ -67,7 +70,7 @@ func main() {
 		log.Fatalf("Failed to initialize policy store: %v", err)
 	}
 
-	// Start the hot-reload watcher (Redis Pub/Sub or fsnotify)
+	// Start the hot-reload watcher (fsnotify + HTTP polling + TCP control plane)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go store.Watch(ctx)
@@ -87,7 +90,9 @@ func main() {
 
 	metricsAddr := os.Getenv("AGENTIAM_METRICS_ADDR")
 	if metricsAddr == "" {
-		metricsAddr = ":9090"
+		// S6: Bind metrics/dashboard to localhost by default.
+		// Set AGENTIAM_METRICS_ADDR=":9090" to expose on all interfaces (e.g., behind a VPN).
+		metricsAddr = "127.0.0.1:9090"
 	}
 
 	poolSize := 50
@@ -142,6 +147,27 @@ func main() {
 	}
 
 	logger.Info("AgentIAM starting with Unified Port Multiplexer...", "port", listenPort)
+
+	// O2: Graceful shutdown — catch SIGTERM/SIGINT, stop accepting new connections,
+	// wait up to 30 seconds for in-flight sessions to complete.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		sig := <-sigCh
+		logger.Info("Shutdown signal received, stopping...", "signal", sig)
+		cancel() // Stop hot-reload watchers and session contexts
+
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer shutdownCancel()
+
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			logger.Error("Graceful shutdown timed out", "error", err)
+			os.Exit(1)
+		}
+		logger.Info("AgentIAM shutdown complete")
+		os.Exit(0)
+	}()
+
 	if err := srv.Start(); err != nil {
 		logger.Error("Proxy server failed", "error", err)
 		os.Exit(1)

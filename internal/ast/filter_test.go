@@ -326,3 +326,86 @@ func TestApplyRules_CacheAndErrors(t *testing.T) {
 		t.Errorf("expected cached result to have limit: %v", result)
 	}
 }
+
+// TestSelectBypassFix verifies that SELECT is blocked when not in AllowedStatements.
+// This was the critical security bug fixed in this release.
+func TestSelectBypassFix(t *testing.T) {
+	parser := &PostgresParser{}
+	c, _ := cache.NewLocalCache(10)
+
+	t.Run("SELECT blocked when not allowed", func(t *testing.T) {
+		rules := Rules{
+			AllowedStatements:  []string{"INSERT"},
+			EnforceSelectLimit: 100,
+		}
+		_, _, err := parser.ApplyRules("SELECT * FROM users", rules, c)
+		if err == nil {
+			t.Error("expected SELECT to be blocked when AllowedStatements=[INSERT], got nil error")
+		}
+	})
+
+	t.Run("SELECT allowed when in allowed list", func(t *testing.T) {
+		rules := Rules{
+			AllowedStatements:  []string{"SELECT"},
+			EnforceSelectLimit: 100,
+		}
+		_, _, err := parser.ApplyRules("SELECT id FROM users", rules, c)
+		if err != nil {
+			t.Errorf("expected SELECT to pass, got: %v", err)
+		}
+	})
+}
+
+// TestAllowedTablesPostgres verifies that AllowedTables is now enforced for the Postgres parser.
+func TestAllowedTablesPostgres(t *testing.T) {
+	parser := &PostgresParser{}
+	c, _ := cache.NewLocalCache(10)
+
+	t.Run("allowed table passes", func(t *testing.T) {
+		rules := Rules{
+			AllowedStatements:  []string{"SELECT"},
+			AllowedTables:      []string{"users"},
+			EnforceSelectLimit: 100,
+		}
+		_, _, err := parser.ApplyRules("SELECT id FROM users", rules, c)
+		if err != nil {
+			t.Errorf("expected allowed table to pass, got: %v", err)
+		}
+	})
+
+	t.Run("blocked table denied", func(t *testing.T) {
+		rules := Rules{
+			AllowedStatements:  []string{"SELECT"},
+			AllowedTables:      []string{"users"},
+			EnforceSelectLimit: 100,
+		}
+		_, _, err := parser.ApplyRules("SELECT secret FROM passwords", rules, c)
+		if err == nil {
+			t.Error("expected access to 'passwords' to be denied, got nil error")
+		}
+	})
+
+	t.Run("wildcard allows all tables", func(t *testing.T) {
+		rules := Rules{
+			AllowedStatements:  []string{"SELECT"},
+			AllowedTables:      []string{"*"},
+			EnforceSelectLimit: 100,
+		}
+		_, _, err := parser.ApplyRules("SELECT col FROM any_table", rules, c)
+		if err != nil {
+			t.Errorf("expected wildcard to allow any table, got: %v", err)
+		}
+	})
+
+	t.Run("empty allowed_tables allows all (no restriction)", func(t *testing.T) {
+		rules := Rules{
+			AllowedStatements:  []string{"SELECT"},
+			AllowedTables:      []string{},
+			EnforceSelectLimit: 100,
+		}
+		_, _, err := parser.ApplyRules("SELECT col FROM any_table", rules, c)
+		if err != nil {
+			t.Errorf("expected empty allowed_tables to allow any table, got: %v", err)
+		}
+	})
+}

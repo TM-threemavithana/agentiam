@@ -63,6 +63,15 @@ func (p *PostgresParser) ApplyRules(sql string, rules Rules, astCache cache.ASTC
 				return "", nil, fmt.Errorf("policy violation: query complexity %d exceeds maximum of %d", complexity, rules.MaxComplexity)
 			}
 		}
+		// Enforce table-level access control for Postgres
+		if len(rules.AllowedTables) > 0 && !isAllowed("*", rules.AllowedTables) {
+			tables := extractPostgresTables(stmt.Stmt)
+			for _, tbl := range tables {
+				if !isAllowed(tbl, rules.AllowedTables) {
+					return "", nil, fmt.Errorf("access to table '%s' is not allowed by policy", tbl)
+				}
+			}
+		}
 		if err := InjectTenantIsolation(stmt.Stmt, rules); err != nil {
 			return "", nil, fmt.Errorf("tenant isolation blocked query: %w", err)
 		}
@@ -86,6 +95,78 @@ func (p *PostgresParser) ApplyRules(sql string, rules Rules, astCache cache.ASTC
 	return deparsed, limitParams, nil
 }
 
+// extractPostgresTables walks an AST node and collects all referenced table names (RangeVar).
+func extractPostgresTables(node *pg_query.Node) []string {
+	if node == nil {
+		return nil
+	}
+	var tables []string
+	collectTables(node.Node, &tables)
+	return tables
+}
+
+func collectTables(v interface{}, tables *[]string) {
+	if v == nil {
+		return
+	}
+	val := reflect.ValueOf(v)
+	if !val.IsValid() {
+		return
+	}
+	if val.Kind() == reflect.Ptr || val.Kind() == reflect.Interface {
+		if val.IsNil() {
+			return
+		}
+		collectTables(val.Elem().Interface(), tables)
+		return
+	}
+	// Direct RangeVar match
+	if rv, ok := v.(*pg_query.Node_RangeVar); ok {
+		if rv.RangeVar != nil && rv.RangeVar.Relname != "" {
+			*tables = append(*tables, rv.RangeVar.Relname)
+		}
+		return
+	}
+	if val.Kind() == reflect.Struct {
+		for i := 0; i < val.NumField(); i++ {
+			field := val.Field(i)
+			if !field.CanInterface() {
+				continue
+			}
+			if field.Kind() == reflect.Ptr && !field.IsNil() {
+				if n, ok := field.Interface().(*pg_query.Node); ok {
+					if rv, ok2 := n.Node.(*pg_query.Node_RangeVar); ok2 {
+						if rv.RangeVar != nil && rv.RangeVar.Relname != "" {
+							*tables = append(*tables, rv.RangeVar.Relname)
+						}
+					}
+					collectTables(n.Node, tables)
+					continue
+				}
+			}
+			collectTables(field.Interface(), tables)
+		}
+	} else if val.Kind() == reflect.Slice {
+		for i := 0; i < val.Len(); i++ {
+			elem := val.Index(i)
+			if elem.Kind() == reflect.Ptr && !elem.IsNil() {
+				if n, ok := elem.Interface().(*pg_query.Node); ok {
+					if rv, ok2 := n.Node.(*pg_query.Node_RangeVar); ok2 {
+						if rv.RangeVar != nil && rv.RangeVar.Relname != "" {
+							*tables = append(*tables, rv.RangeVar.Relname)
+						}
+					}
+					collectTables(n.Node, tables)
+					continue
+				}
+			}
+			collectTables(elem.Interface(), tables)
+		}
+	}
+}
+
+
+
 func enforceRules(node *pg_query.Node, rules Rules, depth int, limitParams *[]int) error {
 	if depth > 50 {
 		return ErrComplexityExceeded
@@ -100,6 +181,9 @@ func enforceRules(node *pg_query.Node, rules Rules, depth int, limitParams *[]in
 	// We check this via the switch, and a fallback check for '*Stmt' suffix.
 	switch n := node.Node.(type) {
 	case *pg_query.Node_SelectStmt:
+		if !isAllowed("SELECT", rules.AllowedStatements) {
+			return fmt.Errorf("SELECT statements are not allowed by policy")
+		}
 		sel := n.SelectStmt
 		if len(sel.LockingClause) > 0 {
 			return fmt.Errorf("SELECT ... FOR UPDATE/SHARE is not allowed by policy")

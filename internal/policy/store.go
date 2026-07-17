@@ -107,10 +107,79 @@ func NewStore(filePath string, apiUrl string, logger *slog.Logger) (*Store, erro
 	return s, nil
 }
 
+// agentConfigToRules converts an AgentConfig into an ast.Rules struct with safe defaults applied.
+// This is the single source of truth for the config → rules mapping.
+func agentConfigToRules(config AgentConfig) ast.Rules {
+	rules := ast.Rules{
+		AllowedStatements:  config.AllowedStatements,
+		AllowedTables:      config.AllowedTables,
+		BlockedFunctions:   config.BlockedFunctions,
+		MaskedColumns:      config.MaskedColumns,
+		EnforceSelectLimit: config.SelectLimit,
+		MaxExecutionTimeMs: config.MaxExecutionTimeMs,
+		PoolMode:           config.PoolMode,
+		Dialect:            config.Dialect,
+		MaxComplexity:      config.MaxComplexity,
+	}
+	if rules.EnforceSelectLimit <= 0 {
+		rules.EnforceSelectLimit = 100
+	}
+	if rules.MaxExecutionTimeMs <= 0 {
+		rules.MaxExecutionTimeMs = 5000
+	}
+	return rules
+}
+
+// mergeAgentStates merges a new list of AgentConfigs with the existing agent state map,
+// preserving cached password hashes and rate limiters where the key has not changed.
+// This is the single source of truth for state diffing — called by both loadPolicies
+// and the control plane push handler.
+func mergeAgentStates(incoming []AgentConfig, existing map[string]agentState) map[string]agentState {
+	newAgents := make(map[string]agentState, len(incoming))
+	for _, a := range incoming {
+		oldState, exists := existing[a.Name]
+
+		version := 1
+		hasCache := false
+		var cachedPwdHash [32]byte
+
+		if exists {
+			version = oldState.version
+			if oldState.config.Key != a.Key {
+				version++ // Key changed — bump version to invalidate active sessions
+			} else {
+				hasCache = oldState.hasCache
+				cachedPwdHash = oldState.cachedPwdHash
+			}
+		}
+
+		// Re-use the existing limiter if rate-limit config is unchanged (avoids losing token state)
+		var limiter *rate.Limiter
+		if exists && oldState.config.RateLimitRPM == a.RateLimitRPM && oldState.config.RateLimitBurst == a.RateLimitBurst {
+			limiter = oldState.limiter
+		} else if a.RateLimitRPM > 0 {
+			burst := a.RateLimitBurst
+			if burst <= 0 {
+				burst = 1
+			}
+			limiter = rate.NewLimiter(rate.Limit(float64(a.RateLimitRPM)/60.0), burst)
+		}
+
+		newAgents[a.Name] = agentState{
+			config:        a,
+			version:       version,
+			hasCache:      hasCache,
+			cachedPwdHash: cachedPwdHash,
+			limiter:       limiter,
+		}
+	}
+	return newAgents
+}
+
 func (s *Store) loadPolicies() error {
 	var py PoliciesYAML
 
-	// 2. Try HTTP API if Redis didn't yield agents
+	// Try remote IAM API first if configured
 	if len(py.Agents) == 0 && s.apiUrl != "" {
 		req, err := http.NewRequestWithContext(context.Background(), "GET", s.apiUrl, nil)
 		if err != nil {
@@ -150,46 +219,7 @@ func (s *Store) loadPolicies() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	newAgents := make(map[string]agentState)
-
-	for _, a := range py.Agents {
-		oldState, exists := s.agents[a.Name]
-
-		version := 1
-		hasCache := false
-		var cachedPwdHash [32]byte
-
-		if exists {
-			version = oldState.version
-			if oldState.config.Key != a.Key {
-				version++
-			} else {
-				hasCache = oldState.hasCache
-				cachedPwdHash = oldState.cachedPwdHash
-			}
-		}
-
-		var limiter *rate.Limiter
-		if exists && oldState.config.RateLimitRPM == a.RateLimitRPM && oldState.config.RateLimitBurst == a.RateLimitBurst {
-			limiter = oldState.limiter
-		} else if a.RateLimitRPM > 0 {
-			burst := a.RateLimitBurst
-			if burst <= 0 {
-				burst = 1 // Default burst
-			}
-			limiter = rate.NewLimiter(rate.Limit(float64(a.RateLimitRPM)/60.0), burst)
-		}
-
-		newAgents[a.Name] = agentState{
-			config:        a,
-			version:       version,
-			hasCache:      hasCache,
-			cachedPwdHash: cachedPwdHash,
-			limiter:       limiter,
-		}
-	}
-
-	s.agents = newAgents
+	s.agents = mergeAgentStates(py.Agents, s.agents)
 	s.auditSinks = py.AuditSinks
 	s.logger.Info("Loaded policies", "count", len(s.agents), "source", s.apiUrl)
 	return nil
@@ -270,47 +300,15 @@ func (s *Store) GetRulesForAgent(clientID string, suppliedPassword string) (ast.
 		bcrypt.CompareHashAndPassword(s.dummyHash, []byte(suppliedPassword)) // mitigates timing oracle
 		err = fmt.Errorf("invalid client ID or password")
 	} else if suppliedPassword == "SCRAM_VERIFIED" || suppliedPassword == "mTLS_VERIFIED" {
-		// Fast path: pre-verified
-		rules = ast.Rules{
-			AllowedStatements:  state.config.AllowedStatements,
-			AllowedTables:      state.config.AllowedTables,
-			BlockedFunctions:   state.config.BlockedFunctions,
-			MaskedColumns:      state.config.MaskedColumns,
-			EnforceSelectLimit: state.config.SelectLimit,
-			MaxExecutionTimeMs: state.config.MaxExecutionTimeMs,
-			PoolMode:           state.config.PoolMode,
-			Dialect:            state.config.Dialect,
-			MaxComplexity:      state.config.MaxComplexity,
-		}
-		if rules.EnforceSelectLimit <= 0 {
-			rules.EnforceSelectLimit = 100
-		}
-		if rules.MaxExecutionTimeMs <= 0 {
-			rules.MaxExecutionTimeMs = 5000
-		}
+		// Fast path: pre-verified by mTLS or SCRAM handshake
+		rules = agentConfigToRules(state.config)
 		version = state.version
 	} else if state.hasCache && subtle.ConstantTimeCompare(state.cachedPwdHash[:], pwdHash[:]) == 1 {
-		// Fast path: Cached password
-		rules = ast.Rules{
-			AllowedStatements:  state.config.AllowedStatements,
-			AllowedTables:      state.config.AllowedTables,
-			BlockedFunctions:   state.config.BlockedFunctions,
-			MaskedColumns:      state.config.MaskedColumns,
-			EnforceSelectLimit: state.config.SelectLimit,
-			MaxExecutionTimeMs: state.config.MaxExecutionTimeMs,
-			PoolMode:           state.config.PoolMode,
-			Dialect:            state.config.Dialect,
-			MaxComplexity:      state.config.MaxComplexity,
-		}
-		if rules.EnforceSelectLimit <= 0 {
-			rules.EnforceSelectLimit = 100
-		}
-		if rules.MaxExecutionTimeMs <= 0 {
-			rules.MaxExecutionTimeMs = 5000
-		}
+		// Fast path: sha256 of password matches cached value — skip expensive bcrypt
+		rules = agentConfigToRules(state.config)
 		version = state.version
 	} else {
-		// Slow path
+		// Slow path: full cryptographic verification
 		if strings.HasPrefix(state.config.Key, "SCRAM-SHA-256$") {
 			iters, salt, storedKey, _, parseErr := parseSCRAMSecret(state.config.Key)
 			if parseErr != nil {
@@ -335,26 +333,10 @@ func (s *Store) GetRulesForAgent(clientID string, suppliedPassword string) (ast.
 		}
 
 		if err == nil {
-			rules = ast.Rules{
-				AllowedStatements:  state.config.AllowedStatements,
-				AllowedTables:      state.config.AllowedTables,
-				BlockedFunctions:   state.config.BlockedFunctions,
-				MaskedColumns:      state.config.MaskedColumns,
-				EnforceSelectLimit: state.config.SelectLimit,
-				MaxExecutionTimeMs: state.config.MaxExecutionTimeMs,
-				PoolMode:           state.config.PoolMode,
-				Dialect:            state.config.Dialect,
-				MaxComplexity:      state.config.MaxComplexity,
-			}
-			if rules.EnforceSelectLimit <= 0 {
-				rules.EnforceSelectLimit = 100
-			}
-			if rules.MaxExecutionTimeMs <= 0 {
-				rules.MaxExecutionTimeMs = 5000
-			}
+			rules = agentConfigToRules(state.config)
 			version = state.version
 
-			// Update cache
+			// Update cache so subsequent requests hit the fast path
 			s.mu.Lock()
 			if st, ok := s.agents[clientID]; ok {
 				st.hasCache = true
@@ -364,6 +346,7 @@ func (s *Store) GetRulesForAgent(clientID string, suppliedPassword string) (ast.
 			s.mu.Unlock()
 		}
 	}
+
 
 	if isPasswordAuth {
 		elapsed := time.Since(start)
@@ -539,45 +522,7 @@ func (s *Store) ConnectControlPlane(addr string) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 
-		newAgents := make(map[string]agentState)
-		for _, a := range py.Agents {
-			oldState, exists := s.agents[a.Name]
-
-			version := 1
-			hasCache := false
-			var cachedPwdHash [32]byte
-
-			if exists {
-				version = oldState.version
-				if oldState.config.Key != a.Key {
-					version++
-				} else {
-					hasCache = oldState.hasCache
-					cachedPwdHash = oldState.cachedPwdHash
-				}
-			}
-
-			var limiter *rate.Limiter
-			if exists && oldState.config.RateLimitRPM == a.RateLimitRPM && oldState.config.RateLimitBurst == a.RateLimitBurst {
-				limiter = oldState.limiter
-			} else if a.RateLimitRPM > 0 {
-				burst := a.RateLimitBurst
-				if burst <= 0 {
-					burst = 1
-				}
-				limiter = rate.NewLimiter(rate.Limit(float64(a.RateLimitRPM)/60.0), burst)
-			}
-
-			newAgents[a.Name] = agentState{
-				config:        a,
-				version:       version,
-				hasCache:      hasCache,
-				cachedPwdHash: cachedPwdHash,
-				limiter:       limiter,
-			}
-		}
-
-		s.agents = newAgents
+		s.agents = mergeAgentStates(py.Agents, s.agents)
 		s.auditSinks = py.AuditSinks
 		s.logger.Info("Policies successfully hot-reloaded from Control Plane stream", "count", len(s.agents))
 	})

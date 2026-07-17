@@ -497,9 +497,222 @@ func (s *Session) recoverBrokenTransaction() {
 	}
 }
 
+// handleParseMsg processes a Parse message (Extended Query Protocol).
+// It applies AST rules, stores the prepared statement, and forwards to upstream.
+func (s *Session) handleParseMsg(ctx context.Context, v *pgproto3.Parse, clientWriteCh chan pgproto3.BackendMessage) error {
+	_, span := Tracer.Start(ctx, "proxy.Parse")
+	defer span.End()
+
+	if s.errorDiscard.Load() {
+		return nil
+	}
+
+	rewrittenSQL, limitParams, err := (&ast.PostgresParser{}).ApplyRules(v.Query, s.rules, s.server.astCache)
+	if err != nil {
+		s.server.DispatchAudit(AuditEvent{Event: EventPolicyBlocked, ClientID: s.clientID, SQL: v.Query, Status: "blocked", Error: err.Error()})
+		BlockedQueriesTotal.WithLabelValues("policy").Inc()
+		clientWriteCh <- &pgproto3.ErrorResponse{
+			Severity: "ERROR",
+			Message:  fmt.Sprintf("AgentIAM Policy Violation: %v", err),
+		}
+		s.errorDiscard.Store(true)
+		return nil
+	}
+
+	s.preparedStatements[v.Name] = PreparedStatement{
+		SQL:           rewrittenSQL,
+		ParameterOIDs: v.ParameterOIDs,
+		LimitParams:   limitParams,
+	}
+	v.Name = ""
+	v.Query = rewrittenSQL
+
+	s.server.DispatchAudit(AuditEvent{Event: EventQueryForwarded, ClientID: s.clientID, SQL: v.Query, Status: "success"})
+	QueriesTotal.WithLabelValues("allowed").Inc()
+
+	u, err := s.getOrAcquireUpstream(ctx, clientWriteCh)
+	if err != nil {
+		return err
+	}
+	u.Frontend.Send(v)
+	return nil
+}
+
+// handleBindMsg processes a Bind message (Extended Query Protocol).
+// It applies rate limiting, re-sends the prepared statement Parse, caps parameterized LIMITs, and forwards upstream.
+func (s *Session) handleBindMsg(ctx context.Context, v *pgproto3.Bind, clientWriteCh chan pgproto3.BackendMessage) error {
+	_, span := Tracer.Start(ctx, "proxy.Bind")
+	defer span.End()
+
+	if s.errorDiscard.Load() {
+		return nil
+	}
+	if s.server.pool != nil {
+		s.server.store.SetPoolLatency(s.server.pool.GetAvgAcquireDuration())
+	}
+	if err := s.server.store.CheckRateLimit(s.clientID); err != nil {
+		s.server.DispatchAudit(AuditEvent{Event: EventPolicyBlocked, ClientID: s.clientID, Status: "rate_limited", Error: err.Error()})
+		BlockedQueriesTotal.WithLabelValues("rate_limit").Inc()
+		clientWriteCh <- &pgproto3.ErrorResponse{
+			Severity: "ERROR",
+			Code:     "53400", // configuration_limit_exceeded
+			Message:  fmt.Sprintf("AgentIAM Policy Violation: %v", err),
+		}
+		s.errorDiscard.Store(true)
+		return nil
+	}
+	u, err := s.getOrAcquireUpstream(ctx, clientWriteCh)
+	if err != nil {
+		return err
+	}
+
+	ps, exists := s.preparedStatements[v.PreparedStatement]
+	if exists {
+		u.SwallowParseComplete.Add(1)
+		u.Frontend.Send(&pgproto3.Parse{
+			Name:          "",
+			Query:         ps.SQL,
+			ParameterOIDs: ps.ParameterOIDs,
+		})
+
+		if len(ps.LimitParams) > 0 && s.rules.EnforceSelectLimit > 0 {
+			for _, paramIdx := range ps.LimitParams {
+				pIdx := paramIdx - 1
+				if pIdx >= 0 && pIdx < len(v.Parameters) {
+					formatCode := uint16(0)
+					if len(v.ParameterFormatCodes) == 1 {
+						formatCode = uint16(v.ParameterFormatCodes[0])
+					} else if len(v.ParameterFormatCodes) > pIdx {
+						formatCode = uint16(v.ParameterFormatCodes[pIdx])
+					}
+
+					valBytes := v.Parameters[pIdx]
+					if len(valBytes) > 0 {
+						if formatCode == 0 { // Text
+							val, parseErr := strconv.ParseInt(string(valBytes), 10, 64)
+							if parseErr == nil && val > int64(s.rules.EnforceSelectLimit) {
+								v.Parameters[pIdx] = []byte(strconv.Itoa(s.rules.EnforceSelectLimit))
+							}
+						} else if formatCode == 1 { // Binary
+							var val int64
+							parsed := false
+							if len(valBytes) == 2 {
+								val = int64(int16(binary.BigEndian.Uint16(valBytes)))
+								parsed = true
+							} else if len(valBytes) == 4 {
+								val = int64(int32(binary.BigEndian.Uint32(valBytes)))
+								parsed = true
+							} else if len(valBytes) == 8 {
+								val = int64(binary.BigEndian.Uint64(valBytes))
+								parsed = true
+							}
+							if parsed && val > int64(s.rules.EnforceSelectLimit) {
+								if len(valBytes) == 2 {
+									binary.BigEndian.PutUint16(v.Parameters[pIdx], uint16(s.rules.EnforceSelectLimit))
+								} else if len(valBytes) == 4 {
+									binary.BigEndian.PutUint32(v.Parameters[pIdx], uint32(s.rules.EnforceSelectLimit))
+								} else if len(valBytes) == 8 {
+									binary.BigEndian.PutUint64(v.Parameters[pIdx], uint64(s.rules.EnforceSelectLimit))
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	v.PreparedStatement = ""
+	v.DestinationPortal = ""
+	u.Frontend.Send(v)
+	return nil
+}
+
+// handleQueryMsg processes a simple Query message (Simple Query Protocol).
+// It applies rate limiting, AST rules, tracks SET vars, and forwards upstream.
+func (s *Session) handleQueryMsg(ctx context.Context, v *pgproto3.Query, clientWriteCh chan pgproto3.BackendMessage) error {
+	s.queryRunning.Store(true)
+	s.queryStartTime.Store(time.Now().UnixNano())
+	_, span := Tracer.Start(ctx, "proxy.Query")
+	defer span.End()
+
+	if s.server.pool != nil {
+		s.server.store.SetPoolLatency(s.server.pool.GetAvgAcquireDuration())
+	}
+	if err := s.server.store.CheckRateLimit(s.clientID); err != nil {
+		s.server.DispatchAudit(AuditEvent{Event: EventPolicyBlocked, ClientID: s.clientID, SQL: v.String, Status: "rate_limited", Error: err.Error()})
+		BlockedQueriesTotal.WithLabelValues("rate_limit").Inc()
+		clientWriteCh <- &pgproto3.ErrorResponse{
+			Severity: "ERROR",
+			Code:     "53400",
+			Message:  fmt.Sprintf("AgentIAM Policy Violation: %v", err),
+		}
+		clientWriteCh <- &pgproto3.ReadyForQuery{TxStatus: 'I'}
+		return nil
+	}
+
+	rewrittenSQL, _, err := (&ast.PostgresParser{}).ApplyRules(v.String, s.rules, s.server.astCache)
+	if err != nil {
+		s.server.DispatchAudit(AuditEvent{Event: EventPolicyBlocked, ClientID: s.clientID, SQL: v.String, Status: "blocked", Error: err.Error()})
+		BlockedQueriesTotal.WithLabelValues("policy").Inc()
+		clientWriteCh <- &pgproto3.ErrorResponse{
+			Severity: "ERROR",
+			Message:  fmt.Sprintf("AgentIAM Policy Violation: %v", err),
+		}
+		clientWriteCh <- &pgproto3.ReadyForQuery{TxStatus: 'I'}
+		return nil
+	}
+
+	v.String = rewrittenSQL
+
+	// Track SET variable changes for session state replay
+	if matches := setCmdRegex.FindStringSubmatch(v.String); matches != nil {
+		key := matches[1]
+		val := strings.TrimRight(matches[2], ";")
+		s.uconnMu.Lock()
+		s.sessionVars[key] = val
+		s.uconnMu.Unlock()
+	}
+
+	s.server.DispatchAudit(AuditEvent{Event: EventQueryForwarded, ClientID: s.clientID, SQL: v.String, Status: "success"})
+	QueriesTotal.WithLabelValues("allowed").Inc()
+
+	u, err := s.getOrAcquireUpstream(ctx, clientWriteCh)
+	if err != nil {
+		return err
+	}
+	u.Frontend.Send(v)
+	return nil
+}
+
+// handleSyncMsg processes a Sync message (Extended Query Protocol).
+// On error-discard state it synthesizes a ReadyForQuery to unblock the client.
+func (s *Session) handleSyncMsg(ctx context.Context, v *pgproto3.Sync, clientWriteCh chan pgproto3.BackendMessage) error {
+	s.queryRunning.Store(true)
+	s.queryStartTime.Store(time.Now().UnixNano())
+	_, span := Tracer.Start(ctx, "proxy.Sync")
+	defer span.End()
+
+	if s.errorDiscard.Load() {
+		s.errorDiscard.Store(false)
+		clientWriteCh <- &pgproto3.ReadyForQuery{TxStatus: 'I'}
+		s.queryRunning.Store(false)
+		return nil
+	}
+	u, err := s.getOrAcquireUpstream(ctx, clientWriteCh)
+	if err != nil {
+		return err
+	}
+	u.Frontend.Send(v)
+	return nil
+}
+
+// proxyLoop is the main read loop for a session.
+// It reads frontend messages and dispatches them to focused handler methods.
 func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clientID string) error {
 	clientWriteCh := make(chan pgproto3.BackendMessage, 64)
 
+	// Writer goroutine: drains clientWriteCh and sends to the client connection.
 	go func() {
 		defer cancel()
 		for {
@@ -514,6 +727,9 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 			}
 		}
 	}()
+
+	ActiveConnections.Inc()
+	defer ActiveConnections.Dec()
 
 	for {
 		msg, err := s.clientBackend.Receive()
@@ -534,128 +750,14 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 
 		switch v := msg.(type) {
 		case *pgproto3.Parse:
-			_, span := Tracer.Start(ctx, "proxy.Parse")
-			if s.errorDiscard.Load() {
-				span.End()
-				continue
-			}
-
-			rewrittenSQL, limitParams, err := (&ast.PostgresParser{}).ApplyRules(v.Query, s.rules, s.server.astCache)
-			if err != nil {
-				s.server.DispatchAudit(AuditEvent{Event: EventPolicyBlocked, ClientID: s.clientID, SQL: v.Query, Status: "blocked", Error: err.Error()})
-				clientWriteCh <- &pgproto3.ErrorResponse{
-					Severity: "ERROR",
-					Message:  fmt.Sprintf("AgentIAM Policy Violation: %v", err),
-				}
-				s.errorDiscard.Store(true)
-				span.End()
-				continue
-			}
-
-			s.preparedStatements[v.Name] = PreparedStatement{
-				SQL:           rewrittenSQL,
-				ParameterOIDs: v.ParameterOIDs,
-				LimitParams:   limitParams,
-			}
-			v.Name = ""
-			v.Query = rewrittenSQL
-			
-			s.server.DispatchAudit(AuditEvent{Event: EventQueryForwarded, ClientID: s.clientID, SQL: v.Query, Status: "success"})
-
-			u, err := s.getOrAcquireUpstream(ctx, clientWriteCh)
-			if err != nil {
-				span.End()
+			if err := s.handleParseMsg(ctx, v, clientWriteCh); err != nil {
 				return err
 			}
-			u.Frontend.Send(v)
-			span.End()
 
 		case *pgproto3.Bind:
-			_, span := Tracer.Start(ctx, "proxy.Bind")
-			if s.errorDiscard.Load() {
-				span.End()
-				continue
-			}
-			if s.server.pool != nil {
-				s.server.store.SetPoolLatency(s.server.pool.GetAvgAcquireDuration())
-			}
-			if err := s.server.store.CheckRateLimit(s.clientID); err != nil {
-				s.server.DispatchAudit(AuditEvent{Event: EventPolicyBlocked, ClientID: s.clientID, Status: "rate_limited", Error: err.Error()})
-				clientWriteCh <- &pgproto3.ErrorResponse{
-					Severity: "ERROR",
-					Code:     "53400", // configuration_limit_exceeded
-					Message:  fmt.Sprintf("AgentIAM Policy Violation: %v", err),
-				}
-				s.errorDiscard.Store(true)
-				span.End()
-				continue
-			}
-			u, err := s.getOrAcquireUpstream(ctx, clientWriteCh)
-			if err != nil {
-				span.End()
+			if err := s.handleBindMsg(ctx, v, clientWriteCh); err != nil {
 				return err
 			}
-
-			ps, exists := s.preparedStatements[v.PreparedStatement]
-			if exists {
-				u.SwallowParseComplete.Add(1)
-				u.Frontend.Send(&pgproto3.Parse{
-					Name:          "",
-					Query:         ps.SQL,
-					ParameterOIDs: ps.ParameterOIDs,
-				})
-
-				if len(ps.LimitParams) > 0 && s.rules.EnforceSelectLimit > 0 {
-					for _, paramIdx := range ps.LimitParams {
-						pIdx := paramIdx - 1
-						if pIdx >= 0 && pIdx < len(v.Parameters) {
-							formatCode := uint16(0)
-							if len(v.ParameterFormatCodes) == 1 {
-								formatCode = uint16(v.ParameterFormatCodes[0])
-							} else if len(v.ParameterFormatCodes) > pIdx {
-								formatCode = uint16(v.ParameterFormatCodes[pIdx])
-							}
-
-							valBytes := v.Parameters[pIdx]
-							if len(valBytes) > 0 {
-								if formatCode == 0 { // Text
-									val, parseErr := strconv.ParseInt(string(valBytes), 10, 64)
-									if parseErr == nil && val > int64(s.rules.EnforceSelectLimit) {
-										v.Parameters[pIdx] = []byte(strconv.Itoa(s.rules.EnforceSelectLimit))
-									}
-								} else if formatCode == 1 { // Binary
-									var val int64
-									parsed := false
-									if len(valBytes) == 2 {
-										val = int64(int16(binary.BigEndian.Uint16(valBytes)))
-										parsed = true
-									} else if len(valBytes) == 4 {
-										val = int64(int32(binary.BigEndian.Uint32(valBytes)))
-										parsed = true
-									} else if len(valBytes) == 8 {
-										val = int64(binary.BigEndian.Uint64(valBytes))
-										parsed = true
-									}
-									if parsed && val > int64(s.rules.EnforceSelectLimit) {
-										if len(valBytes) == 2 {
-											binary.BigEndian.PutUint16(v.Parameters[pIdx], uint16(s.rules.EnforceSelectLimit))
-										} else if len(valBytes) == 4 {
-											binary.BigEndian.PutUint32(v.Parameters[pIdx], uint32(s.rules.EnforceSelectLimit))
-										} else if len(valBytes) == 8 {
-											binary.BigEndian.PutUint64(v.Parameters[pIdx], uint64(s.rules.EnforceSelectLimit))
-										}
-									}
-								}
-							}
-						}
-					}
-				}
-			}
-
-			v.PreparedStatement = ""
-			v.DestinationPortal = ""
-			u.Frontend.Send(v)
-			span.End()
 
 		case *pgproto3.Describe:
 			_, span := Tracer.Start(ctx, "proxy.Describe")
@@ -668,7 +770,6 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 				span.End()
 				return err
 			}
-
 			if v.ObjectType == 'S' {
 				ps, exists := s.preparedStatements[v.Name]
 				if exists {
@@ -716,74 +817,14 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 			span.End()
 
 		case *pgproto3.Sync:
-			s.queryRunning.Store(true)
-			s.queryStartTime.Store(time.Now().UnixNano())
-			_, span := Tracer.Start(ctx, "proxy.Sync")
-			if s.errorDiscard.Load() {
-				s.errorDiscard.Store(false)
-				clientWriteCh <- &pgproto3.ReadyForQuery{TxStatus: 'I'}
-				s.queryRunning.Store(false)
-			} else {
-				u, err := s.getOrAcquireUpstream(ctx, clientWriteCh)
-				if err != nil {
-					span.End()
-					return err
-				}
-				u.Frontend.Send(v)
-			}
-			span.End()
-
-		case *pgproto3.Query:
-			s.queryRunning.Store(true)
-			s.queryStartTime.Store(time.Now().UnixNano())
-			_, span := Tracer.Start(ctx, "proxy.Query")
-			if s.server.pool != nil {
-				s.server.store.SetPoolLatency(s.server.pool.GetAvgAcquireDuration())
-			}
-			if err := s.server.store.CheckRateLimit(s.clientID); err != nil {
-				s.server.DispatchAudit(AuditEvent{Event: EventPolicyBlocked, ClientID: s.clientID, SQL: v.String, Status: "rate_limited", Error: err.Error()})
-				clientWriteCh <- &pgproto3.ErrorResponse{
-					Severity: "ERROR",
-					Code:     "53400",
-					Message:  fmt.Sprintf("AgentIAM Policy Violation: %v", err),
-				}
-				clientWriteCh <- &pgproto3.ReadyForQuery{TxStatus: 'I'}
-				span.End()
-				continue
-			}
-
-			rewrittenSQL, _, err := (&ast.PostgresParser{}).ApplyRules(v.String, s.rules, s.server.astCache)
-			if err != nil {
-				s.server.DispatchAudit(AuditEvent{Event: EventPolicyBlocked, ClientID: s.clientID, SQL: v.String, Status: "blocked", Error: err.Error()})
-				clientWriteCh <- &pgproto3.ErrorResponse{
-					Severity: "ERROR",
-					Message:  fmt.Sprintf("AgentIAM Policy Violation: %v", err),
-				}
-				clientWriteCh <- &pgproto3.ReadyForQuery{TxStatus: 'I'}
-				span.End()
-				continue
-			}
-
-			v.String = rewrittenSQL
-			
-			if matches := setCmdRegex.FindStringSubmatch(v.String); matches != nil {
-				key := matches[1]
-				val := matches[2]
-				val = strings.TrimRight(val, ";")
-				s.uconnMu.Lock()
-				s.sessionVars[key] = val
-				s.uconnMu.Unlock()
-			}
-			
-			s.server.DispatchAudit(AuditEvent{Event: EventQueryForwarded, ClientID: s.clientID, SQL: v.String, Status: "success"})
-
-			u, err := s.getOrAcquireUpstream(ctx, clientWriteCh)
-			if err != nil {
-				span.End()
+			if err := s.handleSyncMsg(ctx, v, clientWriteCh); err != nil {
 				return err
 			}
-			u.Frontend.Send(v)
-			span.End()
+
+		case *pgproto3.Query:
+			if err := s.handleQueryMsg(ctx, v, clientWriteCh); err != nil {
+				return err
+			}
 
 		case *pgproto3.Terminate:
 			s.recoverBrokenTransaction()

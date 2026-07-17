@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,6 +38,7 @@ type Server struct {
 	pool     *Pool
 	sem      chan struct{}
 	wg       sync.WaitGroup
+	listener net.Listener // stored for graceful shutdown
 
 	mu             sync.RWMutex
 	astCache       cache.ASTCache
@@ -198,13 +200,13 @@ func (s *Server) Start() error {
 				w.Write([]byte("pool not ready"))
 			}
 		})
-		
+
 		mux.HandleFunc("/api/status", s.HandleUIStatus)
 		mux.HandleFunc("/api/credentials", s.HandleGenerateCredentials)
 		if s.uiFS != nil {
 			mux.Handle("/", http.FileServer(s.uiFS))
 		}
-		
+
 		s.logger.Info("Starting Prometheus metrics and health endpoint", "addr", s.metricsAddr)
 		if err := http.ListenAndServe(s.metricsAddr, mux); err != nil {
 			s.logger.Error("Metrics server failed", "error", err)
@@ -224,13 +226,20 @@ func (s *Server) Start() error {
 	if err != nil {
 		return fmt.Errorf("failed to bind to %s: %w", s.listenAddr, err)
 	}
-	defer l.Close()
+
+	s.mu.Lock()
+	s.listener = l
+	s.mu.Unlock()
 
 	s.logger.Info("AgentIAM Proxy Listening", "addr", s.listenAddr)
 
 	for {
 		conn, err := l.Accept()
 		if err != nil {
+			// Listener was closed intentionally during shutdown
+			if isClosedConnErr(err) {
+				return nil
+			}
 			s.logger.Error("Failed to accept connection", "error", err)
 			continue
 		}
@@ -244,6 +253,44 @@ func (s *Server) Start() error {
 			conn.Close()
 		}
 	}
+}
+
+// Shutdown stops the listener and waits for all active sessions to drain.
+// It respects the provided context deadline as a timeout.
+func (s *Server) Shutdown(ctx context.Context) error {
+	s.mu.Lock()
+	if s.listener != nil {
+		s.listener.Close()
+	}
+	// Cancel all active sessions
+	for _, sessions := range s.activeSessions {
+		for _, meta := range sessions {
+			meta.cancel()
+		}
+	}
+	s.mu.Unlock()
+
+	// Wait for all goroutines to finish with a timeout
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("shutdown timed out: %w", ctx.Err())
+	}
+}
+
+// isClosedConnErr returns true if the error is a "use of closed network connection" error.
+func isClosedConnErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "use of closed network connection")
 }
 
 func (s *Server) handleConnection(clientConn net.Conn) {
