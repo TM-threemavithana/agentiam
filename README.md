@@ -23,17 +23,9 @@ Relying on "prompt engineering" or read-only users is insufficient. You need a s
 
 AgentIAM operates at the semantic level. It physically parses the incoming binary packets, extracts the SQL, and uses deep AST evaluation to understand the exact intent of the query.
 
-```mermaid
-graph LR
-    A[AI Agent <br> LangChain / LlamaIndex] -- "postgresql://..." --> B{AgentIAM Proxy}
-    B -- Parses AST --> C[AST Evaluation Engine]
-    C -- "🛑 Blocked (e.g. DeleteStmt)" --> D((Connection Dropped))
-    C -- "✅ Allowed (e.g. SelectStmt)" --> E[(Upstream Database)]
-    
-    style B fill:#2563eb,stroke:#1d4ed8,color:#fff
-    style D fill:#ef4444,stroke:#b91c1c,color:#fff
-    style E fill:#10b981,stroke:#047857,color:#fff
-```
+<div align="center">
+  <img src="assets/architecture.svg" alt="AgentIAM Architecture Diagram" width="800">
+</div>
 
 ### ⚡ Example: Intercepting a Prompt Injection Attack
 When an agent connects to AgentIAM and attempts a destructive action, the proxy intercepts it silently:
