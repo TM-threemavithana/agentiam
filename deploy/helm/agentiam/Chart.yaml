@@ -1,0 +1,6 @@
+apiVersion: v2
+name: agentiam
+description: AgentIAM is a semantic SQL firewall proxy for AI Agents.
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
