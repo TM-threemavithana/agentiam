@@ -277,12 +277,32 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		close(done)
 	}()
 
+	var err error
 	select {
 	case <-done:
-		return nil
+		// Okay
 	case <-ctx.Done():
-		return fmt.Errorf("shutdown timed out: %w", ctx.Err())
+		err = fmt.Errorf("shutdown timed out: %w", ctx.Err())
 	}
+
+	// Close Postgres pool
+	if s.pool != nil {
+		s.pool.Close()
+	}
+
+	// Close Handlers if they implement io.Closer
+	for _, handler := range s.handlers {
+		if closer, ok := handler.(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
+	}
+
+	// Close Audit Sinks
+	for _, sink := range s.auditSinks {
+		_ = sink.Close()
+	}
+
+	return err
 }
 
 // isClosedConnErr returns true if the error is a "use of closed network connection" error.

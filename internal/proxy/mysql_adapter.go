@@ -40,6 +40,14 @@ func (h *MySQLProtocolHandler) InitPool() error {
 	return nil
 }
 
+// Close releases the MySQL connection pool resources.
+func (h *MySQLProtocolHandler) Close() error {
+	if h.pool != nil {
+		h.pool.Close()
+	}
+	return nil
+}
+
 // HandleSession implements the ProtocolHandler interface.
 // It proxies the raw net.Conn through the go-mysql-org server implementation.
 func (h *MySQLProtocolHandler) HandleSession(ctx context.Context, clientConn net.Conn) error {

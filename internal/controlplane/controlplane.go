@@ -164,6 +164,8 @@ type Client struct {
 	token    string
 	onUpdate func([]byte)
 	stopCh   chan struct{}
+	mu       sync.Mutex
+	conn     net.Conn
 }
 
 func NewClient(addr string, logger *slog.Logger, token string, onUpdate func([]byte)) *Client {
@@ -188,9 +190,24 @@ func (c *Client) Start() {
 			conn, err := net.Dial("tcp", c.addr)
 			if err != nil {
 				c.logger.Error("Control Plane Client failed to connect, retrying in 2s", "addr", c.addr, "error", err)
-				time.Sleep(2 * time.Second)
+				select {
+				case <-c.stopCh:
+					return
+				case <-time.After(2 * time.Second):
+				}
 				continue
 			}
+
+			c.mu.Lock()
+			select {
+			case <-c.stopCh:
+				conn.Close()
+				c.mu.Unlock()
+				return
+			default:
+				c.conn = conn
+			}
+			c.mu.Unlock()
 
 			// Handshake
 			conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
@@ -198,8 +215,15 @@ func (c *Client) Start() {
 			rand.Read(nonce)
 			if _, err := conn.Write(nonce); err != nil {
 				c.logger.Error("Control Plane Client failed to write nonce", "error", err)
+				c.mu.Lock()
 				conn.Close()
-				time.Sleep(2 * time.Second)
+				c.conn = nil
+				c.mu.Unlock()
+				select {
+				case <-c.stopCh:
+					return
+				case <-time.After(2 * time.Second):
+				}
 				continue
 			}
 
@@ -207,8 +231,15 @@ func (c *Client) Start() {
 			conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 			if _, err := io.ReadFull(conn, mac); err != nil {
 				c.logger.Error("Control Plane Client failed to read MAC", "error", err)
+				c.mu.Lock()
 				conn.Close()
-				time.Sleep(2 * time.Second)
+				c.conn = nil
+				c.mu.Unlock()
+				select {
+				case <-c.stopCh:
+					return
+				case <-time.After(2 * time.Second):
+				}
 				continue
 			}
 
@@ -217,8 +248,15 @@ func (c *Client) Start() {
 			expectedMAC := h.Sum(nil)
 			if !hmac.Equal(mac, expectedMAC) {
 				c.logger.Error("Control Plane Client authentication failed (bad MAC)")
+				c.mu.Lock()
 				conn.Close()
-				time.Sleep(2 * time.Second)
+				c.conn = nil
+				c.mu.Unlock()
+				select {
+				case <-c.stopCh:
+					return
+				case <-time.After(2 * time.Second):
+				}
 				continue
 			}
 
@@ -229,8 +267,17 @@ func (c *Client) Start() {
 			if err != nil {
 				c.logger.Error("Control Plane Client stream error", "error", err)
 			}
+
+			c.mu.Lock()
 			conn.Close()
-			time.Sleep(2 * time.Second) // backoff before reconnecting
+			c.conn = nil
+			c.mu.Unlock()
+
+			select {
+			case <-c.stopCh:
+				return
+			case <-time.After(2 * time.Second):
+			}
 		}
 	}()
 }
@@ -257,4 +304,9 @@ func (c *Client) readStream(conn net.Conn) error {
 
 func (c *Client) Close() {
 	close(c.stopCh)
+	c.mu.Lock()
+	if c.conn != nil {
+		c.conn.Close()
+	}
+	c.mu.Unlock()
 }

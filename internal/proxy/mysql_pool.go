@@ -97,6 +97,7 @@ func (p *MySQLPool) Acquire(ctx context.Context) (*MySQLUpstreamConn, error) {
 	case u := <-p.conns:
 		duration := time.Since(start)
 		p.updateAvgAcquireDuration(duration)
+		PoolIdleConnections.Dec()
 
 		if u.Broken.Load() {
 			u.Close()
@@ -105,42 +106,33 @@ func (p *MySQLPool) Acquire(ctx context.Context) (*MySQLUpstreamConn, error) {
 				broken := &MySQLUpstreamConn{}
 				broken.Broken.Store(true)
 				p.conns <- broken
+				PoolIdleConnections.Inc()
 				return nil, err
 			}
 			newU.InUse.Store(true)
 			return newU, nil
 		}
 		u.InUse.Store(true)
-		PoolIdleConnections.Dec()
 		return u, nil
 	}
 }
 
 func (p *MySQLPool) Release(u *MySQLUpstreamConn) {
 	u.InUse.Store(false)
-	PoolIdleConnections.Inc()
 
 	if !u.Broken.Load() && u.Conn != nil {
 		err := u.Conn.Ping()
 		if err != nil {
 			u.Broken.Store(true)
 		}
-		if err == nil {
-			// Write command COM_RESET_CONNECTION (0x1f)
-			// client package doesn't export WriteCommand directly for custom commands,
-			// so we just issue a dummy command or rely on ping. But wait, `WriteCommand` might be exported?
-			// Actually, just pinging ensures health. We can simulate DISCARD ALL by doing a fast Ping.
-			// Let's check if there is a Reset() method or similar, but for now we skip COM_RESET_CONNECTION
-			// if it doesn't compile or just log.
-		}
 	}
 
 	select {
 	case p.conns <- u:
+		PoolIdleConnections.Inc()
 	default:
 		u.Close()
 		PoolTotalConnections.Dec()
-		PoolIdleConnections.Dec()
 	}
 }
 

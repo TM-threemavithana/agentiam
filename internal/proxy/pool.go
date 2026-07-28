@@ -128,6 +128,7 @@ func (p *Pool) Acquire(ctx context.Context) (*UpstreamConn, error) {
 	case u := <-p.conns:
 		duration := time.Since(start)
 		p.updateAvgAcquireDuration(duration)
+		PoolIdleConnections.Dec()
 
 		if u.Broken.Load() {
 			u.Close()
@@ -136,13 +137,13 @@ func (p *Pool) Acquire(ctx context.Context) (*UpstreamConn, error) {
 				broken := &UpstreamConn{}
 				broken.Broken.Store(true)
 				p.conns <- broken
+				PoolIdleConnections.Inc()
 				return nil, err
 			}
 			newU.InUse.Store(true)
 			return newU, nil
 		}
 		u.InUse.Store(true)
-		PoolIdleConnections.Dec()
 		return u, nil
 	}
 }
@@ -165,9 +166,11 @@ func (p *Pool) Release(u *UpstreamConn) {
 				broken := &UpstreamConn{}
 				broken.Broken.Store(true)
 				p.conns <- broken
+				PoolIdleConnections.Inc()
 				return
 			}
 			p.conns <- newU
+			PoolIdleConnections.Inc()
 		}()
 		return
 	}
@@ -184,6 +187,7 @@ func (p *Pool) Release(u *UpstreamConn) {
 				broken := &UpstreamConn{}
 				broken.Broken.Store(true)
 				p.conns <- broken
+				PoolIdleConnections.Inc()
 				return
 			}
 			if _, ok := msg.(*pgproto3.ReadyForQuery); ok {
@@ -193,4 +197,11 @@ func (p *Pool) Release(u *UpstreamConn) {
 		p.conns <- u
 		PoolIdleConnections.Inc()
 	}()
+}
+
+func (p *Pool) Close() {
+	close(p.conns)
+	for u := range p.conns {
+		u.Close()
+	}
 }
