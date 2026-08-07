@@ -4,7 +4,7 @@
 
 Connecting Large Language Models (LLMs) directly to your database for "Text-to-SQL" functionality is a massive security risk. **AgentIAM** acts as an intelligent, high-performance proxy that sits between your LangChain/LlamaIndex agents and your PostgreSQL or MySQL database. It intercepts binary wire traffic, parses the SQL into an Abstract Syntax Tree (AST), and deterministically blocks destructive queries (like prompt injections) before they ever execute.
 
-[![Go Report Card](https://goreportcard.com/badge/github.com/tm-threemavithana/agentiam)](https://goreportcard.com/report/github.com/tm-threemavithana/agentiam)
+[![CI](https://github.com/tm-threemavithana/agentiam/actions/workflows/ci.yml/badge.svg)](https://github.com/tm-threemavithana/agentiam/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Kubernetes Ready](https://img.shields.io/badge/Kubernetes-Helm_Chart-326ce5.svg?logo=kubernetes&logoColor=white)](deploy/helm/agentiam)
 
