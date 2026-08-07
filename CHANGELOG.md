@@ -14,7 +14,9 @@
 - **Fixed `asyncpg` Pipelining Data Aliasing**: Identified and resolved a memory aliasing vulnerability in the proxy's `DataRow` forwarding path. Reusing the same byte buffer for pipelined responses caused silent data corruption (duplicate rows) under high concurrency without throwing exceptions. Verified fix with a robust 10,000 row integration test.
 
 ### Auditing
-- **Asynchronous Webhook Egress**: Added non-blocking HTTP audit webhook streaming for policy blocks and successful queries. Employs a buffered channel (`buffer_size=1000`) to prevent downstream SIEM latency from pausing the proxy. Included local metrics for tracking silent drops if the queue fills during bursts.## [2026-06-28] - Security, Performance, and Coverage Overhaul
+- **Asynchronous Webhook Egress**: Added non-blocking HTTP audit webhook streaming for policy blocks and successful queries. Employs a buffered channel (`buffer_size=1000`) to prevent downstream SIEM latency from pausing the proxy. Included local metrics for tracking silent drops if the queue fills during bursts.
+
+## [2026-06-28] - Security, Performance, and Coverage Overhaul
 
 ### Security
 - **Patched Standard Library Vulnerabilities**: Updated Go toolchain from `1.25.0` to `1.25.11` in `go.mod`.

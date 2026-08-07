@@ -76,7 +76,7 @@ AgentIAM ships with a native, production-ready Python SDK for AI developers. You
 
 **Prerequisites:** 
 - [Docker](https://docs.docker.com/get-docker/) (for local testing)
-- Go 1.21+ (if building from source)
+- Go 1.25.11+ (if building from source)
 - Python 3.11+ (for running AI Agent demos)
 
 You can test the full end-to-end integration immediately using Docker Compose and the provided LangChain example. *(Note: A MySQL demo is also available in `demo/docker-compose.yml`)*
