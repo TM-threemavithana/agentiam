@@ -1,0 +1,14 @@
+FROM alpine:latest
+
+WORKDIR /app
+
+# GoReleaser copies the built binary here
+COPY agentiam /usr/local/bin/agentiam
+COPY agentiamctl /usr/local/bin/agentiamctl
+
+# Ensure sqlite db can be created if needed
+RUN mkdir -p /app/data
+
+EXPOSE 5433
+
+ENTRYPOINT ["agentiam"]

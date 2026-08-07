@@ -1,0 +1,69 @@
+# deploy/k8s/postgres-dev.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-dev-pvc
+  namespace: agentiam
+  labels:
+    app: postgres-dev
+    environment: dev
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-dev
+  namespace: agentiam
+  labels:
+    app: postgres-dev
+    environment: dev
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres-dev
+  template:
+    metadata:
+      labels:
+        app: postgres-dev
+        environment: dev
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:15-alpine
+          env:
+            - name: POSTGRES_USER
+              value: "app_user"
+            - name: POSTGRES_PASSWORD
+              value: "REPLACE_WITH_POSTGRES_PASSWORD"
+            - name: POSTGRES_DB
+              value: "postgres"
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: postgres-data
+          persistentVolumeClaim:
+            claimName: postgres-dev-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-dev
+  namespace: agentiam
+  labels:
+    app: postgres-dev
+    environment: dev
+spec:
+  selector:
+    app: postgres-dev
+  ports:
+    - port: 5432
+      targetPort: 5432

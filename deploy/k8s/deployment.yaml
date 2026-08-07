@@ -1,0 +1,109 @@
+# deploy/k8s/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agentiam
+  namespace: agentiam
+  labels:
+    app: agentiam
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agentiam
+  template:
+    metadata:
+      labels:
+        app: agentiam
+    spec:
+      volumes:
+        - name: secrets-vol
+          secret:
+            secretName: agentiam-secrets
+            items:
+              - key: policies.yaml
+                path: policies.yaml
+              - key: userlist.txt
+                path: userlist.txt
+        - name: config-vol
+          configMap:
+            name: agentiam-config
+            items:
+              - key: pgbouncer.ini
+                path: pgbouncer.ini
+
+      containers:
+        # ── AgentIAM ──────────────────────────────────────────────
+        - name: agentiam
+          image: ghcr.io/your-org/agentiam:latest
+          ports:
+            - name: postgres
+              containerPort: 5432
+            - name: metrics
+              containerPort: 9090
+          env:
+            - name: AGENTIAM_LISTEN_PORT
+              value: "5432"
+            - name: AGENTIAM_UPSTREAM_DSN
+              value: "postgres://app_user@127.0.0.1:6432/postgres?sslmode=disable"
+            - name: AGENTIAM_POLICY_FILE
+              value: "/etc/agentiam/policies.yaml"
+            - name: AGENTIAM_POLL_INTERVAL
+              value: "10s"
+            - name: AGENTIAM_METRICS_PORT
+              value: "9090"
+          volumeMounts:
+            - name: secrets-vol
+              mountPath: /etc/agentiam/policies.yaml
+              subPath: policies.yaml
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: 9090
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: 9090
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+
+        # ── PgBouncer sidecar ─────────────────────────────────────
+        - name: pgbouncer
+          image: edoburu/pgbouncer:1.22.0
+          ports:
+            - name: pgbouncer
+              containerPort: 6432
+          env:
+            - name: PGBOUNCER_CONFIG
+              value: "/etc/pgbouncer/pgbouncer.ini"
+          volumeMounts:
+            - name: config-vol
+              mountPath: /etc/pgbouncer/pgbouncer.ini
+              subPath: pgbouncer.ini
+              readOnly: true
+            - name: secrets-vol
+              mountPath: /etc/pgbouncer/userlist.txt
+              subPath: userlist.txt
+              readOnly: true
+          readinessProbe:
+            tcpSocket:
+              port: 6432
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "32Mi"
+            limits:
+              cpu: "200m"
+              memory: "64Mi"
