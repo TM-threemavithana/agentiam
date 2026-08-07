@@ -6,14 +6,14 @@ Welcome! Thank you for considering contributing to AgentIAM. We welcome bug repo
 
 AgentIAM is written in Go and uses standard Go tooling.
 
-1. Install Go 1.22+.
+1. Install Go 1.25.11+.
 2. Install Docker (required for integration tests).
-3. Clone the repository: `git clone https://github.com/yourusername/agentiam.git`
+3. Clone the repository: `git clone https://github.com/TM-threemavithana/agentiam.git`
 4. Run `go mod tidy` to download dependencies.
 
 ## Testing
 
-AgentIAM has a comprehensive test suite, including integration tests that spin up a real PostgreSQL database using Docker.
+AgentIAM has a comprehensive test suite, including integration tests that spin up real PostgreSQL and MySQL databases using Docker.
 
 - To run all tests (including integration tests):
   ```bash
@@ -24,7 +24,7 @@ AgentIAM has a comprehensive test suite, including integration tests that spin u
 ## Making Changes
 
 Before submitting a Pull Request, please ensure the following:
-1. **Format Code**: Run `go fmt ./...` before committing. CI will fail if the code is unformatted.
+1. **Format & Lint Code**: Run `go fmt ./...` and `make lint` before committing. CI will fail if the code is unformatted or fails linting.
 2. **Add Tests**: If you fix a bug or add a new feature, add a corresponding test. Integration tests are preferred for proxy-level behavior changes.
 3. **Check CI**: Our GitHub Actions workflow checks formatting, module dependencies (`go.sum`), and runs the full test suite with the Go `-race` detector enabled.
 
