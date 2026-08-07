@@ -81,7 +81,8 @@ func (h *HTTPInterceptor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *HTTPInterceptor) interceptSQLPayload(w http.ResponseWriter, r *http.Request, agentID string, rules ast.Rules) {
-	bodyBytes, err := io.ReadAll(r.Body)
+	// Limit incoming payload to 10MB to prevent memory exhaustion attacks
+	bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 10*1024*1024))
 	if err != nil {
 		http.Error(w, "Failed to read body", http.StatusBadRequest)
 		return

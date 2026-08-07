@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -88,3 +89,30 @@ func TestPool_DialFailureRecovery(t *testing.T) {
 	// 7. Success! No panic, and we have a valid connection again.
 	pool.Release(u2)
 }
+
+func TestPool_ConcurrentMovingAverage(t *testing.T) {
+	logger := NewLogger(io.Discard)
+	pool := NewPool("postgres://dummy", 2, logger)
+
+	var wg sync.WaitGroup
+	workers := 50
+	iterations := 1000
+
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				latency := time.Duration((id*j)%200) * time.Millisecond
+				pool.updateAvgAcquireDuration(latency)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	finalAvg := pool.GetAvgAcquireDuration()
+	if finalAvg <= 0 {
+		t.Errorf("Expected positive average acquire duration, got: %v", finalAvg)
+	}
+}
+

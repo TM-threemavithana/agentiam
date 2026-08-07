@@ -42,6 +42,19 @@ func (s *Server) Start() error {
 	s.logger.Info("Control Plane Server listening", "addr", s.addr)
 
 	go func() {
+		ticker := time.NewTicker(20 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.stopCh:
+				return
+			case <-ticker.C:
+				s.BroadcastPing()
+			}
+		}
+	}()
+
+	go func() {
 		for {
 			conn, err := s.listener.Accept()
 			if err != nil {
@@ -140,6 +153,26 @@ func (s *Server) BroadcastConfig(configBytes []byte) {
 				s.logger.Error("Failed to write payload to client", "error", err)
 				s.unregisterClient(c)
 				return
+			}
+		}(conn)
+	}
+}
+
+// BroadcastPing sends a 0-length heartbeat to all connected clients.
+func (s *Server) BroadcastPing() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	header := make([]byte, 4)
+	binary.BigEndian.PutUint32(header, 0)
+
+	for conn := range s.clients {
+		go func(c net.Conn) {
+			c.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			_, err := c.Write(header)
+			if err != nil {
+				s.logger.Error("Failed to write ping to client", "error", err)
+				s.unregisterClient(c)
 			}
 		}(conn)
 	}
@@ -285,12 +318,18 @@ func (c *Client) Start() {
 func (c *Client) readStream(conn net.Conn) error {
 	header := make([]byte, 4)
 	for {
+		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 		_, err := io.ReadFull(conn, header)
 		if err != nil {
 			return err
 		}
 
 		length := binary.BigEndian.Uint32(header)
+		if length == 0 {
+			// Heartbeat received, resets deadline automatically on next loop
+			continue
+		}
+
 		payload := make([]byte, length)
 		_, err = io.ReadFull(conn, payload)
 		if err != nil {
