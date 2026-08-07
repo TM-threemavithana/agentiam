@@ -5,7 +5,7 @@ CMD_PATH=./cmd/agentiam
 
 build-ui:
 	@echo "==> Building Observability Dashboard..."
-	cd web && npm run build
+	cd web && npm install && npm run build
 
 build: build-ui
 	@echo "==> Building AgentIAM Proxy..."
