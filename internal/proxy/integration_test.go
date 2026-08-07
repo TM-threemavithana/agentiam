@@ -290,6 +290,40 @@ func TestProxyIntegration(t *testing.T) {
 		}
 	})
 
+	// Test 8: Statement Timeout Protection (Live Queries)
+	t.Run("8_Statement_Timeout_Protection", func(t *testing.T) {
+		conn, err := pgx.Connect(ctx, proxyDSN)
+		if err != nil {
+			t.Fatalf("failed to connect via proxy: %v", err)
+		}
+		defer conn.Close(ctx)
+
+		// 1. Simple Query / First Acquisition
+		_, err = conn.Exec(ctx, "SET statement_timeout = '1000000ms'")
+		if err == nil {
+			t.Fatal("expected error when setting statement_timeout, got none")
+		}
+
+		// 2. Reuse of existing connection
+		// Execute a valid query to ensure connection works and is reused
+		_, err = conn.Exec(ctx, "SELECT 1")
+		if err != nil {
+			t.Fatalf("SELECT failed: %v", err)
+		}
+
+		// Try to set timeout again
+		_, err = conn.Exec(ctx, "SET statement_timeout TO 1000")
+		if err == nil {
+			t.Fatal("expected error when setting statement_timeout on reused connection, got none")
+		}
+
+		// 3. Prepared Statement bypass attempt
+		_, err = conn.Prepare(ctx, "set_timeout", "SET statement_timeout = '1000000ms'")
+		if err == nil {
+			t.Fatal("expected error when preparing statement_timeout set, got none")
+		}
+	})
+
 	// Test 6: SimpleQuery Error Recovery
 	t.Run("6_SimpleQuery_Discard", func(t *testing.T) {
 		conn, err := pgx.Connect(ctx, proxyDSN)

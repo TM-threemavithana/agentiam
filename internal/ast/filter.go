@@ -371,6 +371,9 @@ func enforceRules(node *pg_query.Node, rules Rules, depth int, limitParams *[]in
 		if !isAllowed("SET", rules.AllowedStatements) {
 			return fmt.Errorf("SET statements are not allowed by policy")
 		}
+		if strings.EqualFold(n.VariableSetStmt.Name, "statement_timeout") {
+			return fmt.Errorf("overriding statement_timeout is not allowed by policy")
+		}
 	case *pg_query.Node_VariableShowStmt:
 		if !isAllowed("SHOW", rules.AllowedStatements) {
 			return fmt.Errorf("SHOW statements are not allowed by policy")
