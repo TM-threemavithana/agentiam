@@ -10,6 +10,17 @@ Connecting Large Language Models (LLMs) directly to your database for "Text-to-S
 
 ---
 
+## 📑 Table of Contents
+- [The Problem](#-the-problem-why-prompt-engineering-isnt-enough)
+- [How AgentIAM Solves This](#-how-agentiam-solves-this)
+- [Features](#-features)
+- [Python SDK](#-python-sdk)
+- [Quickstart](#-quickstart)
+- [Configuration & Control Plane](#️-configuration--control-plane)
+- [Security Architecture](#-security-architecture)
+
+---
+
 ## 🛑 The Problem: Why Prompt Engineering Isn't Enough
 
 If you give an AI Agent a database connection, it *will* eventually try to delete data or overwhelm your server.
@@ -54,9 +65,21 @@ AgentIAM successfully intercepted and blocked the destructive AST node!
 
 ---
 
+## 🐍 Python SDK
+
+AgentIAM ships with a native, production-ready Python SDK for AI developers. You don't need to write raw database drivers—just drop in our clients for LangChain or LlamaIndex.
+[Read the Python SDK Documentation](sdk/python/agentiam/README.md)
+
+---
+
 ## 🏃 Quickstart
 
-You can test the full end-to-end integration immediately using Docker Compose and the provided LangChain example.
+**Prerequisites:** 
+- [Docker](https://docs.docker.com/get-docker/) (for local testing)
+- Go 1.21+ (if building from source)
+- Python 3.11+ (for running AI Agent demos)
+
+You can test the full end-to-end integration immediately using Docker Compose and the provided LangChain example. *(Note: A MySQL demo is also available in `demo/docker-compose.yml`)*
 
 ### 1. Start the Proxy & Database
 ```bash
@@ -100,6 +123,9 @@ agents:
       - inventory
     select_limit: 100 # Hard cap on all SELECT statements
 ```
+
+> 💡 **Tip:** Generate this secure bcrypt hash easily using the CLI:  
+> `agentiamctl keys generate`
 
 ---
 
