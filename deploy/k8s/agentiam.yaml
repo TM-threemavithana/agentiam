@@ -1,0 +1,123 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agentiam
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: agentiam-secrets
+  namespace: agentiam
+type: Opaque
+stringData:
+  # The YAML policies. Keep keys as bcrypt hashes.
+  policies.yaml: |
+    version: "1"
+    agents:
+      - name: demo-agent
+        key: $2a$10$wE9q.hP8/J5U/8N/B8B8e.hG9r/4h3XU8U7O8M2L2XU8U7O8M2L2X
+        allowed_statements:
+          - SELECT
+        allowed_tables:
+          - public.users
+        select_limit: 100
+        created_at: "2026-06-23T12:00:00Z"
+  
+  # PgBouncer backend Postgres credentials (e.g. for user 'postgres')
+  userlist.txt: |
+    "postgres" "md5_hashed_password_here"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agentiam-config
+  namespace: agentiam
+data:
+  pgbouncer.ini: |
+    [databases]
+    * = host=backend-db-host port=5432 auth_user=postgres
+
+    [pgbouncer]
+    listen_addr = *
+    listen_port = 6432
+    auth_type = md5
+    auth_file = /etc/pgbouncer/userlist.txt
+    pool_mode = transaction
+    max_client_conn = 1000
+    default_pool_size = 20
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agentiam
+  namespace: agentiam
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: agentiam
+  template:
+    metadata:
+      labels:
+        app: agentiam
+    spec:
+      containers:
+        # AgentIAM Proxy Container
+        - name: agentiam
+          image: agentiam:latest # Replace with your registry image
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: AGENTIAM_POLICY_FILE
+              value: "/etc/agentiam/policies.yaml"
+            - name: AGENTIAM_UPSTREAM_DSN
+              value: "postgres://postgres@localhost:6432/?sslmode=disable" # Communicates locally with PgBouncer
+            - name: AGENTIAM_TLS_CERT
+              value: "" # Provide path if enforcing TLS
+            - name: AGENTIAM_TLS_KEY
+              value: ""
+            - name: AGENTIAM_DEV_MODE
+              value: "true"
+          ports:
+            - containerPort: 5433
+          volumeMounts:
+            - name: secrets-volume
+              mountPath: /etc/agentiam
+              readOnly: true
+
+        # PgBouncer Sidecar Container
+        - name: pgbouncer
+          image: edoburu/pgbouncer:latest
+          env:
+            - name: DATABASE_URL
+              value: "postgres://postgres@backend-db-host:5432" # Fallback mapping
+          ports:
+            - containerPort: 6432
+          volumeMounts:
+            - name: config-volume
+              mountPath: /etc/pgbouncer/pgbouncer.ini
+              subPath: pgbouncer.ini
+            - name: secrets-volume
+              mountPath: /etc/pgbouncer/userlist.txt
+              subPath: userlist.txt
+
+      volumes:
+        - name: config-volume
+          configMap:
+            name: agentiam-config
+        - name: secrets-volume
+          secret:
+            secretName: agentiam-secrets
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agentiam
+  namespace: agentiam
+spec:
+  selector:
+    app: agentiam
+  ports:
+    - protocol: TCP
+      port: 5432
+      targetPort: 5433
+  type: ClusterIP

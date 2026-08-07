@@ -1,0 +1,33 @@
+replicaCount: 2
+
+image:
+  repository: tm-threemavithana/agentiam
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+service:
+  type: ClusterIP
+  port: 5432
+  metricsPort: 9090
+
+agentiam:
+  upstreamDSN: "postgres://user:pass@upstream-db:5432/dbname"
+  adminToken: "changeme"
+  poolSize: 50
+  insecureAuth: false
+
+serviceMonitor:
+  enabled: true
+  interval: 15s
+
+policies: |
+  version: "1"
+  agents:
+    - name: "langchain-bot"
+      key: "$2a$10$dummyhash"
+      allowed_statements:
+        - SELECT
+      allowed_tables:
+        - users
+        - products
+      select_limit: 100

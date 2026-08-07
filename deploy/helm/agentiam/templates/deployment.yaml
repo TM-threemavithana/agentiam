@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "agentiam.fullname" . }}
+  labels:
+    app: {{ include "agentiam.name" . }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ include "agentiam.name" . }}
+  template:
+    metadata:
+      labels:
+        app: {{ include "agentiam.name" . }}
+    spec:
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: postgres
+              containerPort: 5432
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          env:
+            - name: AGENTIAM_LISTEN_PORT
+              value: "5432"
+            - name: AGENTIAM_METRICS_PORT
+              value: "9090"
+            - name: AGENTIAM_UPSTREAM_DSN
+              value: {{ .Values.agentiam.upstreamDSN | quote }}
+            - name: AGENTIAM_POLICY_FILE
+              value: "/etc/agentiam/policies.yaml"
+            - name: AGENTIAM_POOL_SIZE
+              value: {{ .Values.agentiam.poolSize | quote }}
+            - name: AGENTIAM_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "agentiam.fullname" . }}-secret
+                  key: admin-token
+          volumeMounts:
+            - name: policies-volume
+              mountPath: /etc/agentiam
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: policies-volume
+          configMap:
+            name: {{ include "agentiam.fullname" . }}-policies
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "agentiam.fullname" . }}-secret
+type: Opaque
+stringData:
+  admin-token: {{ .Values.agentiam.adminToken | quote }}

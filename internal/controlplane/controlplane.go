@@ -1,0 +1,410 @@
+package controlplane
+
+import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
+	"io"
+	"log/slog"
+	"net"
+	"sync"
+	"time"
+)
+
+// Server coordinates configuration pushes to connected gateway client nodes.
+type Server struct {
+	addr     string
+	logger   *slog.Logger
+	token    string
+	listener net.Listener
+	mu       sync.Mutex
+	clients  map[net.Conn]*sync.Mutex
+	stopCh   chan struct{}
+}
+
+func NewServer(addr string, logger *slog.Logger, token string) *Server {
+	return &Server{
+		addr:    addr,
+		logger:  logger,
+		token:   token,
+		clients: make(map[net.Conn]*sync.Mutex),
+		stopCh:  make(chan struct{}),
+	}
+}
+
+func (s *Server) Start() error {
+	l, err := net.Listen("tcp", s.addr)
+	if err != nil {
+		return err
+	}
+	s.listener = l
+	s.logger.Info("Control Plane Server listening", "addr", s.addr)
+
+	go func() {
+		ticker := time.NewTicker(20 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.stopCh:
+				return
+			case <-ticker.C:
+				s.BroadcastPing()
+			}
+		}
+	}()
+
+	go func() {
+		for {
+			conn, err := s.listener.Accept()
+			if err != nil {
+				select {
+				case <-s.stopCh:
+					return
+				default:
+					s.logger.Error("Control Plane Server accept error", "error", err)
+					continue
+				}
+			}
+			go func(c net.Conn) {
+				if s.authenticateClient(c) {
+					s.registerClient(c)
+					s.handleClient(c)
+				} else {
+					c.Close()
+				}
+			}(conn)
+		}
+	}()
+	return nil
+}
+
+func (s *Server) registerClient(conn net.Conn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.clients[conn] = &sync.Mutex{}
+	s.logger.Info("Control Plane Client connected", "remote", conn.RemoteAddr().String())
+}
+
+func (s *Server) unregisterClient(conn net.Conn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.clients, conn)
+	conn.Close()
+	s.logger.Info("Control Plane Client disconnected", "remote", conn.RemoteAddr().String())
+}
+
+func (s *Server) authenticateClient(conn net.Conn) bool {
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	clientNonce := make([]byte, 32)
+	if _, err := io.ReadFull(conn, clientNonce); err != nil {
+		s.logger.Error("Control Plane Server failed to read client nonce", "error", err)
+		return false
+	}
+
+	serverNonce := make([]byte, 32)
+	rand.Read(serverNonce)
+
+	h1 := hmac.New(sha256.New, []byte(s.token))
+	h1.Write(clientNonce)
+	serverMAC := h1.Sum(nil)
+
+	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if _, err := conn.Write(serverMAC); err != nil {
+		s.logger.Error("Control Plane Server failed to write server MAC", "error", err)
+		return false
+	}
+	if _, err := conn.Write(serverNonce); err != nil {
+		s.logger.Error("Control Plane Server failed to write server nonce", "error", err)
+		return false
+	}
+
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	clientMAC := make([]byte, 32)
+	if _, err := io.ReadFull(conn, clientMAC); err != nil {
+		s.logger.Error("Control Plane Server failed to read client MAC", "error", err)
+		return false
+	}
+
+	h2 := hmac.New(sha256.New, []byte(s.token))
+	h2.Write(serverNonce)
+	expectedClientMAC := h2.Sum(nil)
+	if !hmac.Equal(clientMAC, expectedClientMAC) {
+		s.logger.Error("Control Plane Server client authentication failed (bad MAC)")
+		return false
+	}
+
+	conn.SetDeadline(time.Time{})
+	return true
+}
+
+func (s *Server) handleClient(conn net.Conn) {
+	defer s.unregisterClient(conn)
+	// We only need to check if the client closes the connection.
+	// Keep-alive checks or read loops can check for EOF.
+	buf := make([]byte, 1)
+	for {
+		_, err := conn.Read(buf)
+		if err != nil {
+			return
+		}
+	}
+}
+
+// BroadcastConfig pushes a new configuration payload to all connected clients.
+func (s *Server) BroadcastConfig(configBytes []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.logger.Info("Broadcasting new config to clients", "count", len(s.clients), "size", len(configBytes))
+	length := uint32(len(configBytes))
+	header := make([]byte, 4)
+	binary.BigEndian.PutUint32(header, length)
+
+	for conn, mu := range s.clients {
+		go func(c net.Conn, cMu *sync.Mutex) {
+			cMu.Lock()
+			defer cMu.Unlock()
+			c.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			_, err := c.Write(header)
+			if err != nil {
+				s.logger.Error("Failed to write header to client", "error", err)
+				s.unregisterClient(c)
+				return
+			}
+			_, err = c.Write(configBytes)
+			if err != nil {
+				s.logger.Error("Failed to write payload to client", "error", err)
+				s.unregisterClient(c)
+				return
+			}
+		}(conn, mu)
+	}
+}
+
+// BroadcastPing sends a 0-length heartbeat to all connected clients.
+func (s *Server) BroadcastPing() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	header := make([]byte, 4)
+	binary.BigEndian.PutUint32(header, 0)
+
+	for conn, mu := range s.clients {
+		go func(c net.Conn, cMu *sync.Mutex) {
+			cMu.Lock()
+			defer cMu.Unlock()
+			c.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			_, err := c.Write(header)
+			if err != nil {
+				s.logger.Error("Failed to write ping to client", "error", err)
+				s.unregisterClient(c)
+			}
+		}(conn, mu)
+	}
+}
+
+func (s *Server) Close() {
+	close(s.stopCh)
+	if s.listener != nil {
+		s.listener.Close()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for conn := range s.clients {
+		conn.Close()
+	}
+}
+
+// Client connects to the control plane and reads configuration stream.
+type Client struct {
+	addr     string
+	logger   *slog.Logger
+	token    string
+	onUpdate func([]byte)
+	stopCh   chan struct{}
+	mu       sync.Mutex
+	conn     net.Conn
+}
+
+func NewClient(addr string, logger *slog.Logger, token string, onUpdate func([]byte)) *Client {
+	return &Client{
+		addr:     addr,
+		logger:   logger,
+		token:    token,
+		onUpdate: onUpdate,
+		stopCh:   make(chan struct{}),
+	}
+}
+
+func (c *Client) Start() {
+	go func() {
+		for {
+			select {
+			case <-c.stopCh:
+				return
+			default:
+			}
+
+			conn, err := net.Dial("tcp", c.addr)
+			if err != nil {
+				c.logger.Error("Control Plane Client failed to connect, retrying in 2s", "addr", c.addr, "error", err)
+				select {
+				case <-c.stopCh:
+					return
+				case <-time.After(2 * time.Second):
+				}
+				continue
+			}
+
+			c.mu.Lock()
+			select {
+			case <-c.stopCh:
+				conn.Close()
+				c.mu.Unlock()
+				return
+			default:
+				c.conn = conn
+			}
+			c.mu.Unlock()
+
+			// Handshake
+			conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			clientNonce := make([]byte, 32)
+			rand.Read(clientNonce)
+			if _, err := conn.Write(clientNonce); err != nil {
+				c.logger.Error("Control Plane Client failed to write client nonce", "error", err)
+				c.mu.Lock()
+				conn.Close()
+				c.conn = nil
+				c.mu.Unlock()
+				select {
+				case <-c.stopCh:
+					return
+				case <-time.After(2 * time.Second):
+				}
+				continue
+			}
+
+			serverMAC := make([]byte, 32)
+			serverNonce := make([]byte, 32)
+			conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			if _, err := io.ReadFull(conn, serverMAC); err != nil {
+				c.logger.Error("Control Plane Client failed to read server MAC", "error", err)
+				c.mu.Lock()
+				conn.Close()
+				c.conn = nil
+				c.mu.Unlock()
+				select {
+				case <-c.stopCh:
+					return
+				case <-time.After(2 * time.Second):
+				}
+				continue
+			}
+			if _, err := io.ReadFull(conn, serverNonce); err != nil {
+				c.logger.Error("Control Plane Client failed to read server nonce", "error", err)
+				c.mu.Lock()
+				conn.Close()
+				c.conn = nil
+				c.mu.Unlock()
+				select {
+				case <-c.stopCh:
+					return
+				case <-time.After(2 * time.Second):
+				}
+				continue
+			}
+
+			h1 := hmac.New(sha256.New, []byte(c.token))
+			h1.Write(clientNonce)
+			expectedServerMAC := h1.Sum(nil)
+			if !hmac.Equal(serverMAC, expectedServerMAC) {
+				c.logger.Error("Control Plane Client server authentication failed (bad MAC)")
+				c.mu.Lock()
+				conn.Close()
+				c.conn = nil
+				c.mu.Unlock()
+				select {
+				case <-c.stopCh:
+					return
+				case <-time.After(2 * time.Second):
+				}
+				continue
+			}
+
+			h2 := hmac.New(sha256.New, []byte(c.token))
+			h2.Write(serverNonce)
+			clientMAC := h2.Sum(nil)
+
+			conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			if _, err := conn.Write(clientMAC); err != nil {
+				c.logger.Error("Control Plane Client failed to write client MAC", "error", err)
+				c.mu.Lock()
+				conn.Close()
+				c.conn = nil
+				c.mu.Unlock()
+				select {
+				case <-c.stopCh:
+					return
+				case <-time.After(2 * time.Second):
+				}
+				continue
+			}
+
+			conn.SetDeadline(time.Time{})
+
+			c.logger.Info("Control Plane Client connected and authenticated to server", "addr", c.addr)
+			err = c.readStream(conn)
+			if err != nil {
+				c.logger.Error("Control Plane Client stream error", "error", err)
+			}
+
+			c.mu.Lock()
+			conn.Close()
+			c.conn = nil
+			c.mu.Unlock()
+
+			select {
+			case <-c.stopCh:
+				return
+			case <-time.After(2 * time.Second):
+			}
+		}
+	}()
+}
+
+func (c *Client) readStream(conn net.Conn) error {
+	header := make([]byte, 4)
+	for {
+		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		_, err := io.ReadFull(conn, header)
+		if err != nil {
+			return err
+		}
+
+		length := binary.BigEndian.Uint32(header)
+		if length == 0 {
+			// Heartbeat received, resets deadline automatically on next loop
+			continue
+		}
+
+		payload := make([]byte, length)
+		_, err = io.ReadFull(conn, payload)
+		if err != nil {
+			return err
+		}
+
+		c.logger.Info("Control Plane Client received configuration update", "size", length)
+		c.onUpdate(payload)
+	}
+}
+
+func (c *Client) Close() {
+	close(c.stopCh)
+	c.mu.Lock()
+	if c.conn != nil {
+		c.conn.Close()
+	}
+	c.mu.Unlock()
+}
