@@ -82,6 +82,7 @@ func setupTestEnv(t *testing.T) (string, string, func()) {
     key: "%s"
     allowed_statements:
       - "SELECT"
+      - "SET"
 `, string(hash))
 	tmpFile, _ := os.CreateTemp("", "policies-*.yaml")
 	tmpFile.Write([]byte(yamlContent))
@@ -287,6 +288,67 @@ func TestProxyIntegration(t *testing.T) {
 			// If pgx wraps it differently, just ensure it's not nil
 			// But postgres guarantees 57014
 			t.Logf("Query cancelled with error: %v", execErr)
+		}
+	})
+
+	// Test 8: Statement Timeout Protection (Live Queries)
+	t.Run("8_Statement_Timeout_Protection", func(t *testing.T) {
+		conn, err := pgx.Connect(ctx, proxyDSN)
+		if err != nil {
+			t.Fatalf("failed to connect via proxy: %v", err)
+		}
+		defer conn.Close(ctx)
+
+		// 1. Simple Query / First Acquisition
+		_, err = conn.Exec(ctx, "SET statement_timeout = '1000000ms'")
+		if err == nil {
+			t.Fatal("expected error when setting statement_timeout, got none")
+		}
+
+		// 1b. RESET ALL
+		_, err = conn.Exec(ctx, "RESET ALL")
+		if err == nil {
+			t.Fatal("expected error for RESET ALL, got none")
+		}
+
+		// 1c. set_config function
+		_, err = conn.Exec(ctx, "SELECT set_config('statement_timeout', '10000', false)")
+		if err == nil {
+			t.Fatal("expected error for set_config bypass, got none")
+		}
+
+		// 2. Reuse of existing connection
+		// Execute a valid SET to ensure connection works and is reused
+		_, err = conn.Exec(ctx, "SET TimeZone = 'UTC'")
+		if err != nil {
+			t.Fatalf("valid SET failed: %v", err)
+		}
+
+		// Try to set timeout again
+		_, err = conn.Exec(ctx, "SET statement_timeout TO 1000")
+		if err == nil {
+			t.Fatal("expected error when setting statement_timeout on reused connection, got none")
+		}
+
+		// 3. Prepared Statement bypass attempt
+		_, err = conn.Prepare(ctx, "set_timeout", "SET statement_timeout = '1000000ms'")
+		if err == nil {
+			t.Fatal("expected error when preparing statement_timeout set, got none")
+		}
+		
+		// 4. Force transaction pool reacquisition to ensure statement_timeout isn't in sessionVars
+		// but TimeZone is.
+		conn.Close(ctx)
+		
+		conn2, err := pgx.Connect(ctx, proxyDSN)
+		if err != nil {
+			t.Fatalf("failed to reconnect: %v", err)
+		}
+		defer conn2.Close(ctx)
+		
+		_, err = conn2.Exec(ctx, "SELECT 1")
+		if err != nil {
+			t.Fatalf("SELECT failed after reconnect: %v", err)
 		}
 	})
 

@@ -378,10 +378,13 @@ func (s *Session) getOrAcquireUpstream(ctx context.Context, clientWriteCh chan p
 		timeout = 5000 // default fallback
 	}
 	
-	// Prepare state replay queries
 	stateQueries := make([]string, 0, len(s.sessionVars)+1)
 	stateQueries = append(stateQueries, fmt.Sprintf("SET statement_timeout = '%dms'", timeout))
 	for k, v := range s.sessionVars {
+		// Prevent attackers from overriding security timeouts
+		if strings.EqualFold(k, "statement_timeout") {
+			continue 
+		}
 		stateQueries = append(stateQueries, fmt.Sprintf("SET %s = %s", k, v))
 	}
 
