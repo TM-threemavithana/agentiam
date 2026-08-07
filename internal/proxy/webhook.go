@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -78,12 +79,23 @@ func (d *WebhookDispatcher) worker() {
 			continue
 		}
 
-		resp, err := d.client.Post(d.url, "application/json", bytes.NewBuffer(payload))
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		req, err := http.NewRequestWithContext(ctx, "POST", d.url, bytes.NewBuffer(payload))
+		if err != nil {
+			d.logger.Error("Failed to create webhook request", "error", err)
+			cancel()
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := d.client.Do(req)
 		if err != nil {
 			d.logger.Error("Failed to send audit webhook", "error", err, "url", d.url)
+			cancel()
 			continue
 		}
 		resp.Body.Close()
+		cancel()
 
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			d.logger.Error("Audit webhook returned non-200 status", "status", resp.StatusCode)
