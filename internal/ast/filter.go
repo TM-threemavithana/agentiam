@@ -368,6 +368,12 @@ func enforceRules(node *pg_query.Node, rules Rules, depth int, limitParams *[]in
 		// Always allow BEGIN/COMMIT/ROLLBACK as PgBouncer handles them and connection pooling relies on it.
 		return nil
 	case *pg_query.Node_VariableSetStmt:
+		if n.VariableSetStmt.Kind == pg_query.VariableSetKind_VAR_RESET_ALL {
+			return fmt.Errorf("RESET ALL is not allowed by policy")
+		}
+		if strings.EqualFold(n.VariableSetStmt.Name, "statement_timeout") {
+			return fmt.Errorf("overriding statement_timeout is not allowed by policy")
+		}
 		if !isAllowed("SET", rules.AllowedStatements) {
 			return fmt.Errorf("SET statements are not allowed by policy")
 		}
@@ -382,6 +388,22 @@ func enforceRules(node *pg_query.Node, rules Rules, depth int, limitParams *[]in
 		for _, fn := range n.FuncCall.Funcname {
 			if strNode, ok := fn.Node.(*pg_query.Node_String_); ok {
 				fnName := strNode.String_.Sval
+
+				if strings.EqualFold(fnName, "set_config") {
+					if len(n.FuncCall.Args) > 0 {
+						arg0 := n.FuncCall.Args[0]
+						if aconst, ok := arg0.Node.(*pg_query.Node_AConst); ok {
+							if sval, ok := aconst.AConst.Val.(*pg_query.A_Const_Sval); ok {
+								if strings.EqualFold(sval.Sval.Sval, "statement_timeout") {
+									return fmt.Errorf("overriding statement_timeout via set_config is not allowed by policy")
+								}
+							}
+						} else if _, ok := arg0.Node.(*pg_query.Node_ParamRef); ok {
+							return fmt.Errorf("dynamic configuration of parameters via set_config with bind variables is not allowed by policy")
+						}
+					}
+				}
+
 				for _, blocked := range rules.BlockedFunctions {
 					if strings.EqualFold(fnName, blocked) {
 						return fmt.Errorf("function '%s' is not allowed by policy", fnName)
