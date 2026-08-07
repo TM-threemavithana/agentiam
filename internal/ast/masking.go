@@ -81,26 +81,39 @@ func walkNode(node *pg_query.Node, scope *Scope) error {
 	case *pg_query.Node_SelectStmt:
 		sel := n.SelectStmt
 
-		// Handle UNION/INTERSECT/EXCEPT
-		if sel.Op != pg_query.SetOperation_SETOP_NONE {
-			if sel.Larg != nil {
-				if err := walkNode(&pg_query.Node{Node: &pg_query.Node_SelectStmt{SelectStmt: sel.Larg}}, scope); err != nil {
-					return err
-				}
-			}
-			if sel.Rarg != nil {
-				if err := walkNode(&pg_query.Node{Node: &pg_query.Node_SelectStmt{SelectStmt: sel.Rarg}}, scope); err != nil {
-					return err
-				}
-			}
-			return nil
-		}
-
 		// New scope for this SELECT
 		subScope := &Scope{
 			Tables:        make(map[string]string),
 			Parent:        scope,
 			MaskedColumns: scope.MaskedColumns,
+		}
+
+		// Process WITH clause before SetOperations so CTEs are available to the union arms
+		if sel.WithClause != nil {
+			for _, cteNode := range sel.WithClause.Ctes {
+				cte, ok := cteNode.Node.(*pg_query.Node_CommonTableExpr)
+				if !ok {
+					continue
+				}
+				if err := walkNode(cte.CommonTableExpr.Ctequery, subScope); err != nil {
+					return err
+				}
+			}
+		}
+
+		// Handle UNION/INTERSECT/EXCEPT
+		if sel.Op != pg_query.SetOperation_SETOP_NONE {
+			if sel.Larg != nil {
+				if err := walkNode(&pg_query.Node{Node: &pg_query.Node_SelectStmt{SelectStmt: sel.Larg}}, subScope); err != nil {
+					return err
+				}
+			}
+			if sel.Rarg != nil {
+				if err := walkNode(&pg_query.Node{Node: &pg_query.Node_SelectStmt{SelectStmt: sel.Rarg}}, subScope); err != nil {
+					return err
+				}
+			}
+			return nil
 		}
 
 		// 1. Process FROM clause
@@ -110,24 +123,7 @@ func walkNode(node *pg_query.Node, scope *Scope) error {
 			}
 		}
 
-		// 2. Process WITH clause
-		if sel.WithClause != nil {
-			for _, cteNode := range sel.WithClause.Ctes {
-				cte, ok := cteNode.Node.(*pg_query.Node_CommonTableExpr)
-				if !ok {
-					continue
-				}
-				// The CTE query creates a new scope. Wait, for simplicity, we just check if it contains masked tables.
-				if err := walkNode(cte.CommonTableExpr.Ctequery, subScope); err != nil {
-					return err
-				}
-				// We map the CTE name to any table it queries, but full semantic analysis would extract the actual table.
-				// For the bypass suite, we just map CTE name to the CTE name itself, and if it queried a masked table, we should inherit it.
-				// Actually, if the CTE queries a masked table, ANY selection from the CTE is suspect.
-				// A shortcut: if the inner CTE query touched a masked table, we mark the CTE alias as a masked table with ALL columns restricted.
-				// But we just walk it.
-			}
-		}
+
 
 		// 3. Process Target List (SELECT clause)
 		for _, targetNode := range sel.TargetList {
@@ -172,6 +168,21 @@ func walkNode(node *pg_query.Node, scope *Scope) error {
 			}
 			subScope.Tables[alias] = relName
 		}
+		for _, targetNode := range n.UpdateStmt.TargetList {
+			if err := processTarget(targetNode, subScope); err != nil {
+				return err
+			}
+		}
+		for _, fromClause := range n.UpdateStmt.FromClause {
+			if err := processFromClause(fromClause, subScope); err != nil {
+				return err
+			}
+		}
+		if n.UpdateStmt.WhereClause != nil {
+			if err := processExpr(n.UpdateStmt.WhereClause, subScope); err != nil {
+				return err
+			}
+		}
 		for _, targetNode := range n.UpdateStmt.ReturningList {
 			if err := processTarget(targetNode, subScope); err != nil {
 				return err
@@ -191,6 +202,23 @@ func walkNode(node *pg_query.Node, scope *Scope) error {
 				alias = n.InsertStmt.Relation.Alias.Aliasname
 			}
 			subScope.Tables[alias] = relName
+		}
+		if n.InsertStmt.SelectStmt != nil {
+			if err := walkNode(n.InsertStmt.SelectStmt, subScope); err != nil {
+				return err
+			}
+		}
+		if n.InsertStmt.OnConflictClause != nil {
+			if n.InsertStmt.OnConflictClause.WhereClause != nil {
+				if err := processExpr(n.InsertStmt.OnConflictClause.WhereClause, subScope); err != nil {
+					return err
+				}
+			}
+			for _, targetNode := range n.InsertStmt.OnConflictClause.TargetList {
+				if err := processTarget(targetNode, subScope); err != nil {
+					return err
+				}
+			}
 		}
 		for _, targetNode := range n.InsertStmt.ReturningList {
 			if err := processTarget(targetNode, subScope); err != nil {
@@ -317,6 +345,18 @@ func processExpr(expr *pg_query.Node, scope *Scope) error {
 	case *pg_query.Node_AStar:
 		if scope.hasMaskedTable() {
 			return fmt.Errorf("implicit row expansion (SELECT *) is blocked in strict mode when querying masked tables")
+		}
+
+	case *pg_query.Node_SubLink:
+		if n.SubLink.Subselect != nil {
+			if err := walkNode(n.SubLink.Subselect, scope); err != nil {
+				return err
+			}
+		}
+		if n.SubLink.Testexpr != nil {
+			if err := processExpr(n.SubLink.Testexpr, scope); err != nil {
+				return err
+			}
 		}
 
 	case *pg_query.Node_AConst, *pg_query.Node_ParamRef:

@@ -106,7 +106,11 @@ func main() {
 
 	handlers := make(map[proxy.ProtocolType]proxy.ProtocolHandler)
 	webhookUrl := os.Getenv("AGENTIAM_WEBHOOK_URL")
-	webhook := proxy.NewWebhookDispatcher(webhookUrl, logger.Logger)
+	webhook, err := proxy.NewWebhookDispatcher(webhookUrl, logger.Logger)
+	if err != nil {
+		logger.Error("Failed to initialize webhook dispatcher", "error", err)
+		os.Exit(1)
+	}
 
 	uiFS, err := agentiam.GetUIFS()
 	if err != nil {

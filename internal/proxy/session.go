@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
@@ -231,7 +232,6 @@ func (s *Session) Run() error {
 			cert := state.PeerCertificates[0]
 			if cert.Subject.CommonName == clientID {
 				mtlsVerified = true
-				suppliedPassword = "mTLS_VERIFIED"
 			} else {
 				s.logger.Error("mTLS CN mismatch", "cn", cert.Subject.CommonName, "clientID", clientID)
 			}
@@ -264,14 +264,28 @@ func (s *Session) Run() error {
 			clientFirstBare := string(saslInitial.Data)
 			clientFirstBare = strings.TrimPrefix(clientFirstBare, "n,,")
 
+			var clientNonce string
+			for _, part := range strings.Split(clientFirstBare, ",") {
+				if strings.HasPrefix(part, "r=") {
+					clientNonce = part[2:]
+					break
+				}
+			}
+			if clientNonce == "" {
+				return fmt.Errorf("missing client nonce in SCRAM authentication")
+			}
+
 			iters, salt, storedKey, serverKey, err := ParseSCRAMSecret(agentKey)
 			if err != nil {
 				return err
 			}
 
-			serverNonce := "r=Oye230"
+			nonceBytes := make([]byte, 18)
+			rand.Read(nonceBytes)
+			serverNonce := clientNonce + base64.StdEncoding.EncodeToString(nonceBytes)
+
 			saltStr := base64.StdEncoding.EncodeToString(salt)
-			serverFirst := fmt.Sprintf("%s,s=%s,i=%d", clientFirstBare[2:]+serverNonce, saltStr, iters)
+			serverFirst := fmt.Sprintf("r=%s,s=%s,i=%d", serverNonce, saltStr, iters)
 			s.clientBackend.Send(&pgproto3.AuthenticationSASLContinue{Data: []byte(serverFirst)})
 
 			s.clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -301,7 +315,7 @@ func (s *Session) Run() error {
 			}
 
 			s.clientBackend.Send(&pgproto3.AuthenticationSASLFinal{Data: []byte("v=" + serverSignature)})
-			suppliedPassword = "SCRAM_VERIFIED"
+			mtlsVerified = true // Re-use mtlsVerified to signify pre-verified auth (SCRAM)
 		} else {
 			s.clientBackend.Send(&pgproto3.AuthenticationCleartextPassword{})
 			s.clientBackend.SetAuthType(pgproto3.AuthTypeCleartextPassword)
@@ -321,7 +335,7 @@ func (s *Session) Run() error {
 		}
 	}
 
-	rules, authVersion, err := s.store.GetRulesForAgent(clientID, suppliedPassword)
+	rules, authVersion, err := s.store.GetRulesForAgent(clientID, suppliedPassword, mtlsVerified)
 	if err != nil {
 		s.clientBackend.Send(&pgproto3.ErrorResponse{Severity: "FATAL", Message: "Password authentication failed"})
 		return fmt.Errorf("password auth failed")

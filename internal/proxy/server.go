@@ -377,8 +377,12 @@ func (s *Server) handleCancelRequest(conn net.Conn, msg *pgproto3.CancelRequest)
 	s.mu.RUnlock()
 
 	if ok {
-		s.logger.Info("Routing CancelRequest", "virtual_pid", msg.ProcessID)
-		session.CancelQuery()
+		if session.virtualSec == msg.SecretKey {
+			s.logger.Info("Routing CancelRequest", "virtual_pid", msg.ProcessID)
+			session.CancelQuery()
+		} else {
+			s.logger.Error("CancelRequest rejected: invalid SecretKey", "pid", msg.ProcessID)
+		}
 	} else {
 		s.logger.Error("CancelRequest for unknown Virtual PID", "pid", msg.ProcessID)
 	}

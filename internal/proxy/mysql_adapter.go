@@ -53,6 +53,14 @@ func (h *MySQLProtocolHandler) Close() error {
 func (h *MySQLProtocolHandler) HandleSession(ctx context.Context, clientConn net.Conn) error {
 	h.logger.Info("MySQL connection accepted", "remote_addr", clientConn.RemoteAddr().String())
 
+	// Initialize the MySQL Proxy handler if not already initialized
+	if h.pool == nil {
+		if err := h.InitPool(); err != nil {
+			h.logger.Error("Failed to initialize MySQL upstream pool", "error", err)
+			return fmt.Errorf("upstream unavailable: %w", err)
+		}
+	}
+
 	proxyHandler := &AgentIAMMySQLHandler{
 		pool:   h.pool,
 		logger: h.logger,
@@ -71,11 +79,6 @@ func (h *MySQLProtocolHandler) HandleSession(ctx context.Context, clientConn net
 		tlsCfg = h.server.tlsConfig
 	}
 	serverConf := server.NewServer("8.0.11", 255, "mysql_clear_password", nil, tlsCfg)
-
-	// Initialize the MySQL Proxy handler
-	if h.pool == nil {
-		_ = h.InitPool()
-	}
 
 	conn, err := serverConf.NewCustomizedConn(clientConn, authHandler, proxyHandler)
 	if err != nil {
@@ -119,7 +122,7 @@ func (a *AgentIAMAuthHandler) Authenticate(c *server.Conn, authPluginName string
 				cert := state.PeerCertificates[0]
 				if cert.Subject.CommonName == clientID {
 					mtlsVerified = true
-					suppliedPassword = "mTLS_VERIFIED"
+					suppliedPassword = ""
 				} else {
 					a.logger.Error("MySQL mTLS CN mismatch", "cn", cert.Subject.CommonName, "clientID", clientID)
 				}
@@ -146,7 +149,7 @@ func (a *AgentIAMAuthHandler) Authenticate(c *server.Conn, authPluginName string
 		}
 	}
 
-	rules, _, err := a.store.GetRulesForAgent(clientID, suppliedPassword)
+	rules, _, err := a.store.GetRulesForAgent(clientID, suppliedPassword, mtlsVerified)
 	if err != nil {
 		a.logger.Error("MySQL Authentication failed", "user", clientID, "error", err)
 		return fmt.Errorf("invalid Agent Credentials: %w", err)

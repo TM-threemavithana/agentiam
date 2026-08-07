@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -30,6 +31,8 @@ type MySQLPool struct {
 	logger               *Logger
 	conns                chan *MySQLUpstreamConn
 	ready                atomic.Bool
+	closed               atomic.Bool
+	closeOnce            sync.Once
 	avgAcquireDurationNs atomic.Int64
 }
 
@@ -118,6 +121,13 @@ func (p *MySQLPool) Acquire(ctx context.Context) (*MySQLUpstreamConn, error) {
 }
 
 func (p *MySQLPool) Release(u *MySQLUpstreamConn) {
+	if u == nil {
+		return
+	}
+	if p.closed.Load() {
+		u.Close()
+		return
+	}
 	u.InUse.Store(false)
 
 	if !u.Broken.Load() && u.Conn != nil {
@@ -137,8 +147,19 @@ func (p *MySQLPool) Release(u *MySQLUpstreamConn) {
 }
 
 func (p *MySQLPool) Close() {
-	close(p.conns)
-	for u := range p.conns {
-		u.Close()
-	}
+	p.closeOnce.Do(func() {
+		p.closed.Store(true)
+		p.ready.Store(false)
+		
+		for {
+			select {
+			case u := <-p.conns:
+				if u != nil {
+					u.Close()
+				}
+			default:
+				return
+			}
+		}
+	})
 }

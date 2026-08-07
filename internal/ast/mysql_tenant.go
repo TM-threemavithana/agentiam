@@ -47,7 +47,7 @@ func (v *mysqlTenantVisitor) Enter(in ast.Node) (ast.Node, bool) {
 		// 1. SELECTs and JOINs (TableSource wrapping TableName)
 		if tblName, ok := node.Source.(*ast.TableName); ok {
 			if !isSharedTable(tblName.Name.O, v.rule.SharedTables) {
-				subSQL := fmt.Sprintf("SELECT * FROM %s WHERE %s = '%s'", tblName.Name.O, v.rule.TenantColumn, v.rule.TenantID)
+				subSQL := fmt.Sprintf("SELECT * FROM %s WHERE %s = 'dummy'", tblName.Name.O, v.rule.TenantColumn)
 				pr := parser.New()
 				stmtNodes, _, err := pr.Parse(subSQL, "", "")
 				if err != nil {
@@ -55,6 +55,13 @@ func (v *mysqlTenantVisitor) Enter(in ast.Node) (ast.Node, bool) {
 					return in, true
 				}
 				subSelect := stmtNodes[0].(*ast.SelectStmt)
+
+				if binOp, ok := subSelect.Where.(*ast.BinaryOperationExpr); ok {
+					if valExpr, ok := binOp.R.(ast.ValueExpr); ok {
+						valExpr.SetValue(v.rule.TenantID)
+					}
+				}
+
 				// Prevent infinite recursion on the injected subquery
 				v.injected[subSelect] = true
 				v.injected[subSelect.From] = true
@@ -120,16 +127,30 @@ func (v *mysqlTenantVisitor) Leave(in ast.Node) (ast.Node, bool) {
 	return in, true
 }
 
-func appendTenantConditionMySQL(where ast.ExprNode, rule *TenantIsolationRule) ast.ExprNode {
-	tenantCondStr := fmt.Sprintf("%s = '%s'", rule.TenantColumn, rule.TenantID)
+func buildTenantConditionMySQL(rule *TenantIsolationRule) ast.ExprNode {
+	tenantCondStr := fmt.Sprintf("%s = 'dummy'", rule.TenantColumn)
 	pr := parser.New()
 	// Parse a dummy select to extract the WHERE condition
 	stmtNodes, _, err := pr.Parse(fmt.Sprintf("SELECT 1 WHERE %s", tenantCondStr), "", "")
 	if err != nil {
-		return where
+		return nil
 	}
 	sel := stmtNodes[0].(*ast.SelectStmt)
 	newCond := sel.Where
+
+	if binOp, ok := newCond.(*ast.BinaryOperationExpr); ok {
+		if valExpr, ok := binOp.R.(ast.ValueExpr); ok {
+			valExpr.SetValue(rule.TenantID)
+		}
+	}
+	return newCond
+}
+
+func appendTenantConditionMySQL(where ast.ExprNode, rule *TenantIsolationRule) ast.ExprNode {
+	newCond := buildTenantConditionMySQL(rule)
+	if newCond == nil {
+		return where
+	}
 
 	if where == nil {
 		return newCond

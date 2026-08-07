@@ -19,7 +19,7 @@ type Server struct {
 	token    string
 	listener net.Listener
 	mu       sync.Mutex
-	clients  map[net.Conn]struct{}
+	clients  map[net.Conn]*sync.Mutex
 	stopCh   chan struct{}
 }
 
@@ -28,7 +28,7 @@ func NewServer(addr string, logger *slog.Logger, token string) *Server {
 		addr:    addr,
 		logger:  logger,
 		token:   token,
-		clients: make(map[net.Conn]struct{}),
+		clients: make(map[net.Conn]*sync.Mutex),
 		stopCh:  make(chan struct{}),
 	}
 }
@@ -82,7 +82,7 @@ func (s *Server) Start() error {
 func (s *Server) registerClient(conn net.Conn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.clients[conn] = struct{}{}
+	s.clients[conn] = &sync.Mutex{}
 	s.logger.Info("Control Plane Client connected", "remote", conn.RemoteAddr().String())
 }
 
@@ -96,19 +96,41 @@ func (s *Server) unregisterClient(conn net.Conn) {
 
 func (s *Server) authenticateClient(conn net.Conn) bool {
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	nonce := make([]byte, 32)
-	if _, err := io.ReadFull(conn, nonce); err != nil {
-		s.logger.Error("Control Plane Server failed to read nonce", "error", err)
+	clientNonce := make([]byte, 32)
+	if _, err := io.ReadFull(conn, clientNonce); err != nil {
+		s.logger.Error("Control Plane Server failed to read client nonce", "error", err)
 		return false
 	}
 
-	h := hmac.New(sha256.New, []byte(s.token))
-	h.Write(nonce)
-	expectedMAC := h.Sum(nil)
+	serverNonce := make([]byte, 32)
+	rand.Read(serverNonce)
+
+	h1 := hmac.New(sha256.New, []byte(s.token))
+	h1.Write(clientNonce)
+	serverMAC := h1.Sum(nil)
 
 	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	if _, err := conn.Write(expectedMAC); err != nil {
-		s.logger.Error("Control Plane Server failed to write MAC", "error", err)
+	if _, err := conn.Write(serverMAC); err != nil {
+		s.logger.Error("Control Plane Server failed to write server MAC", "error", err)
+		return false
+	}
+	if _, err := conn.Write(serverNonce); err != nil {
+		s.logger.Error("Control Plane Server failed to write server nonce", "error", err)
+		return false
+	}
+
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	clientMAC := make([]byte, 32)
+	if _, err := io.ReadFull(conn, clientMAC); err != nil {
+		s.logger.Error("Control Plane Server failed to read client MAC", "error", err)
+		return false
+	}
+
+	h2 := hmac.New(sha256.New, []byte(s.token))
+	h2.Write(serverNonce)
+	expectedClientMAC := h2.Sum(nil)
+	if !hmac.Equal(clientMAC, expectedClientMAC) {
+		s.logger.Error("Control Plane Server client authentication failed (bad MAC)")
 		return false
 	}
 
@@ -139,8 +161,10 @@ func (s *Server) BroadcastConfig(configBytes []byte) {
 	header := make([]byte, 4)
 	binary.BigEndian.PutUint32(header, length)
 
-	for conn := range s.clients {
-		go func(c net.Conn) {
+	for conn, mu := range s.clients {
+		go func(c net.Conn, cMu *sync.Mutex) {
+			cMu.Lock()
+			defer cMu.Unlock()
 			c.SetWriteDeadline(time.Now().Add(5 * time.Second))
 			_, err := c.Write(header)
 			if err != nil {
@@ -154,7 +178,7 @@ func (s *Server) BroadcastConfig(configBytes []byte) {
 				s.unregisterClient(c)
 				return
 			}
-		}(conn)
+		}(conn, mu)
 	}
 }
 
@@ -166,15 +190,17 @@ func (s *Server) BroadcastPing() {
 	header := make([]byte, 4)
 	binary.BigEndian.PutUint32(header, 0)
 
-	for conn := range s.clients {
-		go func(c net.Conn) {
+	for conn, mu := range s.clients {
+		go func(c net.Conn, cMu *sync.Mutex) {
+			cMu.Lock()
+			defer cMu.Unlock()
 			c.SetWriteDeadline(time.Now().Add(5 * time.Second))
 			_, err := c.Write(header)
 			if err != nil {
 				s.logger.Error("Failed to write ping to client", "error", err)
 				s.unregisterClient(c)
 			}
-		}(conn)
+		}(conn, mu)
 	}
 }
 
@@ -244,10 +270,10 @@ func (c *Client) Start() {
 
 			// Handshake
 			conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			nonce := make([]byte, 32)
-			rand.Read(nonce)
-			if _, err := conn.Write(nonce); err != nil {
-				c.logger.Error("Control Plane Client failed to write nonce", "error", err)
+			clientNonce := make([]byte, 32)
+			rand.Read(clientNonce)
+			if _, err := conn.Write(clientNonce); err != nil {
+				c.logger.Error("Control Plane Client failed to write client nonce", "error", err)
 				c.mu.Lock()
 				conn.Close()
 				c.conn = nil
@@ -260,10 +286,24 @@ func (c *Client) Start() {
 				continue
 			}
 
-			mac := make([]byte, 32)
+			serverMAC := make([]byte, 32)
+			serverNonce := make([]byte, 32)
 			conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-			if _, err := io.ReadFull(conn, mac); err != nil {
-				c.logger.Error("Control Plane Client failed to read MAC", "error", err)
+			if _, err := io.ReadFull(conn, serverMAC); err != nil {
+				c.logger.Error("Control Plane Client failed to read server MAC", "error", err)
+				c.mu.Lock()
+				conn.Close()
+				c.conn = nil
+				c.mu.Unlock()
+				select {
+				case <-c.stopCh:
+					return
+				case <-time.After(2 * time.Second):
+				}
+				continue
+			}
+			if _, err := io.ReadFull(conn, serverNonce); err != nil {
+				c.logger.Error("Control Plane Client failed to read server nonce", "error", err)
 				c.mu.Lock()
 				conn.Close()
 				c.conn = nil
@@ -276,11 +316,30 @@ func (c *Client) Start() {
 				continue
 			}
 
-			h := hmac.New(sha256.New, []byte(c.token))
-			h.Write(nonce)
-			expectedMAC := h.Sum(nil)
-			if !hmac.Equal(mac, expectedMAC) {
-				c.logger.Error("Control Plane Client authentication failed (bad MAC)")
+			h1 := hmac.New(sha256.New, []byte(c.token))
+			h1.Write(clientNonce)
+			expectedServerMAC := h1.Sum(nil)
+			if !hmac.Equal(serverMAC, expectedServerMAC) {
+				c.logger.Error("Control Plane Client server authentication failed (bad MAC)")
+				c.mu.Lock()
+				conn.Close()
+				c.conn = nil
+				c.mu.Unlock()
+				select {
+				case <-c.stopCh:
+					return
+				case <-time.After(2 * time.Second):
+				}
+				continue
+			}
+
+			h2 := hmac.New(sha256.New, []byte(c.token))
+			h2.Write(serverNonce)
+			clientMAC := h2.Sum(nil)
+
+			conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			if _, err := conn.Write(clientMAC); err != nil {
+				c.logger.Error("Control Plane Client failed to write client MAC", "error", err)
 				c.mu.Lock()
 				conn.Close()
 				c.conn = nil

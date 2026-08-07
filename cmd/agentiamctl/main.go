@@ -40,10 +40,12 @@ func savePolicies(py *policy.PoliciesYAML) error {
 	return os.WriteFile(policyFile, b, 0644)
 }
 
-func generateSecureKey() string {
-	b := make([]byte, 16)
-	rand.Read(b)
-	return "sk-" + hex.EncodeToString(b)
+func generateSecureKey() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("failed to generate secure key: %w", err)
+	}
+	return "sk-" + hex.EncodeToString(b), nil
 }
 
 func main() {
@@ -78,7 +80,10 @@ func main() {
 				}
 			}
 
-			plaintextKey := generateSecureKey()
+			plaintextKey, err := generateSecureKey()
+			if err != nil {
+				return err
+			}
 			hash, err := bcrypt.GenerateFromPassword([]byte(plaintextKey), bcrypt.DefaultCost)
 			if err != nil {
 				return err

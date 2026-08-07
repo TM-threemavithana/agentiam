@@ -180,7 +180,7 @@ func (s *Store) loadPolicies() error {
 	var py PoliciesYAML
 
 	// Try remote IAM API first if configured
-	if len(py.Agents) == 0 && s.apiUrl != "" {
+	if s.apiUrl != "" {
 		req, err := http.NewRequestWithContext(context.Background(), "GET", s.apiUrl, nil)
 		if err != nil {
 			return fmt.Errorf("failed to create request: %w", err)
@@ -194,14 +194,14 @@ func (s *Store) loadPolicies() error {
 				if err := json.Unmarshal(body, &py); err != nil {
 					// fallback to yaml
 					if err := yaml.Unmarshal(body, &py); err != nil {
-						s.logger.Error("Failed to decode remote policies", "error", err)
+						return fmt.Errorf("failed to decode remote policies: %w", err)
 					}
 				}
 			} else {
-				s.logger.Error("Remote IAM returned non-200", "status", resp.StatusCode)
+				return fmt.Errorf("remote IAM returned non-200: %d", resp.StatusCode)
 			}
 		} else {
-			s.logger.Error("Failed to fetch from IAM API", "error", err)
+			return fmt.Errorf("failed to fetch from IAM API: %w", err)
 		}
 	}
 
@@ -279,9 +279,9 @@ func (s *Store) Watch(ctx context.Context) {
 	}
 }
 
-func (s *Store) GetRulesForAgent(clientID string, suppliedPassword string) (ast.Rules, int, error) {
+func (s *Store) GetRulesForAgent(clientID string, suppliedPassword string, preVerified bool) (ast.Rules, int, error) {
 	var start time.Time
-	isPasswordAuth := suppliedPassword != "SCRAM_VERIFIED" && suppliedPassword != "mTLS_VERIFIED"
+	isPasswordAuth := !preVerified
 	if isPasswordAuth {
 		start = time.Now()
 	}
@@ -299,7 +299,7 @@ func (s *Store) GetRulesForAgent(clientID string, suppliedPassword string) (ast.
 	if !exists {
 		bcrypt.CompareHashAndPassword(s.dummyHash, []byte(suppliedPassword)) // mitigates timing oracle
 		err = fmt.Errorf("invalid client ID or password")
-	} else if suppliedPassword == "SCRAM_VERIFIED" || suppliedPassword == "mTLS_VERIFIED" {
+	} else if preVerified {
 		// Fast path: pre-verified by mTLS or SCRAM handshake
 		rules = agentConfigToRules(state.config)
 		version = state.version

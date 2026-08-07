@@ -62,7 +62,7 @@ func (h *HTTPInterceptor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rules, _, err := h.store.GetRulesForAgent(agentID, password)
+	rules, _, err := h.store.GetRulesForAgent(agentID, password, false)
 	if err != nil {
 		h.logger.Warn("Failed HTTP auth", "agent", agentID, "error", err)
 		http.Error(w, "Unauthorized: Invalid credentials", http.StatusUnauthorized)

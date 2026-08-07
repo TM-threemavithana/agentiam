@@ -18,7 +18,7 @@ func TestStore_TimingOracleProtection(t *testing.T) {
 
 	// 1. Password authentication for non-existent client (timing attack target)
 	start := time.Now()
-	_, _, err := store.GetRulesForAgent("non-existent", "wrong-password")
+	_, _, err := store.GetRulesForAgent("non-existent", "wrong-password", false)
 	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatal("expected error, got nil")
@@ -29,7 +29,7 @@ func TestStore_TimingOracleProtection(t *testing.T) {
 
 	// 2. Password authentication for existing client with wrong password
 	start = time.Now()
-	_, _, err = store.GetRulesForAgent("test-agent", "wrong-password")
+	_, _, err = store.GetRulesForAgent("test-agent", "wrong-password", false)
 	elapsed = time.Since(start)
 	if err == nil {
 		t.Fatal("expected error, got nil")
@@ -40,7 +40,7 @@ func TestStore_TimingOracleProtection(t *testing.T) {
 
 	// 3. mTLS verification (should be fast/immediate)
 	start = time.Now()
-	_, _, err = store.GetRulesForAgent("test-agent", "mTLS_VERIFIED")
+	_, _, err = store.GetRulesForAgent("test-agent", "", true)
 	elapsed = time.Since(start)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

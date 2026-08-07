@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -35,6 +36,8 @@ type Pool struct {
 	logger               *Logger
 	conns                chan *UpstreamConn
 	ready                atomic.Bool
+	closed               atomic.Bool
+	closeOnce            sync.Once
 	avgAcquireDurationNs atomic.Int64
 }
 
@@ -152,6 +155,10 @@ func (p *Pool) Release(u *UpstreamConn) {
 	if u == nil {
 		return
 	}
+	if p.closed.Load() {
+		u.Close()
+		return
+	}
 	u.InUse.Store(false)
 	u.SwallowParseComplete.Store(0)
 	u.SwallowSetTimeout.Store(0)
@@ -194,14 +201,29 @@ func (p *Pool) Release(u *UpstreamConn) {
 				break
 			}
 		}
+		if p.closed.Load() {
+			u.Close()
+			return
+		}
 		p.conns <- u
 		PoolIdleConnections.Inc()
 	}()
 }
 
 func (p *Pool) Close() {
-	close(p.conns)
-	for u := range p.conns {
-		u.Close()
-	}
+	p.closeOnce.Do(func() {
+		p.closed.Store(true)
+		p.ready.Store(false)
+		
+		for {
+			select {
+			case u := <-p.conns:
+				if u != nil {
+					u.Close()
+				}
+			default:
+				return
+			}
+		}
+	})
 }

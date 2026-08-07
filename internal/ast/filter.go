@@ -2,6 +2,9 @@ package ast
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"strings"
@@ -20,6 +23,12 @@ var ErrComplexityExceeded = fmt.Errorf("Policy Violation: Maximum AST complexity
 
 type PostgresParser struct{}
 
+func policyFingerprint(rules Rules) string {
+	b, _ := json.Marshal(rules)
+	hash := sha256.Sum256(b)
+	return hex.EncodeToString(hash[:])
+}
+
 // ApplyRules parses the SQL into an AST, checks it against the rules, injects limits, and returns the rewritten SQL.
 func (p *PostgresParser) ApplyRules(sql string, rules Rules, astCache cache.ASTCache) (string, []int, error) {
 	_, span := otel.Tracer("agentiam/ast").Start(context.Background(), "ApplyRules")
@@ -30,12 +39,12 @@ func (p *PostgresParser) ApplyRules(sql string, rules Rules, astCache cache.ASTC
 		ParsingDuration.Observe(time.Since(start).Seconds())
 	}()
 
-	cacheKey := fmt.Sprintf("%d:%s", rules.EnforceSelectLimit, sql)
+	cacheKey := fmt.Sprintf("%s:%s", policyFingerprint(rules), sql)
 	if astCache != nil {
 		if cached, ok := astCache.Get(cacheKey); ok {
 			AstCacheHitsTotal.Inc()
 			span.SetAttributes(attribute.Bool("cache.hit", true))
-			return cached, nil, nil // Cache does not store limitParams currently, but they shouldn't hit cache often if parameterized. TODO: cache limitparams
+			return cached.SQL, cached.LimitParams, nil
 		}
 	}
 	AstCacheMissesTotal.Inc()
@@ -90,7 +99,10 @@ func (p *PostgresParser) ApplyRules(sql string, rules Rules, astCache cache.ASTC
 	}
 
 	if astCache != nil && isCacheable(sql) {
-		astCache.Add(cacheKey, deparsed)
+		astCache.Add(cacheKey, cache.CachedAST{
+			SQL:         deparsed,
+			LimitParams: limitParams,
+		})
 	}
 	return deparsed, limitParams, nil
 }

@@ -1,6 +1,6 @@
 import unittest
 import os
-from unittest.mock import patch, Mock
+from unittest.mock import patch, Mock, AsyncMock
 import asyncio
 from agentiam.client import AgentIAMClient, AsyncAgentIAMClient
 
@@ -39,7 +39,7 @@ class TestAgentIAMClient(unittest.TestCase):
         expected = "postgresql+psycopg2://test_agent:super_secret_password@127.0.0.1:5435/my_db"
         self.assertEqual(conn_str, expected)
         
-    @patch('httpx.AsyncClient.post')
+    @patch('httpx.AsyncClient.post', new_callable=AsyncMock)
     def test_async_generate_credentials(self, mock_post):
         mock_response = Mock()
         mock_response.json.return_value = {

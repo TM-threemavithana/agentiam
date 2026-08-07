@@ -3,8 +3,10 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -24,13 +26,18 @@ type WebhookDispatcher struct {
 	logger  *slog.Logger
 }
 
-func NewWebhookDispatcher(url string, logger *slog.Logger) *WebhookDispatcher {
-	if url == "" {
-		return nil
+func NewWebhookDispatcher(webhookURL string, logger *slog.Logger) (*WebhookDispatcher, error) {
+	if webhookURL == "" {
+		return nil, nil
+	}
+
+	u, err := url.Parse(webhookURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return nil, fmt.Errorf("invalid webhook URL format: must be http or https with a host")
 	}
 
 	d := &WebhookDispatcher{
-		url:     url,
+		url:     webhookURL,
 		eventCh: make(chan AuditEvent, 10000), // Buffer to absorb spikes
 		client: &http.Client{
 			Timeout: 3 * time.Second, // Fast timeout for SIEM
@@ -43,7 +50,7 @@ func NewWebhookDispatcher(url string, logger *slog.Logger) *WebhookDispatcher {
 		go d.worker()
 	}
 
-	return d
+	return d, nil
 }
 
 func (d *WebhookDispatcher) Dispatch(event AuditEvent) {

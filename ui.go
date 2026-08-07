@@ -6,7 +6,7 @@ import (
 	"net/http"
 )
 
-//go:embed web/dist/*
+//go:embed all:web/dist
 var webDist embed.FS
 
 // GetUIFS returns the embedded filesystem for the React UI.
