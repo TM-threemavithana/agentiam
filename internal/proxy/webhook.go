@@ -90,7 +90,7 @@ func (d *WebhookDispatcher) worker() {
 
 		resp, err := d.client.Do(req)
 		if err != nil {
-			d.logger.Error("Failed to send audit webhook", "error", err, "url", d.url)
+			d.logger.Error("Failed to send audit webhook", "error", err)
 			cancel()
 			continue
 		}
