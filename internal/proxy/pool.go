@@ -74,9 +74,13 @@ type Pool struct {
 	ready                atomic.Bool
 	closed               atomic.Bool
 	closeOnce            sync.Once
+	closeMu              sync.RWMutex
 	avgAcquireDurationNs atomic.Int64
 	activeCount          atomic.Int32
 	cleaningCount        atomic.Int32
+	redialingCount       atomic.Int32
+	healthyIdleCount     atomic.Int32
+	brokenCount          atomic.Int32
 
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -95,6 +99,19 @@ func NewPool(dsn string, size int, logger *Logger) *Pool {
 	}
 }
 
+// tryAddWorker atomically checks if the pool is accepting new workers and calls workersWg.Add(1).
+// It returns false if the pool is closed or shutting down.
+func (p *Pool) tryAddWorker() bool {
+	p.closeMu.RLock()
+	defer p.closeMu.RUnlock()
+
+	if p.closed.Load() {
+		return false
+	}
+	p.workersWg.Add(1)
+	return true
+}
+
 func (p *Pool) IsReady() bool {
 	return p.ready.Load()
 }
@@ -107,7 +124,25 @@ func (p *Pool) GetCleaningCount() int {
 	return int(p.cleaningCount.Load())
 }
 
+func (p *Pool) GetRedialingCount() int {
+	return int(p.redialingCount.Load())
+}
+
+func (p *Pool) GetBrokenCount() int {
+	return int(p.brokenCount.Load())
+}
+
+func (p *Pool) GetHealthyIdleCount() int {
+	return int(p.healthyIdleCount.Load())
+}
+
+// GetIdleCount returns the number of healthy, sanitized idle connections ready for lease.
 func (p *Pool) GetIdleCount() int {
+	return int(p.healthyIdleCount.Load())
+}
+
+// GetChannelLen returns the total number of items currently buffered in the connection channel (healthy + broken placeholders).
+func (p *Pool) GetChannelLen() int {
 	if p == nil || p.conns == nil {
 		return 0
 	}
@@ -126,13 +161,15 @@ func (p *Pool) Init(ctx context.Context) error {
 		u.InUse.Store(false)
 		u.state.Store(int32(ConnStateIdle))
 		p.conns <- u
+		p.healthyIdleCount.Add(1)
 		if i == 0 {
 			p.ready.Store(true)
 		}
 	}
 	p.logger.Info("Upstream connection pool initialized", "size", p.size)
 	PoolTotalConnections.Set(float64(p.size))
-	PoolIdleConnections.Set(float64(p.size))
+	PoolIdleConnections.Set(float64(p.healthyIdleCount.Load()))
+	PoolBrokenConnections.Set(0)
 	return nil
 }
 
@@ -203,6 +240,13 @@ func (p *Pool) Acquire(ctx context.Context) (*UpstreamConn, error) {
 	case conn, ok := <-p.conns:
 		if !ok || p.closed.Load() {
 			if conn != nil {
+				if conn.Conn != nil && !conn.Broken.Load() && conn.State() == ConnStateIdle {
+					p.healthyIdleCount.Add(-1)
+					PoolIdleConnections.Set(float64(p.healthyIdleCount.Load()))
+				} else {
+					p.brokenCount.Add(-1)
+					PoolBrokenConnections.Set(float64(p.brokenCount.Load()))
+				}
 				conn.Close()
 				conn.state.Store(int32(ConnStateClosed))
 			}
@@ -213,7 +257,6 @@ func (p *Pool) Acquire(ctx context.Context) (*UpstreamConn, error) {
 
 	duration := time.Since(start)
 	p.updateAvgAcquireDuration(duration)
-	PoolIdleConnections.Dec()
 
 	if u == nil {
 		u = &UpstreamConn{}
@@ -222,11 +265,16 @@ func (p *Pool) Acquire(ctx context.Context) (*UpstreamConn, error) {
 
 	// If connection was marked broken or is a synthetic broken stub: redial
 	if u.Broken.Load() || u.Conn == nil {
+		p.brokenCount.Add(-1)
+		PoolBrokenConnections.Set(float64(p.brokenCount.Load()))
+
 		u.Close()
 		u.InUse.Store(false)
 		u.state.Store(int32(ConnStateClosed))
 
+		p.redialingCount.Add(1)
 		newU, err := p.dial(ctx)
+		p.redialingCount.Add(-1)
 		if err != nil {
 			// Re-enqueue broken stub so capacity slot is not permanently lost
 			if !p.closed.Load() {
@@ -234,9 +282,16 @@ func (p *Pool) Acquire(ctx context.Context) (*UpstreamConn, error) {
 				broken.Broken.Store(true)
 				broken.state.Store(int32(ConnStateClosed))
 				p.conns <- broken
-				PoolIdleConnections.Inc()
+				p.brokenCount.Add(1)
+				PoolBrokenConnections.Set(float64(p.brokenCount.Load()))
 			}
 			return nil, err
+		}
+
+		if p.closed.Load() {
+			newU.Close()
+			newU.state.Store(int32(ConnStateClosed))
+			return nil, ErrPoolClosed
 		}
 
 		newU.InUse.Store(true)
@@ -244,6 +299,10 @@ func (p *Pool) Acquire(ctx context.Context) (*UpstreamConn, error) {
 		p.activeCount.Add(1)
 		return newU, nil
 	}
+
+	// Healthy connection dequeued
+	p.healthyIdleCount.Add(-1)
+	PoolIdleConnections.Set(float64(p.healthyIdleCount.Load()))
 
 	u.InUse.Store(true)
 	u.state.Store(int32(ConnStateInUse))
@@ -279,9 +338,14 @@ func (p *Pool) Release(u *UpstreamConn) {
 		u.InUse.Store(false)
 		u.state.Store(int32(ConnStateClosed))
 
-		p.workersWg.Add(1)
+		if !p.tryAddWorker() {
+			return
+		}
+		p.redialingCount.Add(1)
+
 		go func() {
 			defer p.workersWg.Done()
+			defer p.redialingCount.Add(-1)
 
 			if p.closed.Load() {
 				return
@@ -300,7 +364,8 @@ func (p *Pool) Release(u *UpstreamConn) {
 				broken.Broken.Store(true)
 				broken.state.Store(int32(ConnStateClosed))
 				p.conns <- broken
-				PoolIdleConnections.Inc()
+				p.brokenCount.Add(1)
+				PoolBrokenConnections.Set(float64(p.brokenCount.Load()))
 				return
 			}
 
@@ -313,14 +378,21 @@ func (p *Pool) Release(u *UpstreamConn) {
 			newU.InUse.Store(false)
 			newU.state.Store(int32(ConnStateIdle))
 			p.conns <- newU
-			PoolIdleConnections.Inc()
+			p.healthyIdleCount.Add(1)
+			PoolIdleConnections.Set(float64(p.healthyIdleCount.Load()))
 		}()
 		return
 	}
 
 	// Healthy connection: sanitize session state via DISCARD ALL
+	if !p.tryAddWorker() {
+		u.Close()
+		u.InUse.Store(false)
+		u.state.Store(int32(ConnStateClosed))
+		return
+	}
+
 	p.cleaningCount.Add(1)
-	p.workersWg.Add(1)
 	go func() {
 		defer p.workersWg.Done()
 		defer p.cleaningCount.Add(-1)
@@ -390,7 +462,8 @@ func (p *Pool) Release(u *UpstreamConn) {
 		u.InUse.Store(false)
 		u.state.Store(int32(ConnStateIdle))
 		p.conns <- u
-		PoolIdleConnections.Inc()
+		p.healthyIdleCount.Add(1)
+		PoolIdleConnections.Set(float64(p.healthyIdleCount.Load()))
 	}()
 }
 
@@ -408,47 +481,65 @@ func (p *Pool) handleCleaningFailure(u *UpstreamConn) {
 	broken.Broken.Store(true)
 	broken.state.Store(int32(ConnStateClosed))
 	p.conns <- broken
-	PoolIdleConnections.Inc()
+	p.brokenCount.Add(1)
+	PoolBrokenConnections.Set(float64(p.brokenCount.Load()))
+}
+
+func (p *Pool) drainConns() {
+	for {
+		select {
+		case u := <-p.conns:
+			if u != nil {
+				if u.Conn != nil && !u.Broken.Load() && u.State() == ConnStateIdle {
+					p.healthyIdleCount.Add(-1)
+				} else {
+					p.brokenCount.Add(-1)
+				}
+				u.Close()
+				u.InUse.Store(false)
+				u.state.Store(int32(ConnStateClosed))
+			}
+		default:
+			h := p.healthyIdleCount.Load()
+			if h < 0 {
+				p.healthyIdleCount.Store(0)
+				h = 0
+			}
+			b := p.brokenCount.Load()
+			if b < 0 {
+				p.brokenCount.Store(0)
+				b = 0
+			}
+			PoolIdleConnections.Set(float64(h))
+			PoolBrokenConnections.Set(float64(b))
+			return
+		}
+	}
 }
 
 func (p *Pool) Close() {
 	p.closeOnce.Do(func() {
+		// 1. Atomically seal worker admission before waiting
+		p.closeMu.Lock()
 		p.closed.Store(true)
 		p.ready.Store(false)
 		if p.cancel != nil {
 			p.cancel()
 		}
+		p.closeMu.Unlock() // Crucial: do not hold closeMu while waiting for workers!
 
-		// Drain currently idle connections
-		for {
-			select {
-			case u := <-p.conns:
-				if u != nil {
-					u.Close()
-					u.InUse.Store(false)
-					u.state.Store(int32(ConnStateClosed))
-				}
-			default:
-				goto drained
-			}
-		}
+		// 2. Drain currently idle connections
+		p.drainConns()
 
-	drained:
-		// Wait for active workers to complete
+		// 3. Wait for all already-admitted workers to complete
 		p.workersWg.Wait()
 
-		// Final drain pass
-		for {
-			select {
-			case u := <-p.conns:
-				if u != nil {
-					u.Close()
-					u.InUse.Store(false)
-					u.state.Store(int32(ConnStateClosed))
-				}
-			default:
-				return
-			}
-		}
+		// 4. Final drain pass for any connections returned by workers right before finishing
+		p.drainConns()
+
+		// 5. Zero out metrics
+		PoolIdleConnections.Set(0)
+		PoolBrokenConnections.Set(0)
+		PoolTotalConnections.Set(0)
 	})
 }

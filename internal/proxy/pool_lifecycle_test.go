@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/tm-threemavithana/agentiam/internal/proxy"
 )
 
@@ -487,5 +488,428 @@ func TestPool_MaintainingUsableCapacityAfterFailures(t *testing.T) {
 
 	if pool.GetIdleCount() != poolSize {
 		t.Errorf("Expected full pool capacity %d, got idle count %d", poolSize, pool.GetIdleCount())
+	}
+}
+
+// TestPool_WorkerAdmission_CloseRaceBarrier uses deterministic synchronization barriers
+// to verify that worker admission and Pool.Close() synchronize cleanly without WaitGroup panic or leaks.
+func TestPool_WorkerAdmission_CloseRaceBarrier(t *testing.T) {
+	for iter := 0; iter < 10; iter++ {
+		l, dsn := mockUpstreamServer(t, nil)
+
+		logger := proxy.NewLogger(io.Discard)
+		const poolSize = 4
+		pool := proxy.NewPool(dsn, poolSize, logger)
+		ctx := context.Background()
+		if err := pool.Init(ctx); err != nil {
+			l.Close()
+			t.Fatalf("iter %d: pool.Init failed: %v", iter, err)
+		}
+
+		// Acquire all connections
+		conns := make([]*proxy.UpstreamConn, poolSize)
+		for i := 0; i < poolSize; i++ {
+			u, err := pool.Acquire(ctx)
+			if err != nil {
+				l.Close()
+				t.Fatalf("iter %d: Acquire %d failed: %v", iter, i, err)
+			}
+			conns[i] = u
+		}
+
+		// Barrier to release and close simultaneously
+		startBarrier := make(chan struct{})
+		var wg sync.WaitGroup
+
+		for _, conn := range conns {
+			c := conn
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-startBarrier
+				pool.Release(c)
+			}()
+		}
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-startBarrier
+			pool.Close()
+		}()
+
+		// Trigger simultaneous release and close
+		close(startBarrier)
+		wg.Wait()
+
+		// Verify pool is closed and cannot acquire
+		_, err := pool.Acquire(ctx)
+		if !errors.Is(err, proxy.ErrPoolClosed) {
+			t.Errorf("iter %d: Expected ErrPoolClosed, got %v", iter, err)
+		}
+
+		l.Close()
+	}
+}
+
+// TestPool_RepeatedRelease_RacingWithShutdown tests repeated concurrent releases racing with Close()
+// to verify that double-release CAS protection and worker admission sealing prevent panics or deadlocks.
+func TestPool_RepeatedRelease_RacingWithShutdown(t *testing.T) {
+	l, dsn := mockUpstreamServer(t, nil)
+	defer l.Close()
+
+	logger := proxy.NewLogger(io.Discard)
+	const poolSize = 5
+	pool := proxy.NewPool(dsn, poolSize, logger)
+	ctx := context.Background()
+	if err := pool.Init(ctx); err != nil {
+		t.Fatalf("pool.Init failed: %v", err)
+	}
+
+	conns := make([]*proxy.UpstreamConn, poolSize)
+	for i := 0; i < poolSize; i++ {
+		u, err := pool.Acquire(ctx)
+		if err != nil {
+			t.Fatalf("Acquire failed: %v", err)
+		}
+		conns[i] = u
+	}
+
+	var wg sync.WaitGroup
+	// Concurrently invoke Release 5 times per connection
+	for _, conn := range conns {
+		for r := 0; r < 5; r++ {
+			c := conn
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				pool.Release(c)
+			}()
+		}
+	}
+
+	// Concurrently close
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		pool.Close()
+	}()
+
+	wg.Wait()
+
+	// Invariant: pool must be closed cleanly
+	_, err := pool.Acquire(ctx)
+	if !errors.Is(err, proxy.ErrPoolClosed) {
+		t.Errorf("Expected ErrPoolClosed after shutdown, got: %v", err)
+	}
+}
+
+// TestPool_ShutdownWhileDiscardAllBlocked verifies that if an upstream connection hangs during DISCARD ALL,
+// Pool.Close() aborts the blocked operation promptly and completes shutdown without hanging for the full 5s timeout.
+func TestPool_ShutdownWhileDiscardAllBlocked(t *testing.T) {
+	// Mock server that deliberately hangs on receiving DISCARD ALL
+	discardReceived := make(chan struct{})
+	l, dsn := mockUpstreamServer(t, func(backend *pgproto3.Backend, c net.Conn) {
+		for {
+			msg, err := backend.Receive()
+			if err != nil {
+				return
+			}
+			if _, ok := msg.(*pgproto3.Query); ok {
+				// Signal that DISCARD ALL was received and deliberately block without sending response
+				select {
+				case <-discardReceived:
+				default:
+					close(discardReceived)
+				}
+				// Hang until socket is closed by client
+				buf := make([]byte, 1)
+				_, _ = c.Read(buf)
+				return
+			}
+		}
+	})
+	defer l.Close()
+
+	logger := proxy.NewLogger(io.Discard)
+	pool := proxy.NewPool(dsn, 1, logger)
+	ctx := context.Background()
+	if err := pool.Init(ctx); err != nil {
+		t.Fatalf("pool.Init failed: %v", err)
+	}
+
+	u, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+
+	// Release starts DISCARD ALL worker
+	pool.Release(u)
+
+	// Wait for worker to send DISCARD ALL and block
+	select {
+	case <-discardReceived:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Timed out waiting for DISCARD ALL to be received by mock server")
+	}
+
+	// Now close the pool; it should cancel pool context and unblock promptly
+	startClose := time.Now()
+	pool.Close()
+	closeDuration := time.Since(startClose)
+
+	if closeDuration > 2*time.Second {
+		t.Errorf("Pool.Close() took %v; expected prompt cancellation well under 2s", closeDuration)
+	}
+
+	_, err = pool.Acquire(ctx)
+	if !errors.Is(err, proxy.ErrPoolClosed) {
+		t.Errorf("Expected ErrPoolClosed, got %v", err)
+	}
+}
+
+func readGaugeValue(g interface{ Write(*dto.Metric) error }) float64 {
+	var m dto.Metric
+	if err := g.Write(&m); err != nil {
+		return 0
+	}
+	if m.Gauge != nil {
+		return m.Gauge.GetValue()
+	}
+	return 0
+}
+
+// TestPool_MetricAccounting_BrokenVsHealthy directly verifies Finding D:
+// 1. Broken placeholder tokens are NEVER counted as healthy idle connections in PoolIdleConnections.
+// 2. PoolBrokenConnections tracks placeholder stubs accurately.
+// 3. Gauges remain balanced during acquire, failure, recovery, and close.
+func TestPool_MetricAccounting_BrokenVsHealthy(t *testing.T) {
+	l, dsn := mockUpstreamServer(t, nil)
+	listenAddr := l.Addr().String()
+
+	logger := proxy.NewLogger(io.Discard)
+	const poolSize = 3
+	pool := proxy.NewPool(dsn, poolSize, logger)
+	ctx := context.Background()
+	if err := pool.Init(ctx); err != nil {
+		l.Close()
+		t.Fatalf("pool.Init failed: %v", err)
+	}
+	defer pool.Close()
+
+	// 1. Initial metrics
+	if pool.GetIdleCount() != 3 {
+		t.Fatalf("Expected healthy idle count 3, got %d", pool.GetIdleCount())
+	}
+	if pool.GetBrokenCount() != 0 {
+		t.Fatalf("Expected broken count 0, got %d", pool.GetBrokenCount())
+	}
+	if idleMetric := readGaugeValue(proxy.PoolIdleConnections); idleMetric != 3 {
+		t.Fatalf("Expected PoolIdleConnections gauge 3, got %v", idleMetric)
+	}
+	if brokenMetric := readGaugeValue(proxy.PoolBrokenConnections); brokenMetric != 0 {
+		t.Fatalf("Expected PoolBrokenConnections gauge 0, got %v", brokenMetric)
+	}
+
+	// 2. Acquire 1 connection
+	u1, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+	if pool.GetIdleCount() != 2 {
+		t.Fatalf("Expected idle count 2 after acquire, got %d", pool.GetIdleCount())
+	}
+	if idleMetric := readGaugeValue(proxy.PoolIdleConnections); idleMetric != 2 {
+		t.Fatalf("Expected PoolIdleConnections gauge 2, got %v", idleMetric)
+	}
+
+	// 3. Mark connection broken and close upstream so background redial fails
+	u1.Broken.Store(true)
+	l.Close()
+
+	pool.Release(u1)
+
+	// Wait for background redial to fail and place broken placeholder into pool
+	for start := time.Now(); time.Since(start) < 2*time.Second; time.Sleep(5 * time.Millisecond) {
+		if pool.GetRedialingCount() == 0 && pool.GetBrokenCount() == 1 {
+			break
+		}
+	}
+
+	// Invariant check: PoolIdleConnections MUST NOT have incremented!
+	if pool.GetIdleCount() != 2 {
+		t.Errorf("Finding D violation: healthy idle count must remain 2, got %d", pool.GetIdleCount())
+	}
+	if idleMetric := readGaugeValue(proxy.PoolIdleConnections); idleMetric != 2 {
+		t.Errorf("Finding D violation: PoolIdleConnections gauge must remain 2, got %v", idleMetric)
+	}
+	if pool.GetBrokenCount() != 1 {
+		t.Errorf("Expected broken count 1, got %d", pool.GetBrokenCount())
+	}
+	if brokenMetric := readGaugeValue(proxy.PoolBrokenConnections); brokenMetric != 1 {
+		t.Errorf("Expected PoolBrokenConnections gauge 1, got %v", brokenMetric)
+	}
+	if pool.GetChannelLen() != 3 {
+		t.Errorf("Expected channel length 3 (2 healthy + 1 broken), got %d", pool.GetChannelLen())
+	}
+
+	// 4. Restart upstream server
+	l2, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		t.Fatalf("Failed restarting mock server on %s: %v", listenAddr, err)
+	}
+	defer l2.Close()
+
+	go func() {
+		for {
+			conn, err := l2.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				backend := pgproto3.NewBackend(c, c)
+				_, _ = backend.ReceiveStartupMessage()
+				backend.Send(&pgproto3.AuthenticationOk{})
+				backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+				_ = backend.Flush()
+
+				for {
+					msg, err := backend.Receive()
+					if err != nil {
+						return
+					}
+					if _, ok := msg.(*pgproto3.Query); ok {
+						backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+						_ = backend.Flush()
+					}
+				}
+			}(conn)
+		}
+	}()
+
+	// 5. Acquire 3 times: 2 healthy immediately, 1 broken slot triggers redial and succeeds
+	c1, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("Acquire 1 failed: %v", err)
+	}
+	c2, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("Acquire 2 failed: %v", err)
+	}
+	c3, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("Acquire 3 (redialed slot) failed: %v", err)
+	}
+
+	if pool.GetBrokenCount() != 0 {
+		t.Errorf("Expected broken count 0 after redial, got %d", pool.GetBrokenCount())
+	}
+	if brokenMetric := readGaugeValue(proxy.PoolBrokenConnections); brokenMetric != 0 {
+		t.Errorf("Expected PoolBrokenConnections 0, got %v", brokenMetric)
+	}
+	if pool.GetActiveCount() != 3 {
+		t.Errorf("Expected active count 3, got %d", pool.GetActiveCount())
+	}
+
+	// 6. Release all three cleanly
+	pool.Release(c1)
+	pool.Release(c2)
+	pool.Release(c3)
+	for start := time.Now(); time.Since(start) < 2*time.Second; time.Sleep(5 * time.Millisecond) {
+		if pool.GetCleaningCount() == 0 && pool.GetIdleCount() == 3 {
+			break
+		}
+	}
+
+	if pool.GetIdleCount() != 3 {
+		t.Errorf("Expected all 3 healthy idle, got %d", pool.GetIdleCount())
+	}
+	if idleMetric := readGaugeValue(proxy.PoolIdleConnections); idleMetric != 3 {
+		t.Errorf("Expected PoolIdleConnections 3, got %v", idleMetric)
+	}
+}
+
+// TestPool_CapacityInvariant_StateTransitions verifies the formal state-based capacity invariant:
+// healthyIdleCount + brokenCount + activeCount + cleaningCount + redialingCount == p.size
+// across all valid lifecycle transitions.
+func TestPool_CapacityInvariant_StateTransitions(t *testing.T) {
+	l, dsn := mockUpstreamServer(t, nil)
+	defer l.Close()
+
+	logger := proxy.NewLogger(io.Discard)
+	const poolSize = 4
+	pool := proxy.NewPool(dsn, poolSize, logger)
+	ctx := context.Background()
+	if err := pool.Init(ctx); err != nil {
+		t.Fatalf("pool.Init failed: %v", err)
+	}
+	defer pool.Close()
+
+	checkInvariant := func(stage string) {
+		h := pool.GetHealthyIdleCount()
+		b := pool.GetBrokenCount()
+		a := pool.GetActiveCount()
+		c := pool.GetCleaningCount()
+		r := pool.GetRedialingCount()
+		sum := h + b + a + c + r
+		if sum != poolSize {
+			t.Errorf("[%s] Invariant violated: healthy(%d) + broken(%d) + active(%d) + cleaning(%d) + redialing(%d) = %d != %d",
+				stage, h, b, a, c, r, sum, poolSize)
+		}
+		if pool.GetChannelLen() != h+b {
+			t.Errorf("[%s] Channel length mismatch: len(conns)=%d != healthy(%d) + broken(%d)",
+				stage, pool.GetChannelLen(), h, b)
+		}
+	}
+
+	checkInvariant("init")
+
+	// Acquire 2
+	u1, _ := pool.Acquire(ctx)
+	u2, _ := pool.Acquire(ctx)
+	checkInvariant("after acquire 2")
+
+	// Acquire remaining 2
+	u3, _ := pool.Acquire(ctx)
+	u4, _ := pool.Acquire(ctx)
+	checkInvariant("after acquire all")
+
+	// Release 1 normally (undergoes cleaning)
+	pool.Release(u1)
+	// Even during cleaning, invariant holds (active - 1, cleaning + 1)
+	checkInvariant("immediately after release u1")
+
+	for start := time.Now(); time.Since(start) < 2*time.Second; time.Sleep(5 * time.Millisecond) {
+		if pool.GetCleaningCount() == 0 {
+			break
+		}
+	}
+	checkInvariant("after u1 cleaning finished")
+
+	// Mark u2 broken and release
+	u2.Broken.Store(true)
+	pool.Release(u2)
+	checkInvariant("immediately after broken release u2")
+
+	for start := time.Now(); time.Since(start) < 2*time.Second; time.Sleep(5 * time.Millisecond) {
+		if pool.GetRedialingCount() == 0 {
+			break
+		}
+	}
+	checkInvariant("after u2 background redial finished")
+
+	// Release u3 and u4
+	pool.Release(u3)
+	pool.Release(u4)
+	for start := time.Now(); time.Since(start) < 2*time.Second; time.Sleep(5 * time.Millisecond) {
+		if pool.GetCleaningCount() == 0 {
+			break
+		}
+	}
+	checkInvariant("all released")
+
+	if pool.GetIdleCount() != poolSize {
+		t.Errorf("Expected full healthy idle count %d, got %d", poolSize, pool.GetIdleCount())
 	}
 }

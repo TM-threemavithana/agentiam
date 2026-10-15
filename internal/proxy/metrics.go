@@ -49,6 +49,13 @@ var (
 		},
 	)
 
+	PoolBrokenConnections = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "agentiam_pool_broken_connections",
+			Help: "Number of broken placeholder stubs currently in the upstream pool awaiting redial.",
+		},
+	)
+
 	WebhookDroppedEventsTotal = prometheus.NewCounter(
 		prometheus.CounterOpts{
 			Name: "agentiam_webhook_dropped_events_total",
@@ -64,5 +71,6 @@ func init() {
 	prometheus.MustRegister(BlockedQueriesTotal)
 	prometheus.MustRegister(PoolIdleConnections)
 	prometheus.MustRegister(PoolTotalConnections)
+	prometheus.MustRegister(PoolBrokenConnections)
 	prometheus.MustRegister(WebhookDroppedEventsTotal)
 }
