@@ -9,7 +9,7 @@ import (
 
 	"github.com/tm-threemavithana/agentiam/internal/ast"
 
-	"github.com/jackc/pgproto3/v2"
+	"github.com/jackc/pgx/v5/pgproto3"
 )
 
 // mockServer provides a dummy UpstreamConn loop
@@ -23,7 +23,7 @@ func (m *mockServer) start(l net.Listener) {
 		}
 		go func(c net.Conn) {
 			defer c.Close()
-			backend := pgproto3.NewBackend(pgproto3.NewChunkReader(c), c)
+			backend := pgproto3.NewBackend(c, c)
 			for {
 				msg, err := backend.Receive()
 				if err != nil {
@@ -34,6 +34,7 @@ func (m *mockServer) start(l net.Listener) {
 				}
 				// Mock a ready for query after everything
 				backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+				_ = backend.Flush()
 			}
 		}(conn)
 	}
@@ -72,7 +73,7 @@ func FuzzProxyLoop(f *testing.F) {
 		session := &Session{
 			server:        server,
 			clientConn:    clientConn,
-			clientBackend: pgproto3.NewBackend(pgproto3.NewChunkReader(clientConn), clientConn),
+			clientBackend: pgproto3.NewBackend(clientConn, clientConn),
 			logger:        logger,
 			rules: ast.Rules{
 				EnforceSelectLimit: 10,

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgproto3/v2"
+	"github.com/jackc/pgx/v5/pgproto3"
 )
 
 // mockUpstream represents a dummy upstream database to test pool dialing.
@@ -24,12 +24,13 @@ func mockUpstream(t *testing.T, listenAddr string) net.Listener {
 				return
 			}
 			go func(c net.Conn) {
-				backend := pgproto3.NewBackend(pgproto3.NewChunkReader(c), c)
+				backend := pgproto3.NewBackend(c, c)
 				// Consume startup message
 				_, _ = backend.ReceiveStartupMessage()
 				// Send AuthenticationOk and ReadyForQuery
-				_ = backend.Send(&pgproto3.AuthenticationOk{})
-				_ = backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+				backend.Send(&pgproto3.AuthenticationOk{})
+				backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+				_ = backend.Flush()
 				// Wait for DISCARD ALL or close
 				_, _ = backend.Receive()
 				c.Close()
@@ -43,10 +44,10 @@ func TestPool_DialFailureRecovery(t *testing.T) {
 	// Start a mock upstream server
 	l := mockUpstream(t, "127.0.0.1:0")
 	dsn := "postgres://user:pass@" + l.Addr().String() + "/db?sslmode=disable"
-	
+
 	logger := NewLogger(io.Discard)
 	pool := NewPool(dsn, 2, logger)
-	
+
 	ctx := context.Background()
 	if err := pool.Init(ctx); err != nil {
 		t.Fatalf("Failed to initialize pool: %v", err)
@@ -69,7 +70,7 @@ func TestPool_DialFailureRecovery(t *testing.T) {
 
 	// 4. Release it. The pool background worker will try to dial(), fail, and push a Broken dummy connection.
 	pool.Release(u1)
-	
+
 	// Wait a tiny bit for the background redial to execute and fail
 	time.Sleep(100 * time.Millisecond)
 
@@ -115,4 +116,3 @@ func TestPool_ConcurrentMovingAverage(t *testing.T) {
 		t.Errorf("Expected positive average acquire duration, got: %v", finalAvg)
 	}
 }
-

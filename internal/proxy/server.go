@@ -16,7 +16,7 @@ import (
 	"github.com/tm-threemavithana/agentiam/internal/cache"
 	"github.com/tm-threemavithana/agentiam/internal/policy"
 
-	"github.com/jackc/pgproto3/v2"
+	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -344,7 +344,7 @@ func (s *Server) AllocateVirtualPID(session *Session) (uint32, uint32) {
 	defer s.mu.Unlock()
 	s.nextPID++
 	pid := s.nextPID
-	
+
 	// Generate a cryptographically secure random secret
 	var secret uint32
 	b := make([]byte, 4)
@@ -377,7 +377,11 @@ func (s *Server) handleCancelRequest(conn net.Conn, msg *pgproto3.CancelRequest)
 	s.mu.RUnlock()
 
 	if ok {
-		if session.virtualSec == msg.SecretKey {
+		var keyUint uint32
+		if len(msg.SecretKey) >= 4 {
+			keyUint = binary.BigEndian.Uint32(msg.SecretKey)
+		}
+		if session.virtualSec == keyUint {
 			s.logger.Info("Routing CancelRequest", "virtual_pid", msg.ProcessID)
 			session.CancelQuery()
 		} else {

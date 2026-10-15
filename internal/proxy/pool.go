@@ -2,14 +2,15 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/jackc/pgproto3/v2"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgproto3"
 )
 
 type UpstreamConn struct {
@@ -95,9 +96,12 @@ func (p *Pool) dial(ctx context.Context) (*UpstreamConn, error) {
 		secretKeyUint = uint32(hijacked.SecretKey[0])<<24 | uint32(hijacked.SecretKey[1])<<16 | uint32(hijacked.SecretKey[2])<<8 | uint32(hijacked.SecretKey[3])
 	}
 
+	fe := pgproto3.NewFrontend(hijacked.Conn, hijacked.Conn)
+	fe.SetMaxBodyLen(DefaultMaxProtocolBodyLen)
+
 	return &UpstreamConn{
 		Conn:      hijacked.Conn,
-		Frontend:  pgproto3.NewFrontend(pgproto3.NewChunkReader(hijacked.Conn), hijacked.Conn),
+		Frontend:  fe,
 		PID:       hijacked.PID,
 		SecretKey: secretKeyUint,
 	}, nil
@@ -185,10 +189,28 @@ func (p *Pool) Release(u *UpstreamConn) {
 	// Proactively clean the connection state before putting it back in the pool
 	go func() {
 		u.Frontend.Send(&pgproto3.Query{String: "DISCARD ALL"})
+		if err := u.Frontend.Flush(); err != nil {
+			p.logger.Error("Failed to flush DISCARD ALL on release", "error", err)
+			u.Broken.Store(true)
+			u.Close()
+			broken := &UpstreamConn{}
+			broken.Broken.Store(true)
+			p.conns <- broken
+			PoolIdleConnections.Inc()
+			return
+		}
 		for {
 			msg, err := u.Frontend.Receive()
 			if err != nil {
-				p.logger.Error("Failed to DISCARD ALL on release", "error", err)
+				var maxLenErr *pgproto3.ExceededMaxBodyLenErr
+				if errors.As(err, &maxLenErr) {
+					p.logger.Error("DISCARD ALL received message exceeding maximum length limit",
+						"max", maxLenErr.MaxExpectedBodyLen,
+						"actual", maxLenErr.ActualBodyLen,
+					)
+				} else {
+					p.logger.Error("Failed to DISCARD ALL on release", "error", err)
+				}
 				u.Broken.Store(true)
 				u.Close()
 				broken := &UpstreamConn{}
@@ -214,7 +236,7 @@ func (p *Pool) Close() {
 	p.closeOnce.Do(func() {
 		p.closed.Store(true)
 		p.ready.Store(false)
-		
+
 		for {
 			select {
 			case u := <-p.conns:
