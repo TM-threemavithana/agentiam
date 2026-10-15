@@ -162,6 +162,8 @@ agents:
           full_name: "full_name"
           national_id: "national_id"
           tenant_id: "tenant_id"
+        unexposed_columns:
+          - "card_no"
     masked_columns:
       customers:
         - "ssn"
@@ -763,6 +765,149 @@ func TestViewMaskingIntegration(t *testing.T) {
 		}
 		if rowCount != 1 {
 			t.Fatalf("expected exactly 1 row (Alice Smith, tenant-alpha), got: %d", rowCount)
+		}
+	})
+
+	t.Run("Adversarial_WhereSensitivePredicate_BlockedLive", func(t *testing.T) {
+		conn, err := pgx.Connect(ctx, env.proxyDSN)
+		if err != nil {
+			t.Fatalf("failed proxy connect: %v", err)
+		}
+		defer conn.Close(ctx)
+
+		rows, err := conn.Query(ctx, "SELECT id, name FROM customers WHERE ssn = '000-11-2222'")
+		if err == nil {
+			rows.Close()
+			t.Fatalf("expected query with sensitive column in WHERE to be rejected, but succeeded")
+		}
+		if !strings.Contains(err.Error(), "sensitive column 'ssn' cannot be referenced in WHERE clause") {
+			t.Fatalf("expected WHERE clause violation error, got: %v", err)
+		}
+	})
+
+	t.Run("Adversarial_JoinSensitivePredicate_BlockedLive", func(t *testing.T) {
+		conn, err := pgx.Connect(ctx, env.proxyDSN)
+		if err != nil {
+			t.Fatalf("failed proxy connect: %v", err)
+		}
+		defer conn.Close(ctx)
+
+		rows, err := conn.Query(ctx, "SELECT c1.id FROM customers c1 JOIN customers c2 ON c1.ssn = c2.ssn")
+		if err == nil {
+			rows.Close()
+			t.Fatalf("expected query with sensitive column in JOIN ON to be rejected, but succeeded")
+		}
+		if !strings.Contains(err.Error(), "sensitive column 'ssn' cannot be referenced in JOIN ON clause") {
+			t.Fatalf("expected JOIN ON clause violation error, got: %v", err)
+		}
+	})
+
+	t.Run("Adversarial_PreparedStatement_RevokedOnPolicyUpdate", func(t *testing.T) {
+		conn, err := pgx.Connect(ctx, env.proxyDSN)
+		if err != nil {
+			t.Fatalf("failed proxy connect: %v", err)
+		}
+		defer conn.Close(ctx)
+
+		// 1. Initial query succeeds
+		var id int
+		var name string
+		err = conn.QueryRow(ctx, "SELECT id, name FROM customers WHERE id = 1").Scan(&id, &name)
+		if err != nil {
+			t.Fatalf("initial authorized query failed: %v", err)
+		}
+
+		// 2. Revoke policy dynamically
+		revokedPolicy := policy.AgentConfig{
+			AllowedStatements: []string{"SELECT"},
+			AllowedTables:     []string{"orders"}, // customers removed!
+		}
+		env.policyStore.SetAgentPolicy("test-analyst", revokedPolicy)
+
+		// 3. Subsequent query on the same connection MUST be rejected immediately (57P01 or connection closed)
+		err = conn.QueryRow(ctx, "SELECT id, name FROM customers WHERE id = 1").Scan(&id, &name)
+		if err == nil {
+			t.Fatalf("expected query to fail after policy revocation, but succeeded")
+		}
+		errStr := err.Error()
+		if !strings.Contains(errStr, "57P01") && !strings.Contains(errStr, "revoked") && !strings.Contains(errStr, "conn closed") && !strings.Contains(errStr, "EOF") && !strings.Contains(errStr, "closed") {
+			t.Fatalf("expected revocation error (57P01), got: %v", err)
+		}
+	})
+
+	t.Run("Adversarial_ConcurrentSessionsDuringPolicyUpdate", func(t *testing.T) {
+		// Restore allowed policy first
+		validPolicy := policy.AgentConfig{
+			AllowedStatements: []string{"SELECT"},
+			AllowedTables:     []string{"customers", "orders"},
+		}
+		env.policyStore.SetAgentPolicy("test-analyst", validPolicy)
+
+		done := make(chan bool)
+		errCh := make(chan error, 20)
+
+		// Spawn 5 concurrent querying sessions
+		for i := 0; i < 5; i++ {
+			go func() {
+				c, err := pgx.Connect(ctx, env.proxyDSN)
+				if err != nil {
+					// Connection might be refused during dynamic policy changes
+					return
+				}
+				defer c.Close(ctx)
+
+				for {
+					select {
+					case <-done:
+						return
+					default:
+						rows, qErr := c.Query(ctx, "SELECT id, name FROM customers WHERE id = 1")
+						if qErr == nil {
+							rows.Close()
+						}
+						time.Sleep(5 * time.Millisecond)
+					}
+				}
+			}()
+		}
+
+		// Rapidly update policies 5 times concurrently
+		for v := 0; v < 5; v++ {
+			time.Sleep(10 * time.Millisecond)
+			env.policyStore.SetAgentPolicy("test-analyst", policy.AgentConfig{
+				AllowedStatements: []string{"SELECT"},
+				AllowedTables:     []string{"customers", "orders"},
+				SelectLimit:        v + 10,
+			})
+		}
+
+		close(done)
+		select {
+		case err := <-errCh:
+			t.Fatalf("concurrent session error: %v", err)
+		case <-time.After(100 * time.Millisecond):
+		}
+	})
+
+	t.Run("Adversarial_DirectPostgreSQLViewAccess_PrivilegeBoundary", func(t *testing.T) {
+		// Connect directly to PostgreSQL using restricted DB role
+		directConn, err := pgx.Connect(ctx, env.directDSN)
+		if err != nil {
+			t.Fatalf("failed direct postgres connect: %v", err)
+		}
+		defer directConn.Close(ctx)
+
+		// SEC-P2-01 Demonstration: Querying definer view directly in PostgreSQL returns raw sensitive data!
+		row := directConn.QueryRow(ctx, "SELECT ssn FROM customer_public_view WHERE id = 1")
+		var ssn string
+		err = row.Scan(&ssn)
+		if err != nil {
+			t.Fatalf("direct view select failed: %v", err)
+		}
+		if ssn == "987-65-4321" {
+			t.Logf("CONFIRMED SEC-P2-01 / RISK-VIEW-02: Direct database connection bypassed proxy and accessed raw sensitive value '%s' via PostgreSQL definer view. Network isolation of PostgreSQL listener (port 5432) is mandatory.", ssn)
+		} else {
+			t.Fatalf("unexpected raw ssn value: %s", ssn)
 		}
 	})
 }

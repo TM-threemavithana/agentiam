@@ -570,3 +570,229 @@ func TestViewMasking_TenantIsolation_PreservedWithMasking(t *testing.T) {
 		t.Fatalf("expected tenant filter injection, got: %s", rewritten)
 	}
 }
+
+func TestViewMasking_SensitiveColumnInWhere_Rejected(t *testing.T) {
+	rules := Rules{
+		AllowedStatements: []string{"SELECT"},
+		AllowedTables:     []string{"users"},
+		MaskedColumns: map[string][]string{
+			"users": {"ssn"},
+		},
+	}
+	parser := &PostgresParser{}
+
+	queries := []string{
+		"SELECT id FROM users WHERE ssn = '123-45-6789'",
+		"SELECT id FROM users WHERE ssn IS NOT NULL",
+		"SELECT id FROM users WHERE ssn IN ('111', '222')",
+		"SELECT id FROM users WHERE ssn LIKE '123%'",
+		"SELECT id FROM users WHERE length(ssn) > 5",
+	}
+
+	for _, q := range queries {
+		_, _, err := parser.ApplyRules(q, rules, nil)
+		if err == nil {
+			t.Fatalf("expected query '%s' to be rejected due to sensitive column in WHERE, but succeeded", q)
+		}
+		if !strings.Contains(err.Error(), "sensitive column 'ssn' cannot be referenced in WHERE clause") {
+			t.Fatalf("expected specific error for query '%s', got: %v", q, err)
+		}
+	}
+}
+
+func TestViewMasking_SensitiveColumnInJoinOn_Rejected(t *testing.T) {
+	rules := Rules{
+		AllowedStatements: []string{"SELECT"},
+		AllowedTables:     []string{"users", "profiles"},
+		MaskedColumns: map[string][]string{
+			"users": {"ssn"},
+		},
+	}
+	parser := &PostgresParser{}
+
+	queries := []string{
+		"SELECT u.id, p.bio FROM users u JOIN profiles p ON u.ssn = p.ssn_ref",
+		"SELECT u.id, p.bio FROM users u LEFT JOIN profiles p ON u.id = p.user_id AND u.ssn = 'secret'",
+	}
+
+	for _, q := range queries {
+		_, _, err := parser.ApplyRules(q, rules, nil)
+		if err == nil {
+			t.Fatalf("expected query '%s' to be rejected due to sensitive column in JOIN ON, but succeeded", q)
+		}
+		if !strings.Contains(err.Error(), "sensitive column 'ssn' cannot be referenced in JOIN ON clause") {
+			t.Fatalf("expected specific join error for query '%s', got: %v", q, err)
+		}
+	}
+}
+
+func TestViewMasking_SensitiveColumnInGroupByHavingOrderByWindow_Rejected(t *testing.T) {
+	rules := Rules{
+		AllowedStatements: []string{"SELECT"},
+		AllowedTables:     []string{"users"},
+		MaskedColumns: map[string][]string{
+			"users": {"ssn"},
+		},
+	}
+	parser := &PostgresParser{}
+
+	cases := []struct {
+		sql    string
+		clause string
+	}{
+		{"SELECT count(*) FROM users GROUP BY ssn", "GROUP BY clause"},
+		{"SELECT count(*) FROM users GROUP BY id HAVING max(ssn) > '1'", "HAVING clause"},
+		{"SELECT id FROM users ORDER BY ssn DESC", "ORDER BY clause"},
+		{"SELECT id FROM users WINDOW w AS (PARTITION BY ssn)", "WINDOW clause"},
+		{"SELECT id, row_number() OVER (PARTITION BY ssn ORDER BY id) FROM users", "derived SELECT expression"},
+		{"SELECT id, row_number() OVER (ORDER BY ssn) FROM users", "derived SELECT expression"},
+	}
+
+	for _, tc := range cases {
+		_, _, err := parser.ApplyRules(tc.sql, rules, nil)
+		if err == nil {
+			t.Fatalf("expected query '%s' to be rejected, but succeeded", tc.sql)
+		}
+		if !strings.Contains(err.Error(), tc.clause) {
+			t.Fatalf("expected error mentioning '%s' for '%s', got: %v", tc.clause, tc.sql, err)
+		}
+	}
+}
+
+func TestViewMasking_SensitiveColumnInDerivedExpressions_Rejected(t *testing.T) {
+	rules := Rules{
+		AllowedStatements: []string{"SELECT"},
+		AllowedTables:     []string{"users"},
+		MaskedColumns: map[string][]string{
+			"users": {"ssn"},
+		},
+	}
+	parser := &PostgresParser{}
+
+	derivedQueries := []string{
+		"SELECT upper(ssn) FROM users",
+		"SELECT ssn || '-suffix' FROM users",
+		"SELECT ssn::text FROM users",
+		"SELECT CASE WHEN ssn = '123' THEN 'A' ELSE 'B' END FROM users",
+		"SELECT COALESCE(ssn, 'none') FROM users",
+	}
+
+	for _, q := range derivedQueries {
+		_, _, err := parser.ApplyRules(q, rules, nil)
+		if err == nil {
+			t.Fatalf("expected query '%s' to be rejected due to sensitive column in derived expression, but succeeded", q)
+		}
+		if !strings.Contains(err.Error(), "derived SELECT expression") {
+			t.Fatalf("expected derived SELECT expression error for '%s', got: %v", q, err)
+		}
+	}
+}
+
+func TestViewMasking_MultipleMaskedBaseColumns_IncompleteMapping_Rejected(t *testing.T) {
+	rules := Rules{
+		AllowedStatements: []string{"SELECT"},
+		AllowedTables:     []string{"users"},
+		Views: []ViewPolicy{
+			{
+				Name:      "user_partial_view",
+				BaseTable: "users",
+				ColumnMappings: map[string]string{
+					"national_id": "ssn",
+				},
+				// Note: credit_card is NOT mapped and NOT declared in UnexposedColumns
+			},
+		},
+		MaskedColumns: map[string][]string{
+			"users": {"ssn", "credit_card"},
+		},
+	}
+	parser := &PostgresParser{}
+
+	sql := "SELECT id, national_id FROM user_partial_view"
+	_, _, err := parser.ApplyRules(sql, rules, nil)
+	if err == nil {
+		t.Fatalf("expected incomplete view mapping across multiple masked columns to fail closed, but succeeded")
+	}
+	if !strings.Contains(err.Error(), "unmapped sensitive column 'credit_card'") {
+		t.Fatalf("expected error complaining about unmapped sensitive column 'credit_card', got: %v", err)
+	}
+}
+
+func TestViewMasking_MultipleMaskedBaseColumns_WithUnexposedColumns_Allowed(t *testing.T) {
+	rules := Rules{
+		AllowedStatements: []string{"SELECT"},
+		AllowedTables:     []string{"users"},
+		Views: []ViewPolicy{
+			{
+				Name:      "user_audited_view",
+				BaseTable: "users",
+				ColumnMappings: map[string]string{
+					"national_id": "ssn",
+				},
+				UnexposedColumns: []string{"credit_card"},
+			},
+		},
+		MaskedColumns: map[string][]string{
+			"users": {"ssn", "credit_card"},
+		},
+	}
+	parser := &PostgresParser{}
+
+	sql := "SELECT id, national_id FROM user_audited_view"
+	rewritten, _, err := parser.ApplyRules(sql, rules, nil)
+	if err != nil {
+		t.Fatalf("unexpected error with explicit unexposed_columns: %v", err)
+	}
+	if !strings.Contains(rewritten, "'[REDACTED]'") {
+		t.Fatalf("expected national_id to be redacted to '[REDACTED]', got: %s", rewritten)
+	}
+}
+
+func TestViewMasking_AuthorizedQuery_UnaffectedColumns_Passes(t *testing.T) {
+	rules := Rules{
+		AllowedStatements: []string{"SELECT"},
+		AllowedTables:     []string{"users"},
+		MaskedColumns: map[string][]string{
+			"users": {"ssn"},
+		},
+	}
+	parser := &PostgresParser{}
+
+	sql := "SELECT id, name, created_at FROM users WHERE id = 42 ORDER BY name ASC"
+	rewritten, _, err := parser.ApplyRules(sql, rules, nil)
+	if err != nil {
+		t.Fatalf("unexpected error on authorized query: %v", err)
+	}
+	if strings.Contains(rewritten, "'[REDACTED]'") {
+		t.Fatalf("unexpected redaction in query with no sensitive columns: %s", rewritten)
+	}
+	if !strings.Contains(rewritten, "WHERE id = 42") {
+		t.Fatalf("expected WHERE clause to be preserved, got: %s", rewritten)
+	}
+}
+
+func TestViewMasking_SubqueriesAndCTEs_StrictEnforcement(t *testing.T) {
+	rules := Rules{
+		AllowedStatements: []string{"SELECT"},
+		AllowedTables:     []string{"users"},
+		MaskedColumns: map[string][]string{
+			"users": {"ssn"},
+		},
+	}
+	parser := &PostgresParser{}
+
+	// Subquery where outer WHERE filters on sensitive column
+	sq1 := "SELECT * FROM (SELECT ssn FROM users) sub WHERE ssn = '123'"
+	_, _, err := parser.ApplyRules(sq1, rules, nil)
+	if err == nil {
+		t.Fatalf("expected subquery with outer filter on sensitive column to fail closed")
+	}
+
+	// CTE where outer query filters on sensitive column
+	cte1 := "WITH cte AS (SELECT ssn FROM users) SELECT * FROM cte WHERE ssn = '123'"
+	_, _, err = parser.ApplyRules(cte1, rules, nil)
+	if err == nil {
+		t.Fatalf("expected CTE with outer filter on sensitive column to fail closed")
+	}
+}
+

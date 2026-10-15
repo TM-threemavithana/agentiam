@@ -84,7 +84,7 @@ func NewServer(listenAddr, upstreamDSN string, store *policy.Store, tlsConfig *t
 		}
 	}
 
-	return &Server{
+	srv := &Server{
 		listenAddr:     listenAddr,
 		upstreamDSN:    upstreamDSN,
 		store:          store,
@@ -104,6 +104,35 @@ func NewServer(listenAddr, upstreamDSN string, store *policy.Store, tlsConfig *t
 		latencyBuffer:  NewUILatencyRingBuffer(60), // 60 seconds of history
 		uiFS:           uiFS,
 		auditSinks:     auditSinks,
+	}
+
+	if store != nil {
+		store.SetPolicyUpdateHook(func(clientID string) {
+			srv.RevokeSessionsForClient(clientID)
+		})
+	}
+
+	return srv
+}
+
+// RevokeSessionsForClient immediately marks sessions as invalidated and cancels their contexts.
+func (s *Server) RevokeSessionsForClient(clientID string) {
+	s.mu.Lock()
+	sessions, exists := s.activeSessions[clientID]
+	if !exists {
+		s.mu.Unlock()
+		return
+	}
+	var toRevoke []context.CancelFunc
+	for sess, meta := range sessions {
+		sess.invalidated.Store(true)
+		toRevoke = append(toRevoke, meta.cancel)
+	}
+	delete(s.activeSessions, clientID)
+	s.mu.Unlock()
+
+	for _, cancel := range toRevoke {
+		cancel()
 	}
 }
 
@@ -157,8 +186,9 @@ func (s *Server) pollPolicyUpdates() {
 		var toRevoke []context.CancelFunc
 		for clientID, sessions := range s.activeSessions {
 			dbVersion, exists := dbVersions[clientID]
-			for _, meta := range sessions {
+			for sess, meta := range sessions {
 				if !exists || dbVersion != meta.authVersion {
+					sess.invalidated.Store(true)
 					toRevoke = append(toRevoke, meta.cancel)
 				}
 			}

@@ -29,10 +29,12 @@ import (
 )
 
 type ViewConfig struct {
-	Name           string            `yaml:"name" json:"name"`
-	BaseTable      string            `yaml:"base_table" json:"base_table"`
-	ColumnMappings map[string]string `yaml:"column_mappings" json:"column_mappings"`
-	MaskedColumns  []string          `yaml:"masked_columns" json:"masked_columns"`
+	Name                  string            `yaml:"name" json:"name"`
+	BaseTable             string            `yaml:"base_table" json:"base_table"`
+	ColumnMappings        map[string]string `yaml:"column_mappings" json:"column_mappings"`
+	MaskedColumns         []string          `yaml:"masked_columns" json:"masked_columns"`
+	UnexposedColumns      []string          `yaml:"unexposed_columns" json:"unexposed_columns"`
+	DefinitionFingerprint string            `yaml:"definition_fingerprint" json:"definition_fingerprint"`
 }
 
 type AgentConfig struct {
@@ -75,15 +77,17 @@ type agentState struct {
 }
 
 type Store struct {
-	mu            sync.RWMutex
-	agents        map[string]agentState
-	auditSinks    []AuditSinkConfig
-	poolLatencyNs atomic.Int64
-	dummyHash     []byte
-	filePath      string
-	apiUrl        string
-	logger        *slog.Logger
-	httpClient    *http.Client
+	mu               sync.RWMutex
+	agents           map[string]agentState
+	auditSinks       []AuditSinkConfig
+	poolLatencyNs    atomic.Int64
+	dummyHash        []byte
+	filePath         string
+	apiUrl           string
+	logger           *slog.Logger
+	httpClient       *http.Client
+	policyUpdateHook func(clientID string)
+	hookMu           sync.RWMutex
 }
 
 func (s *Store) GetAuditSinks() []AuditSinkConfig {
@@ -121,10 +125,12 @@ func agentConfigToRules(config AgentConfig) ast.Rules {
 	var views []ast.ViewPolicy
 	for _, v := range config.Views {
 		views = append(views, ast.ViewPolicy{
-			Name:           v.Name,
-			BaseTable:      v.BaseTable,
-			ColumnMappings: v.ColumnMappings,
-			MaskedColumns:  v.MaskedColumns,
+			Name:                  v.Name,
+			BaseTable:             v.BaseTable,
+			ColumnMappings:        v.ColumnMappings,
+			MaskedColumns:         v.MaskedColumns,
+			UnexposedColumns:      v.UnexposedColumns,
+			DefinitionFingerprint: v.DefinitionFingerprint,
 		})
 	}
 
@@ -380,6 +386,30 @@ func (s *Store) GetRulesForAgent(clientID string, suppliedPassword string, preVe
 	return rules, version, nil
 }
 
+func (s *Store) SetPolicyUpdateHook(fn func(clientID string)) {
+	s.hookMu.Lock()
+	defer s.hookMu.Unlock()
+	s.policyUpdateHook = fn
+}
+
+func (s *Store) notifyPolicyUpdate(clientID string) {
+	s.hookMu.RLock()
+	fn := s.policyUpdateHook
+	s.hookMu.RUnlock()
+	if fn != nil {
+		fn(clientID)
+	}
+}
+
+func (s *Store) GetAgentVersion(clientID string) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if state, exists := s.agents[clientID]; exists {
+		return state.version
+	}
+	return -1
+}
+
 func (s *Store) GetAgentVersions() (map[string]int, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -393,7 +423,6 @@ func (s *Store) GetAgentVersions() (map[string]int, error) {
 
 func (s *Store) SetAgentPolicy(clientID string, config AgentConfig) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	var limiter *rate.Limiter
 	if config.RateLimitRPM > 0 {
@@ -404,11 +433,19 @@ func (s *Store) SetAgentPolicy(clientID string, config AgentConfig) {
 		limiter = rate.NewLimiter(rate.Limit(float64(config.RateLimitRPM)/60.0), burst)
 	}
 
+	newVersion := 1
+	if old, exists := s.agents[clientID]; exists {
+		newVersion = old.version + 1
+	}
+
 	s.agents[clientID] = agentState{
 		config:  config,
-		version: 1,
+		version: newVersion,
 		limiter: limiter,
 	}
+	s.mu.Unlock()
+
+	s.notifyPolicyUpdate(clientID)
 }
 
 // GetAgentKey returns the stored authentication key material (e.g. SCRAM verifier or bcrypt hash) for the given clientID.

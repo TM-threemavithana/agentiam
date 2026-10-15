@@ -91,6 +91,17 @@
                   "items": {
                     "type": "string"
                   }
+                },
+                "unexposed_columns": {
+                  "type": "array",
+                  "description": "Columns of the base table that are confirmed not exposed by this view",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "definition_fingerprint": {
+                  "type": "string",
+                  "description": "Expected SHA-256 hash or canonical fingerprint of the view definition"
                 }
               },
               "required": ["name"]

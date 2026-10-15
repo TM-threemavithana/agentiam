@@ -3,10 +3,12 @@ package ast
 // ViewPolicy defines an explicitly approved database view, its underlying base table,
 // column mappings, and column masking rules.
 type ViewPolicy struct {
-	Name           string            `yaml:"name" json:"name"`
-	BaseTable      string            `yaml:"base_table" json:"base_table"`
-	ColumnMappings map[string]string `yaml:"column_mappings" json:"column_mappings"` // view_column -> base_column
-	MaskedColumns  []string          `yaml:"masked_columns" json:"masked_columns"`   // explicit view columns to mask
+	Name                  string            `yaml:"name" json:"name"`
+	BaseTable             string            `yaml:"base_table" json:"base_table"`
+	ColumnMappings        map[string]string `yaml:"column_mappings" json:"column_mappings"`               // view_column -> base_column
+	MaskedColumns         []string          `yaml:"masked_columns" json:"masked_columns"`                 // explicit view columns to mask
+	UnexposedColumns      []string          `yaml:"unexposed_columns" json:"unexposed_columns"`           // base table sensitive columns confirmed NOT projected by view
+	DefinitionFingerprint string            `yaml:"definition_fingerprint" json:"definition_fingerprint"` // expected view definition SHA-256 hash or canonical SQL
 }
 
 // Rules defines the AST filtering rules to be applied to an incoming SQL statement.

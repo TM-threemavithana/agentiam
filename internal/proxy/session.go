@@ -131,6 +131,8 @@ type Session struct {
 	clientBackend *pgproto3.Backend
 
 	errorDiscard atomic.Bool
+	invalidated  atomic.Bool
+	authVersion  int
 	rules        ast.Rules
 	tlsConfig    *tls.Config
 	closeOnce    sync.Once
@@ -147,6 +149,20 @@ type Session struct {
 	preparedStatements map[string]PreparedStatement
 	sessionVars        map[string]string
 	clientID           string
+}
+
+func (s *Session) isPolicyRevoked() bool {
+	if s.invalidated.Load() {
+		return true
+	}
+	if s.store != nil && s.clientID != "" {
+		currentVer := s.store.GetAgentVersion(s.clientID)
+		if currentVer != -1 && currentVer != s.authVersion {
+			s.invalidated.Store(true)
+			return true
+		}
+	}
+	return false
 }
 
 func NewSession(clientConn net.Conn, upstreamDSN string, store *policy.Store, tlsConfig *tls.Config, logger *Logger, server *Server, insecureAuth bool) *Session {
@@ -433,6 +449,7 @@ func (s *Session) Run() (err error) {
 		return fmt.Errorf("password auth failed")
 	}
 	s.rules = rules
+	s.authVersion = authVersion
 	s.clientID = clientID
 
 	s.clientBackend.Send(&pgproto3.AuthenticationOk{})
@@ -661,6 +678,19 @@ func (s *Session) handleParseMsg(ctx context.Context, v *pgproto3.Parse, clientW
 	if s.errorDiscard.Load() {
 		return nil
 	}
+	if s.isPolicyRevoked() {
+		s.clientBackend.Send(&pgproto3.ErrorResponse{
+			Severity: "FATAL",
+			Code:     "57P01",
+			Message:  "AgentIAM Policy Violation: active session policy was revoked or updated",
+		})
+		_ = s.clientBackend.Flush()
+		s.errorDiscard.Store(true)
+		if s.cancel != nil {
+			s.cancel()
+		}
+		return fmt.Errorf("session policy revoked")
+	}
 
 	rewrittenSQL, limitParams, err := (&ast.PostgresParser{}).ApplyRules(v.Query, s.rules, s.server.astCache)
 	if err != nil {
@@ -704,6 +734,19 @@ func (s *Session) handleBindMsg(ctx context.Context, v *pgproto3.Bind, clientWri
 
 	if s.errorDiscard.Load() {
 		return nil
+	}
+	if s.isPolicyRevoked() {
+		s.clientBackend.Send(&pgproto3.ErrorResponse{
+			Severity: "FATAL",
+			Code:     "57P01",
+			Message:  "AgentIAM Policy Violation: active session policy was revoked or updated",
+		})
+		_ = s.clientBackend.Flush()
+		s.errorDiscard.Store(true)
+		if s.cancel != nil {
+			s.cancel()
+		}
+		return fmt.Errorf("session policy revoked")
 	}
 	if s.server.pool != nil {
 		s.server.store.SetPoolLatency(s.server.pool.GetAvgAcquireDuration())
@@ -799,6 +842,21 @@ func (s *Session) handleQueryMsg(ctx context.Context, v *pgproto3.Query, clientW
 	s.queryStartTime.Store(time.Now().UnixNano())
 	_, span := Tracer.Start(ctx, "proxy.Query")
 	defer span.End()
+
+	if s.isPolicyRevoked() {
+		s.clientBackend.Send(&pgproto3.ErrorResponse{
+			Severity: "FATAL",
+			Code:     "57P01",
+			Message:  "AgentIAM Policy Violation: active session policy was revoked or updated",
+		})
+		s.clientBackend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+		_ = s.clientBackend.Flush()
+		s.errorDiscard.Store(true)
+		if s.cancel != nil {
+			s.cancel()
+		}
+		return fmt.Errorf("session policy revoked")
+	}
 
 	if s.server.pool != nil {
 		s.server.store.SetPoolLatency(s.server.pool.GetAvgAcquireDuration())
@@ -949,6 +1007,21 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 		default:
 		}
 
+		if _, isTerm := msg.(*pgproto3.Terminate); !isTerm && s.isPolicyRevoked() {
+			s.clientBackend.Send(&pgproto3.ErrorResponse{
+				Severity: "FATAL",
+				Code:     "57P01",
+				Message:  "AgentIAM Policy Violation: active session policy was revoked or updated",
+			})
+			_ = s.clientBackend.Flush()
+			s.errorDiscard.Store(true)
+			if s.cancel != nil {
+				s.cancel()
+			}
+			s.recoverBrokenTransaction()
+			return fmt.Errorf("session policy revoked")
+		}
+
 		switch v := msg.(type) {
 		case *pgproto3.Parse:
 			if err := s.handleParseMsg(ctx, v, clientWriteCh); err != nil {
@@ -965,6 +1038,21 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 			if s.errorDiscard.Load() {
 				span.End()
 				continue
+			}
+			if s.isPolicyRevoked() {
+				span.End()
+				s.clientBackend.Send(&pgproto3.ErrorResponse{
+					Severity: "FATAL",
+					Code:     "57P01",
+					Message:  "AgentIAM Policy Violation: active session policy was revoked or updated",
+				})
+				_ = s.clientBackend.Flush()
+				s.errorDiscard.Store(true)
+				if s.cancel != nil {
+					s.cancel()
+				}
+				s.recoverBrokenTransaction()
+				return fmt.Errorf("session policy revoked")
 			}
 			u, err := s.getOrAcquireUpstream(ctx, clientWriteCh)
 			if err != nil {
@@ -994,6 +1082,21 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 			if s.errorDiscard.Load() {
 				span.End()
 				continue
+			}
+			if s.isPolicyRevoked() {
+				span.End()
+				s.clientBackend.Send(&pgproto3.ErrorResponse{
+					Severity: "FATAL",
+					Code:     "57P01",
+					Message:  "AgentIAM Policy Violation: active session policy was revoked or updated",
+				})
+				_ = s.clientBackend.Flush()
+				s.errorDiscard.Store(true)
+				if s.cancel != nil {
+					s.cancel()
+				}
+				s.recoverBrokenTransaction()
+				return fmt.Errorf("session policy revoked")
 			}
 			u, err := s.getOrAcquireUpstream(ctx, clientWriteCh)
 			if err != nil {

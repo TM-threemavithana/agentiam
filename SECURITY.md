@@ -56,14 +56,15 @@ For most security-critical deployments, this conservative blocking is acceptable
 If an agent is granted `SELECT` access without query timeout enforcement, they can execute `SELECT pg_sleep(10)` or computationally expensive queries to exhaust upstream connection pools.
 **Mitigation:** `AgentConfig.MaxExecutionTimeMs` forces context cancellation on slow queries. Ensure this is configured appropriately for your upstream database tier.
 
-### Data Masking Bypass via Views
-- **Status:** UNRESOLVED (tracked for Medium Term in ROADMAP)
+### Data Masking & View Provenance (Phase 2 Hardening)
+- **Status:** RESOLVED / ENFORCED
+- **Components:** `internal/ast/masking.go`, `internal/policy/store.go`, `internal/proxy/session.go`
 
-Data Masking in AgentIAM operates strictly via AST semantic analysis. Because the proxy does not actively query Postgres internal catalogs to resolve view dependencies, it cannot trace an unrestricted view back to a masked base table.
-
-For example, if the `users` table masks `ssn`, but a DBA creates `CREATE VIEW users_view AS SELECT * FROM users`, an agent querying `SELECT ssn FROM users_view` **will successfully extract the unmasked SSN** because `users_view` is not configured as a masked table in the policy.
-
-**Mitigation:** Do not grant agents access to views or materialized views that wrap masked tables. Use standard Postgres `GRANT/REVOKE` permissions to ensure agents cannot query sensitive views directly.
+View masking operates via AST semantic analysis with strict relation provenance tracking:
+1. **Relation Whitelisting & Provenance:** Views querying masked tables must be explicitly declared in policy with column mappings. Incomplete column mappings on masked tables fail closed.
+2. **Fail-Closed Expression Semantics:** Sensitive columns can only be directly projected for string constant redaction (`'[REDACTED]'`). Any reference inside `WHERE`, `JOIN ON`, `GROUP BY`, `ORDER BY`, `HAVING`, window, or derived expressions (`UPPER()`, concatenations, casts) is strictly rejected before database execution.
+3. **Immediate Revocation:** Prepared statements and active sessions are dynamically revoked (Postgres `57P01`) on policy modification via synchronous notification hooks and version tracking.
+4. **Direct Access Boundary:** For direct connection isolation requirements and deployment constraints, refer to [DEPLOYMENT_SECURITY.md](docs/DEPLOYMENT_SECURITY.md).
 
 ### Warehouse Parser Regex Dialect Translation
 - **Status:** Known Limitation
