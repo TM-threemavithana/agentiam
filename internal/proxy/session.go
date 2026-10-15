@@ -185,14 +185,16 @@ func (s *Session) Run() (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			s.logger.Error("Panic recovered in session lifecycle",
+				"event", "session_worker_panic",
 				"client_id", s.clientID,
 				"addr", s.clientConn.RemoteAddr(),
-				"panic", sanitizePanicValue(r),
+				"panic_type", panicType(r),
+				"panic_summary", safePanicSummary(r),
 				"stack", sanitizedStackTrace(),
 			)
 			s.recoverBrokenTransaction()
 			s.Close()
-			err = fmt.Errorf("session terminated due to unexpected panic: %s", sanitizePanicValue(r))
+			err = fmt.Errorf("session terminated due to unexpected panic (%s)", panicType(r))
 		}
 	}()
 
@@ -202,8 +204,10 @@ func (s *Session) Run() (err error) {
 		defer func() {
 			if r := recover(); r != nil {
 				s.logger.Error("Panic recovered in idle watchdog",
+					"event", "idle_watchdog_panic",
 					"client_id", s.clientID,
-					"panic", sanitizePanicValue(r),
+					"panic_type", panicType(r),
+					"panic_summary", safePanicSummary(r),
 				)
 			}
 		}()
@@ -498,8 +502,10 @@ func (s *Session) getOrAcquireUpstream(ctx context.Context, clientWriteCh chan p
 		defer func() {
 			if r := recover(); r != nil {
 				s.logger.Error("Panic recovered in upstream response reader",
+					"event", "upstream_reader_panic",
 					"client_id", s.clientID,
-					"panic", sanitizePanicValue(r),
+					"panic_type", panicType(r),
+					"panic_summary", safePanicSummary(r),
 					"stack", sanitizedStackTrace(),
 				)
 				u.Broken.Store(true)
@@ -882,8 +888,10 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 		defer func() {
 			if r := recover(); r != nil {
 				s.logger.Error("Panic recovered in client writer goroutine",
+					"event", "client_writer_panic",
 					"client_id", s.clientID,
-					"panic", sanitizePanicValue(r),
+					"panic_type", panicType(r),
+					"panic_summary", safePanicSummary(r),
 					"stack", sanitizedStackTrace(),
 				)
 				s.recoverBrokenTransaction()

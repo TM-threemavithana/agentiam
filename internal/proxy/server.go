@@ -321,8 +321,10 @@ func (s *Server) handleConnection(clientConn net.Conn) {
 	defer func() {
 		if r := recover(); r != nil {
 			s.logger.Error("Panic recovered in client connection handler",
+				"event", "client_connection_panic",
 				"addr", clientConn.RemoteAddr(),
-				"panic", sanitizePanicValue(r),
+				"panic_type", panicType(r),
+				"panic_summary", safePanicSummary(r),
 				"stack", sanitizedStackTrace(),
 			)
 		}

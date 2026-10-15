@@ -352,7 +352,9 @@ func (p *Pool) Release(u *UpstreamConn) {
 			defer func() {
 				if r := recover(); r != nil {
 					p.logger.Error("Panic recovered in background redial worker",
-						"panic", sanitizePanicValue(r),
+						"event", "pool_redial_panic",
+						"panic_type", panicType(r),
+						"panic_summary", safePanicSummary(r),
 						"stack", sanitizedStackTrace(),
 					)
 					if !p.closed.Load() {
@@ -418,7 +420,9 @@ func (p *Pool) Release(u *UpstreamConn) {
 		defer func() {
 			if r := recover(); r != nil {
 				p.logger.Error("Panic recovered in connection cleanup worker",
-					"panic", sanitizePanicValue(r),
+					"event", "pool_cleanup_panic",
+					"panic_type", panicType(r),
+					"panic_summary", safePanicSummary(r),
 					"stack", sanitizedStackTrace(),
 				)
 				p.handleCleaningFailure(u)
@@ -446,7 +450,7 @@ func (p *Pool) Release(u *UpstreamConn) {
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
-					discardDone <- fmt.Errorf("panic in discard receiver: %s", sanitizePanicValue(r))
+					discardDone <- fmt.Errorf("panic in discard receiver (%s)", panicType(r))
 				}
 			}()
 			for {
@@ -501,10 +505,12 @@ func (p *Pool) Release(u *UpstreamConn) {
 }
 
 func (p *Pool) handleCleaningFailure(u *UpstreamConn) {
+	if !u.state.CompareAndSwap(int32(ConnStateCleaning), int32(ConnStateClosed)) {
+		return
+	}
 	u.Broken.Store(true)
 	u.Close()
 	u.InUse.Store(false)
-	u.state.Store(int32(ConnStateClosed))
 
 	if p.closed.Load() {
 		return
