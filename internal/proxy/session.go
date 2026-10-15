@@ -138,6 +138,7 @@ func NewSession(clientConn net.Conn, upstreamDSN string, store *policy.Store, tl
 func (s *Session) CancelQuery() {
 	s.uconnMu.Lock()
 	u := s.uconn
+	s.uconn = nil
 	s.uconnMu.Unlock()
 	if u != nil {
 		u.Broken.Store(true)
