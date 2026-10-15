@@ -318,6 +318,16 @@ func (s *Server) handleConnection(clientConn net.Conn) {
 	defer func() { <-s.sem }()
 	defer clientConn.Close()
 
+	defer func() {
+		if r := recover(); r != nil {
+			s.logger.Error("Panic recovered in client connection handler",
+				"addr", clientConn.RemoteAddr(),
+				"panic", sanitizePanicValue(r),
+				"stack", sanitizedStackTrace(),
+			)
+		}
+	}()
+
 	ptype, sniffedConn, err := SniffProtocol(clientConn, 100*time.Millisecond)
 	if err != nil {
 		s.logger.Error("Failed to sniff protocol", "addr", clientConn.RemoteAddr(), "error", err)

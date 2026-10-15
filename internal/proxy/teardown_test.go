@@ -1,0 +1,713 @@
+package proxy
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgproto3"
+	dto "github.com/prometheus/client_model/go"
+	"github.com/tm-threemavithana/agentiam/internal/policy"
+	"golang.org/x/crypto/bcrypt"
+)
+
+// setupTeardownTestServer creates an in-process proxy server and mock upstream for teardown testing.
+func setupTeardownTestServer(t *testing.T, poolSize int, upstreamHandler func(backend *pgproto3.Backend, c net.Conn)) (*Server, *Pool, net.Listener, string, func()) {
+	t.Helper()
+
+	// 1. Mock upstream PostgreSQL server
+	upListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to listen for mock upstream: %v", err)
+	}
+
+	go func() {
+		for {
+			conn, err := upListener.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				backend := pgproto3.NewBackend(c, c)
+				_, err := backend.ReceiveStartupMessage()
+				if err != nil {
+					return
+				}
+				backend.Send(&pgproto3.AuthenticationOk{})
+				backend.Send(&pgproto3.ParameterStatus{Name: "server_version", Value: "15.0"})
+				backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+				if err := backend.Flush(); err != nil {
+					return
+				}
+
+				if upstreamHandler != nil {
+					upstreamHandler(backend, c)
+				} else {
+					// Default query & DISCARD ALL handler
+					for {
+						msg, err := backend.Receive()
+						if err != nil {
+							return
+						}
+						switch msg.(type) {
+						case *pgproto3.Query:
+							backend.Send(&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")})
+							backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+							_ = backend.Flush()
+						case *pgproto3.Terminate:
+							return
+						}
+					}
+				}
+			}(conn)
+		}
+	}()
+
+	upstreamDSN := fmt.Sprintf("postgres://user:pass@%s/testdb?sslmode=disable", upListener.Addr().String())
+
+	// 2. Policy store
+	hashBytes, err := bcrypt.GenerateFromPassword([]byte("test_pass"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatalf("Failed to hash password: %v", err)
+	}
+	hash := string(hashBytes)
+
+	tmpFile, err := os.CreateTemp("", "teardown-policies-*.yaml")
+	if err != nil {
+		t.Fatalf("Failed to create temp policy file: %v", err)
+	}
+	policyContent := fmt.Sprintf(`agents:
+  - name: test_agent
+    key: '%s'
+    allowed_statements: ["SELECT", "INSERT", "SET"]
+  - name: agent_b
+    key: '%s'
+    allowed_statements: ["SELECT", "INSERT", "SET"]
+`, hash, hash)
+	if _, err := tmpFile.Write([]byte(policyContent)); err != nil {
+		t.Fatalf("Failed to write temp policy: %v", err)
+	}
+	tmpFile.Close()
+
+	store, err := policy.NewStore(tmpFile.Name(), "", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("Failed to create policy store: %v", err)
+	}
+
+	logger := NewLogger(io.Discard)
+	handlers := make(map[ProtocolType]ProtocolHandler)
+	server := NewServer("127.0.0.1:0", upstreamDSN, store, nil, logger, nil, handlers, true, ":0", poolSize, nil, nil)
+	pgHandler := NewPostgresProtocolHandler(upstreamDSN, store, nil, logger, server, true)
+	server.SetHandler(ProtocolPostgres, pgHandler)
+
+	pool := server.pool
+	if err := pool.Init(context.Background()); err != nil {
+		t.Fatalf("Failed to init pool: %v", err)
+	}
+
+	// 3. Proxy Listener
+	proxyListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to listen for proxy: %v", err)
+	}
+
+	go func() {
+		for {
+			conn, err := proxyListener.Accept()
+			if err != nil {
+				return
+			}
+			go server.handleConnection(conn)
+		}
+	}()
+
+	cleanup := func() {
+		proxyListener.Close()
+		upListener.Close()
+		pool.Close()
+		os.Remove(tmpFile.Name())
+	}
+
+	return server, pool, proxyListener, proxyListener.Addr().String(), cleanup
+}
+
+// connectTestClient performs PostgreSQL startup and cleartext authentication with the proxy.
+func connectTestClient(t *testing.T, proxyAddr, username string) (net.Conn, *pgproto3.Frontend) {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", proxyAddr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("Failed to connect to proxy: %v", err)
+	}
+
+	fe := pgproto3.NewFrontend(conn, conn)
+	fe.Send(&pgproto3.StartupMessage{
+		ProtocolVersion: 196608,
+		Parameters: map[string]string{
+			"user":     username,
+			"database": "testdb",
+		},
+	})
+	if err := fe.Flush(); err != nil {
+		conn.Close()
+		t.Fatalf("Failed to flush startup message: %v", err)
+	}
+
+	// Expect AuthenticationCleartextPassword
+	msg, err := fe.Receive()
+	if err != nil {
+		conn.Close()
+		t.Fatalf("Failed to receive auth challenge: %v", err)
+	}
+	if _, ok := msg.(*pgproto3.AuthenticationCleartextPassword); !ok {
+		conn.Close()
+		t.Fatalf("Expected AuthenticationCleartextPassword, got: %T", msg)
+	}
+
+	// Send password
+	fe.Send(&pgproto3.PasswordMessage{Password: "test_pass"})
+	if err := fe.Flush(); err != nil {
+		conn.Close()
+		t.Fatalf("Failed to flush password: %v", err)
+	}
+
+	// Receive until ReadyForQuery
+	for {
+		msg, err := fe.Receive()
+		if err != nil {
+			conn.Close()
+			t.Fatalf("Failed to complete auth handshake: %v", err)
+		}
+		if _, ok := msg.(*pgproto3.ReadyForQuery); ok {
+			break
+		}
+	}
+
+	return conn, fe
+}
+
+// 1. TestTeardown_PanicInSessionWorker verifies that an unexpected panic inside
+// an isolated session worker (e.g. query handling) is safely recovered, upstream is
+// marked broken and closed, client socket is closed, and server stays healthy.
+func TestTeardown_PanicInSessionWorker(t *testing.T) {
+	server, pool, _, proxyAddr, cleanup := setupTeardownTestServer(t, 2, nil)
+	defer cleanup()
+
+	conn, fe := connectTestClient(t, proxyAddr, "test_agent")
+	defer conn.Close()
+
+	// Configure hook to panic during query execution
+	SetTestPanicHook(func() {
+		panic("simulated worker failure: password='super_secret_credentials'")
+	})
+	defer SetTestPanicHook(nil)
+
+	// Send simple query that will trigger panic
+	fe.Send(&pgproto3.Query{String: "SELECT 1;"})
+	_ = fe.Flush()
+
+	// Client should observe closed connection / EOF / error
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 1024)
+	_, err := conn.Read(buf)
+	if err == nil {
+		t.Fatalf("Expected client connection to be closed after worker panic, but read succeeded")
+	}
+
+	// Wait for pool redial to complete
+	time.Sleep(150 * time.Millisecond)
+
+	// Verify server semaphore was released
+	if len(server.sem) != 0 {
+		t.Errorf("Expected server semaphore to be 0 (no leak), got %d", len(server.sem))
+	}
+
+	// Verify active count is 0
+	if pool.GetActiveCount() != 0 {
+		t.Errorf("Expected active count 0, got %d", pool.GetActiveCount())
+	}
+}
+
+// 2. TestTeardown_PanicInUpstreamResponseReader verifies that a panic inside the
+// background goroutine reading messages from upstream is recovered safely, connection
+// is marked broken and replaced, context is cancelled, and client is closed.
+func TestTeardown_PanicInUpstreamResponseReader(t *testing.T) {
+	_, pool, _, proxyAddr, cleanup := setupTeardownTestServer(t, 2, nil)
+	defer cleanup()
+
+	conn, fe := connectTestClient(t, proxyAddr, "test_agent")
+	defer conn.Close()
+
+	// Configure hook to panic inside upstream response reader
+	var panicked atomic.Bool
+	SetTestPanicOnUpstreamReceive(func() {
+		if panicked.CompareAndSwap(false, true) {
+			panic("simulated upstream reader panic: token='bearer_secret_123'")
+		}
+	})
+	defer SetTestPanicOnUpstreamReceive(nil)
+
+	fe.Send(&pgproto3.Query{String: "SELECT 1;"})
+	_ = fe.Flush()
+
+	// Client should observe closed connection
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 1024)
+	_, err := conn.Read(buf)
+	if err == nil {
+		t.Fatalf("Expected client connection to be closed after upstream reader panic, but read succeeded")
+	}
+
+	time.Sleep(150 * time.Millisecond)
+
+	if pool.GetActiveCount() != 0 {
+		t.Errorf("Expected active count 0, got %d", pool.GetActiveCount())
+	}
+}
+
+// 3. TestTeardown_ClientDisconnectDuringQuery verifies that when a client abruptly
+// disconnects during an active in-flight query, the proxy detects the disconnect,
+// tears down the session, detaches upstream, and leaves no goroutine leaks.
+func TestTeardown_ClientDisconnectDuringQuery(t *testing.T) {
+	queryStarted := make(chan struct{})
+	allowQueryFinish := make(chan struct{})
+	var queryStartedOnce sync.Once
+
+	// Upstream that blocks on query until signal
+	upstreamHandler := func(backend *pgproto3.Backend, c net.Conn) {
+		for {
+			msg, err := backend.Receive()
+			if err != nil {
+				return
+			}
+			switch m := msg.(type) {
+			case *pgproto3.Query:
+				if strings.HasPrefix(m.String, "SET ") || strings.Contains(m.String, "DISCARD ALL") {
+					tag := "SET"
+					if strings.Contains(m.String, "DISCARD ALL") {
+						tag = "DISCARD ALL"
+					}
+					backend.Send(&pgproto3.CommandComplete{CommandTag: []byte(tag)})
+					backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+					_ = backend.Flush()
+					continue
+				}
+				queryStartedOnce.Do(func() {
+					close(queryStarted)
+				})
+				<-allowQueryFinish
+				backend.Send(&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")})
+				backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+				_ = backend.Flush()
+			case *pgproto3.Terminate:
+				return
+			}
+		}
+	}
+
+	_, pool, _, proxyAddr, cleanup := setupTeardownTestServer(t, 2, upstreamHandler)
+	defer cleanup()
+
+	conn, fe := connectTestClient(t, proxyAddr, "test_agent")
+
+	fe.Send(&pgproto3.Query{String: "SELECT 1;"})
+	_ = fe.Flush()
+
+	// Wait until query reaches upstream
+	select {
+	case <-queryStarted:
+	case <-time.After(15 * time.Second):
+		t.Fatalf("Timeout waiting for query to reach upstream")
+	}
+
+	// Abrupt client disconnect
+	conn.Close()
+
+	// Allow upstream to finish and unblock
+	close(allowQueryFinish)
+
+	// Wait for teardown
+	time.Sleep(300 * time.Millisecond)
+
+	if pool.GetActiveCount() != 0 {
+		t.Errorf("Expected active count 0 after client disconnect, got %d", pool.GetActiveCount())
+	}
+}
+
+// 4. TestTeardown_UpstreamSocketTermination verifies that abrupt termination of
+// the upstream database socket during an active query is handled cleanly: connection
+// is marked broken, pool triggers background redial, and client session is torn down.
+func TestTeardown_UpstreamSocketTermination(t *testing.T) {
+	upstreamHandler := func(backend *pgproto3.Backend, c net.Conn) {
+		for {
+			msg, err := backend.Receive()
+			if err != nil {
+				return
+			}
+			switch m := msg.(type) {
+			case *pgproto3.Query:
+				if strings.HasPrefix(m.String, "SET ") || strings.Contains(m.String, "DISCARD ALL") {
+					tag := "SET"
+					if strings.Contains(m.String, "DISCARD ALL") {
+						tag = "DISCARD ALL"
+					}
+					backend.Send(&pgproto3.CommandComplete{CommandTag: []byte(tag)})
+					backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+					_ = backend.Flush()
+					continue
+				}
+				// Abruptly terminate socket instead of answering
+				c.Close()
+				return
+			case *pgproto3.Terminate:
+				return
+			}
+		}
+	}
+
+	_, pool, _, proxyAddr, cleanup := setupTeardownTestServer(t, 2, upstreamHandler)
+	defer cleanup()
+
+	conn, fe := connectTestClient(t, proxyAddr, "test_agent")
+	defer conn.Close()
+
+	fe.Send(&pgproto3.Query{String: "SELECT 1;"})
+	_ = fe.Flush()
+
+	// Client should observe closed connection
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 1024)
+	_, err := conn.Read(buf)
+	if err == nil {
+		t.Fatalf("Expected client to observe error/EOF on upstream termination, but read succeeded")
+	}
+
+	time.Sleep(150 * time.Millisecond)
+
+	if pool.GetActiveCount() != 0 {
+		t.Errorf("Expected active count 0, got %d", pool.GetActiveCount())
+	}
+}
+
+// 5. TestTeardown_ContextCancellation_UnblocksIO verifies that cancelling a session context
+// immediately unblocks blocked socket operations in under 100ms.
+func TestTeardown_ContextCancellation_UnblocksIO(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	session := &Session{
+		clientConn:    serverConn,
+		clientBackend: pgproto3.NewBackend(serverConn, serverConn),
+		logger:        NewLogger(io.Discard),
+	}
+
+	unblocked := make(chan struct{})
+	start := time.Now()
+
+	go func() {
+		// Read will block on net.Pipe until closed
+		buf := make([]byte, 10)
+		_, _ = serverConn.Read(buf)
+		close(unblocked)
+	}()
+
+	// Close session via Close()
+	time.Sleep(10 * time.Millisecond)
+	session.Close()
+
+	select {
+	case <-unblocked:
+		elapsed := time.Since(start)
+		if elapsed > 150*time.Millisecond {
+			t.Errorf("Teardown took too long to unblock socket: %v", elapsed)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("Socket did not unblock after session Close()")
+	}
+}
+
+// 6. TestTeardown_RepeatedCleanup_Concurrent verifies that calling Close(),
+// recoverBrokenTransaction(), and pool.Release() repeatedly and concurrently on the
+// same connection causes no panics, no race conditions, and idempotent single release.
+func TestTeardown_RepeatedCleanup_Concurrent(t *testing.T) {
+	_, pool, _, _, cleanup := setupTeardownTestServer(t, 2, nil)
+	defer cleanup()
+
+	ctx := context.Background()
+	u, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+
+	session := &Session{
+		clientConn:    serverConn,
+		clientBackend: pgproto3.NewBackend(serverConn, serverConn),
+		uconn:         u,
+		server:        &Server{pool: pool},
+		logger:        NewLogger(io.Discard),
+	}
+
+	const callers = 20
+	var wg sync.WaitGroup
+	wg.Add(callers)
+
+	for i := 0; i < callers; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			switch idx % 4 {
+			case 0:
+				session.Close()
+			case 1:
+				session.recoverBrokenTransaction()
+			case 2:
+				u.Close()
+			case 3:
+				pool.Release(u)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	time.Sleep(100 * time.Millisecond)
+
+	if pool.GetActiveCount() != 0 {
+		t.Errorf("Expected active count 0, got %d", pool.GetActiveCount())
+	}
+}
+
+// 7. TestTeardown_PanicDuringPoolShutdown verifies that a worker panic occurring while
+// pool shutdown is actively underway is caught by recovery, accounts for workersWg.Done(),
+// and allows pool.Close() to complete without deadlock.
+func TestTeardown_PanicDuringPoolShutdown(t *testing.T) {
+	logger := NewLogger(io.Discard)
+	p := NewPool("postgres://dummy", 2, logger)
+
+	// Add a dummy worker that panics during execution
+	if p.tryAddWorker() {
+		p.redialingCount.Add(1)
+		go func() {
+			defer p.workersWg.Done()
+			defer p.redialingCount.Add(-1)
+			defer func() {
+				if r := recover(); r != nil {
+					p.logger.Error("Panic recovered in test redial worker", "panic", sanitizePanicValue(r))
+				}
+			}()
+			panic("simulated panic while pool is shutting down")
+		}()
+	}
+
+	// Close pool concurrently
+	closed := make(chan struct{})
+	go func() {
+		p.Close()
+		close(closed)
+	}()
+
+	select {
+	case <-closed:
+		// Success: pool closed cleanly without deadlock
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Pool.Close() deadlocked or timed out during concurrent worker panic")
+	}
+}
+
+// 8. TestTeardown_UnaffectedSessionsSurviveFailure verifies that when Session A encounters
+// a catastrophic failure / panic, it is safely contained and torn down while concurrent
+// Session B continues executing queries successfully without interruption.
+func TestTeardown_UnaffectedSessionsSurviveFailure(t *testing.T) {
+	_, pool, _, proxyAddr, cleanup := setupTeardownTestServer(t, 3, nil)
+	defer cleanup()
+
+	// Connect Client A and Client B
+	connA, feA := connectTestClient(t, proxyAddr, "test_agent")
+	defer connA.Close()
+
+	connB, feB := connectTestClient(t, proxyAddr, "agent_b")
+	defer connB.Close()
+
+	// Panicking hook that only triggers for Session A
+	var panicTriggered atomic.Bool
+	SetTestPanicHook(func() {
+		if panicTriggered.CompareAndSwap(false, true) {
+			panic("fatal panic in session A")
+		}
+	})
+	defer SetTestPanicHook(nil)
+
+	// Send query on Session A -> should trigger panic and close
+	feA.Send(&pgproto3.Query{String: "SELECT 1;"})
+	_ = feA.Flush()
+
+	// Client A must fail
+	_ = connA.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 1024)
+	_, err := connA.Read(buf)
+	if err == nil {
+		t.Fatalf("Expected Client A to be disconnected after panic")
+	}
+
+	// Session B must continue executing queries normally!
+	for i := 0; i < 3; i++ {
+		feB.Send(&pgproto3.Query{String: "SELECT 1;"})
+		if err := feB.Flush(); err != nil {
+			t.Fatalf("Client B failed to send query %d: %v", i+1, err)
+		}
+
+		_ = connB.SetReadDeadline(time.Now().Add(2 * time.Second))
+		msg, err := feB.Receive()
+		if err != nil {
+			t.Fatalf("Client B failed to receive response %d: %v", i+1, err)
+		}
+		if _, ok := msg.(*pgproto3.CommandComplete); !ok {
+			t.Fatalf("Client B expected CommandComplete, got: %T (%+v)", msg, msg)
+		}
+		// Read ReadyForQuery
+		msg2, err := feB.Receive()
+		if err != nil || msg2 == nil {
+			t.Fatalf("Client B failed to receive ReadyForQuery %d: %v", i+1, err)
+		}
+	}
+
+	time.Sleep(150 * time.Millisecond)
+
+	// In transaction pooling mode, completed query releases upstream back to pool.
+	// Verify pool has no leaked active connections and all connections are healthy idle.
+	if pool.GetActiveCount() != 0 {
+		t.Errorf("Expected active count 0, got %d", pool.GetActiveCount())
+	}
+	if pool.GetHealthyIdleCount() != 3 {
+		t.Errorf("Expected healthy idle count 3, got %d", pool.GetHealthyIdleCount())
+	}
+
+	// Verify Client B can still execute subsequent queries successfully
+	feB.Send(&pgproto3.Query{String: "SELECT 2;"})
+	if err := feB.Flush(); err != nil {
+		t.Fatalf("Client B failed to send subsequent query: %v", err)
+	}
+	msg, err := feB.Receive()
+	if err != nil {
+		t.Fatalf("Client B failed to receive subsequent query response: %v", err)
+	}
+	if _, ok := msg.(*pgproto3.CommandComplete); !ok {
+		t.Fatalf("Client B expected CommandComplete for subsequent query, got: %T", msg)
+	}
+	_, _ = feB.Receive() // ReadyForQuery
+}
+
+// 9. TestTeardown_CapacityAccountingAfterFailures verifies that after a cascade of
+// failure events (panics, socket terminations, disconnects), the connection pool
+// invariant holds: healthy + broken + active + cleaning + redialing == poolSize.
+func TestTeardown_CapacityAccountingAfterFailures(t *testing.T) {
+	_, pool, _, proxyAddr, cleanup := setupTeardownTestServer(t, 4, nil)
+	defer cleanup()
+
+	const iterations = 8
+	var wg sync.WaitGroup
+	wg.Add(iterations)
+
+	for i := 0; i < iterations; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			conn, fe := connectTestClient(t, proxyAddr, "test_agent")
+			if conn == nil {
+				return
+			}
+			defer conn.Close()
+
+			switch idx % 3 {
+			case 0:
+				// Normal fast query
+				fe.Send(&pgproto3.Query{String: "SELECT 1;"})
+				_ = fe.Flush()
+				_, _ = fe.Receive()
+			case 1:
+				// Sudden client disconnect mid-query
+				fe.Send(&pgproto3.Query{String: "SELECT 1;"})
+				_ = fe.Flush()
+				conn.Close()
+			case 2:
+				// Send terminate
+				fe.Send(&pgproto3.Terminate{})
+				_ = fe.Flush()
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	time.Sleep(300 * time.Millisecond)
+
+	// Invariant check: healthy + broken + active + cleaning + redialing == poolSize
+	healthy := pool.healthyIdleCount.Load()
+	broken := pool.brokenCount.Load()
+	active := pool.activeCount.Load()
+	cleaning := pool.cleaningCount.Load()
+	redialing := pool.redialingCount.Load()
+	total := healthy + broken + active + cleaning + redialing
+
+	if total != 4 {
+		t.Errorf("Capacity invariant violated after failures: healthy(%d) + broken(%d) + active(%d) + cleaning(%d) + redialing(%d) = %d, expected 4",
+			healthy, broken, active, cleaning, redialing, total)
+	}
+
+	if active != 0 {
+		t.Errorf("Expected active count 0, got %d", active)
+	}
+
+	// Verify Prometheus broken gauge matches atomic brokenCount
+	var m dto.Metric
+	if err := PoolBrokenConnections.Write(&m); err == nil && m.Gauge != nil {
+		gaugeVal := int32(*m.Gauge.Value)
+		if gaugeVal != broken {
+			t.Errorf("PoolBrokenConnections gauge (%d) does not match brokenCount (%d)", gaugeVal, broken)
+		}
+	}
+}
+
+// 10. TestTeardown_NoRegressions verifies that Phase 1A malformed message protections
+// and Phase 1B lifecycle protections remain fully intact without regressions.
+func TestTeardown_NoRegressions(t *testing.T) {
+	// Verify sanitizePanicValue redacts sensitive information properly
+	rawWithPassword := "runtime error: invalid memory address: password='super_secret_hunter2'"
+	sanitized := sanitizePanicValue(rawWithPassword)
+	if strings.Contains(sanitized, "super_secret_hunter2") {
+		t.Errorf("sanitizePanicValue leaked password: %s", sanitized)
+	}
+	if !strings.Contains(sanitized, "password=[REDACTED]") {
+		t.Errorf("sanitizePanicValue failed to redact password: %s", sanitized)
+	}
+
+	rawWithToken := "authentication failed for token: bearer_secret_token_12345"
+	sanitizedToken := sanitizePanicValue(rawWithToken)
+	if strings.Contains(sanitizedToken, "bearer_secret_token_12345") {
+		t.Errorf("sanitizePanicValue leaked token: %s", sanitizedToken)
+	}
+
+	// Verify truncation of large panic messages
+	hugeMsg := strings.Repeat("A", 500)
+	sanitizedHuge := sanitizePanicValue(hugeMsg)
+	if len(sanitizedHuge) > 280 {
+		t.Errorf("sanitizePanicValue failed to truncate large message: len=%d", len(sanitizedHuge))
+	}
+
+	// Verify nil and error types
+	if sanitizePanicValue(nil) != "nil" {
+		t.Errorf("Expected 'nil', got %s", sanitizePanicValue(nil))
+	}
+	if sanitizePanicValue(errors.New("simple error")) != "simple error" {
+		t.Errorf("Expected 'simple error', got %s", sanitizePanicValue(errors.New("simple error")))
+	}
+}

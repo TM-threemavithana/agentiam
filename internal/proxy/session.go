@@ -26,7 +26,37 @@ import (
 // to defend against memory exhaustion attacks from corrupt or malicious peers.
 const DefaultMaxProtocolBodyLen = 64 * 1024 * 1024
 
-var setCmdRegex = regexp.MustCompile(`(?i)^\s*SET\s+([a-zA-Z0-9_]+)\s*(?:TO|=)\s*(.+)$`)
+var (
+	setCmdRegex = regexp.MustCompile(`(?i)^\s*SET\s+([a-zA-Z0-9_]+)\s*(?:TO|=)\s*(.+)$`)
+
+	testPanicMu                sync.RWMutex
+	testPanicHook              func()
+	testPanicOnUpstreamReceive func()
+)
+
+func SetTestPanicHook(fn func()) {
+	testPanicMu.Lock()
+	defer testPanicMu.Unlock()
+	testPanicHook = fn
+}
+
+func getTestPanicHook() func() {
+	testPanicMu.RLock()
+	defer testPanicMu.RUnlock()
+	return testPanicHook
+}
+
+func SetTestPanicOnUpstreamReceive(fn func()) {
+	testPanicMu.Lock()
+	defer testPanicMu.Unlock()
+	testPanicOnUpstreamReceive = fn
+}
+
+func getTestPanicOnUpstreamReceive() func() {
+	testPanicMu.RLock()
+	defer testPanicMu.RUnlock()
+	return testPanicOnUpstreamReceive
+}
 
 type PreparedStatement struct {
 	SQL           string
@@ -104,6 +134,7 @@ type Session struct {
 	rules        ast.Rules
 	tlsConfig    *tls.Config
 	closeOnce    sync.Once
+	cancel       context.CancelFunc
 
 	startupMsg pgproto3.FrontendMessage
 	virtualPID uint32
@@ -146,13 +177,36 @@ func (s *Session) CancelQuery() {
 	}
 }
 
-func (s *Session) Run() error {
+func (s *Session) Run() (err error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	s.cancel = cancel
+
+	defer func() {
+		if r := recover(); r != nil {
+			s.logger.Error("Panic recovered in session lifecycle",
+				"client_id", s.clientID,
+				"addr", s.clientConn.RemoteAddr(),
+				"panic", sanitizePanicValue(r),
+				"stack", sanitizedStackTrace(),
+			)
+			s.recoverBrokenTransaction()
+			s.Close()
+			err = fmt.Errorf("session terminated due to unexpected panic: %s", sanitizePanicValue(r))
+		}
+	}()
 
 	s.lastClientActivity.Store(time.Now().UnixNano())
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				s.logger.Error("Panic recovered in idle watchdog",
+					"client_id", s.clientID,
+					"panic", sanitizePanicValue(r),
+				)
+			}
+		}()
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for {
@@ -178,7 +232,6 @@ func (s *Session) Run() error {
 	}()
 
 	var clientID string
-	var err error
 
 	for i := 0; i < 3; i++ {
 		if s.startupMsg == nil {
@@ -434,14 +487,36 @@ func (s *Session) getOrAcquireUpstream(ctx context.Context, clientWriteCh chan p
 	}
 	if err := u.Frontend.Flush(); err != nil {
 		u.Broken.Store(true)
-		s.releaseUpstream()
+		s.server.pool.Release(u)
 		return nil, fmt.Errorf("failed to flush session state queries: %w", err)
 	}
 
 	s.uconn = u
 
 	go func() {
+		cleanedUp := false
+		defer func() {
+			if r := recover(); r != nil {
+				s.logger.Error("Panic recovered in upstream response reader",
+					"client_id", s.clientID,
+					"panic", sanitizePanicValue(r),
+					"stack", sanitizedStackTrace(),
+				)
+				u.Broken.Store(true)
+				s.releaseUpstream()
+				if s.cancel != nil {
+					s.cancel()
+				}
+			} else if !cleanedUp {
+				u.Broken.Store(true)
+				s.releaseUpstream()
+			}
+		}()
+
 		for {
+			if fn := getTestPanicOnUpstreamReceive(); fn != nil {
+				fn()
+			}
 			msg, err := u.Frontend.Receive()
 			if err != nil {
 				var maxLenErr *pgproto3.ExceededMaxBodyLenErr
@@ -452,7 +527,11 @@ func (s *Session) getOrAcquireUpstream(ctx context.Context, clientWriteCh chan p
 					)
 				}
 				u.Broken.Store(true)
+				cleanedUp = true
 				s.releaseUpstream()
+				if s.cancel != nil {
+					s.cancel()
+				}
 				return
 			}
 
@@ -526,6 +605,7 @@ func (s *Session) getOrAcquireUpstream(ctx context.Context, clientWriteCh chan p
 							return
 						case clientWriteCh <- msg:
 						}
+						cleanedUp = true
 						s.releaseUpstream()
 						return
 					}
@@ -706,6 +786,9 @@ func (s *Session) handleBindMsg(ctx context.Context, v *pgproto3.Bind, clientWri
 // handleQueryMsg processes a simple Query message (Simple Query Protocol).
 // It applies rate limiting, AST rules, tracks SET vars, and forwards upstream.
 func (s *Session) handleQueryMsg(ctx context.Context, v *pgproto3.Query, clientWriteCh chan pgproto3.BackendMessage) error {
+	if fn := getTestPanicHook(); fn != nil {
+		fn()
+	}
 	s.queryRunning.Store(true)
 	s.queryStartTime.Store(time.Now().UnixNano())
 	_, span := Tracer.Start(ctx, "proxy.Query")
@@ -796,6 +879,16 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 	// Writer goroutine: drains clientWriteCh and sends to the client connection.
 	go func() {
 		defer cancel()
+		defer func() {
+			if r := recover(); r != nil {
+				s.logger.Error("Panic recovered in client writer goroutine",
+					"client_id", s.clientID,
+					"panic", sanitizePanicValue(r),
+					"stack", sanitizedStackTrace(),
+				)
+				s.recoverBrokenTransaction()
+			}
+		}()
 		for {
 			select {
 			case <-ctx.Done():
@@ -804,8 +897,13 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 				if !ok {
 					return
 				}
+				_ = s.clientConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 				s.clientBackend.Send(msg)
-				_ = s.clientBackend.Flush()
+				if err := s.clientBackend.Flush(); err != nil {
+					_ = s.clientConn.SetWriteDeadline(time.Time{})
+					return
+				}
+				_ = s.clientConn.SetWriteDeadline(time.Time{})
 			}
 		}
 	}()

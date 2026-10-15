@@ -54,12 +54,15 @@ type UpstreamConn struct {
 	SwallowParseComplete atomic.Int32
 	SwallowSetTimeout    atomic.Int32
 	TxStatus             byte
+	closeOnce            sync.Once
 }
 
 func (u *UpstreamConn) Close() {
-	if u.Conn != nil {
-		u.Conn.Close()
-	}
+	u.closeOnce.Do(func() {
+		if u.Conn != nil {
+			_ = u.Conn.Close()
+		}
+	})
 }
 
 func (u *UpstreamConn) State() ConnState {
@@ -346,6 +349,22 @@ func (p *Pool) Release(u *UpstreamConn) {
 		go func() {
 			defer p.workersWg.Done()
 			defer p.redialingCount.Add(-1)
+			defer func() {
+				if r := recover(); r != nil {
+					p.logger.Error("Panic recovered in background redial worker",
+						"panic", sanitizePanicValue(r),
+						"stack", sanitizedStackTrace(),
+					)
+					if !p.closed.Load() {
+						broken := &UpstreamConn{}
+						broken.Broken.Store(true)
+						broken.state.Store(int32(ConnStateClosed))
+						p.conns <- broken
+						p.brokenCount.Add(1)
+						PoolBrokenConnections.Set(float64(p.brokenCount.Load()))
+					}
+				}
+			}()
 
 			if p.closed.Load() {
 				return
@@ -396,6 +415,15 @@ func (p *Pool) Release(u *UpstreamConn) {
 	go func() {
 		defer p.workersWg.Done()
 		defer p.cleaningCount.Add(-1)
+		defer func() {
+			if r := recover(); r != nil {
+				p.logger.Error("Panic recovered in connection cleanup worker",
+					"panic", sanitizePanicValue(r),
+					"stack", sanitizedStackTrace(),
+				)
+				p.handleCleaningFailure(u)
+			}
+		}()
 
 		if p.closed.Load() {
 			u.Close()
@@ -416,6 +444,11 @@ func (p *Pool) Release(u *UpstreamConn) {
 
 		discardDone := make(chan error, 1)
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					discardDone <- fmt.Errorf("panic in discard receiver: %s", sanitizePanicValue(r))
+				}
+			}()
 			for {
 				msg, err := u.Frontend.Receive()
 				if err != nil {
