@@ -28,21 +28,29 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+type ViewConfig struct {
+	Name           string            `yaml:"name" json:"name"`
+	BaseTable      string            `yaml:"base_table" json:"base_table"`
+	ColumnMappings map[string]string `yaml:"column_mappings" json:"column_mappings"`
+	MaskedColumns  []string          `yaml:"masked_columns" json:"masked_columns"`
+}
+
 type AgentConfig struct {
-	Name               string   `yaml:"name" json:"name"`
-	Key                string   `yaml:"key" json:"key"` // bcrypt hash or SCRAM verifier
-	AllowedStatements  []string `yaml:"allowed_statements" json:"allowed_statements"`
+	Name               string              `yaml:"name" json:"name"`
+	Key                string              `yaml:"key" json:"key"` // bcrypt hash or SCRAM verifier
+	AllowedStatements  []string            `yaml:"allowed_statements" json:"allowed_statements"`
 	AllowedTables      []string            `yaml:"allowed_tables" json:"allowed_tables"`
+	Views              []ViewConfig        `yaml:"views" json:"views"`
 	BlockedFunctions   []string            `yaml:"blocked_functions" json:"blocked_functions"`
 	MaskedColumns      map[string][]string `yaml:"masked_columns" json:"masked_columns"`
 	SelectLimit        int                 `yaml:"select_limit" json:"select_limit"`
-	MaxExecutionTimeMs int      `yaml:"max_execution_time_ms" json:"max_execution_time_ms"`
-	MaxComplexity      int      `yaml:"max_complexity" json:"max_complexity"`
-	RateLimitRPM       int      `yaml:"rate_limit_rpm" json:"rate_limit_rpm"`
-	RateLimitBurst     int      `yaml:"rate_limit_burst" json:"rate_limit_burst"`
-	PoolMode           string   `yaml:"pool_mode" json:"pool_mode"`
-	Dialect            string   `yaml:"dialect" json:"dialect"`
-	CreatedAt          string   `yaml:"created_at" json:"created_at"`
+	MaxExecutionTimeMs int                 `yaml:"max_execution_time_ms" json:"max_execution_time_ms"`
+	MaxComplexity      int                 `yaml:"max_complexity" json:"max_complexity"`
+	RateLimitRPM       int                 `yaml:"rate_limit_rpm" json:"rate_limit_rpm"`
+	RateLimitBurst     int                 `yaml:"rate_limit_burst" json:"rate_limit_burst"`
+	PoolMode           string              `yaml:"pool_mode" json:"pool_mode"`
+	Dialect            string              `yaml:"dialect" json:"dialect"`
+	CreatedAt          string              `yaml:"created_at" json:"created_at"`
 }
 
 type AuditSinkConfig struct {
@@ -110,9 +118,20 @@ func NewStore(filePath string, apiUrl string, logger *slog.Logger) (*Store, erro
 // agentConfigToRules converts an AgentConfig into an ast.Rules struct with safe defaults applied.
 // This is the single source of truth for the config → rules mapping.
 func agentConfigToRules(config AgentConfig) ast.Rules {
+	var views []ast.ViewPolicy
+	for _, v := range config.Views {
+		views = append(views, ast.ViewPolicy{
+			Name:           v.Name,
+			BaseTable:      v.BaseTable,
+			ColumnMappings: v.ColumnMappings,
+			MaskedColumns:  v.MaskedColumns,
+		})
+	}
+
 	rules := ast.Rules{
 		AllowedStatements:  config.AllowedStatements,
 		AllowedTables:      config.AllowedTables,
+		Views:              views,
 		BlockedFunctions:   config.BlockedFunctions,
 		MaskedColumns:      config.MaskedColumns,
 		EnforceSelectLimit: config.SelectLimit,

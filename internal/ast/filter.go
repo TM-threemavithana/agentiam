@@ -72,14 +72,9 @@ func (p *PostgresParser) ApplyRules(sql string, rules Rules, astCache cache.ASTC
 				return "", nil, fmt.Errorf("policy violation: query complexity %d exceeds maximum of %d", complexity, rules.MaxComplexity)
 			}
 		}
-		// Enforce table-level access control for Postgres
-		if len(rules.AllowedTables) > 0 && !isAllowed("*", rules.AllowedTables) {
-			tables := extractPostgresTables(stmt.Stmt)
-			for _, tbl := range tables {
-				if !isAllowed(tbl, rules.AllowedTables) {
-					return "", nil, fmt.Errorf("access to table '%s' is not allowed by policy", tbl)
-				}
-			}
+		// Enforce relation-level access control (default-deny for tables and views)
+		if err := enforceRelationAccess(stmt.Stmt, rules); err != nil {
+			return "", nil, err
 		}
 		if err := InjectTenantIsolation(stmt.Stmt, rules); err != nil {
 			return "", nil, fmt.Errorf("tenant isolation blocked query: %w", err)
@@ -124,65 +119,161 @@ func isCacheable(sql string) bool {
 	return true
 }
 
-// extractPostgresTables walks an AST node and collects all referenced table names (RangeVar).
-func extractPostgresTables(node *pg_query.Node) []string {
+// RelationRef represents a referenced relation, optionally schema-qualified.
+type RelationRef struct {
+	Schema string
+	Name   string
+}
+
+// collectCTENames collects all Common Table Expression (CTE) names defined within a statement.
+// These are query-local aliases and should not be treated as database tables.
+func collectCTENames(node *pg_query.Node) map[string]bool {
+	ctes := make(map[string]bool)
+	collectCTEsRecursive(node, ctes)
+	return ctes
+}
+
+func collectCTEsRecursive(node *pg_query.Node, ctes map[string]bool) {
+	if node == nil {
+		return
+	}
+	if sel, ok := node.Node.(*pg_query.Node_SelectStmt); ok && sel.SelectStmt != nil {
+		if sel.SelectStmt.WithClause != nil {
+			for _, cteNode := range sel.SelectStmt.WithClause.Ctes {
+				if cte, ok2 := cteNode.Node.(*pg_query.Node_CommonTableExpr); ok2 && cte.CommonTableExpr != nil {
+					ctes[strings.ToLower(cte.CommonTableExpr.Ctename)] = true
+					collectCTEsRecursive(cte.CommonTableExpr.Ctequery, ctes)
+				}
+			}
+		}
+	}
+	if ins, ok := node.Node.(*pg_query.Node_InsertStmt); ok && ins.InsertStmt != nil && ins.InsertStmt.WithClause != nil {
+		for _, cteNode := range ins.InsertStmt.WithClause.Ctes {
+			if cte, ok2 := cteNode.Node.(*pg_query.Node_CommonTableExpr); ok2 && cte.CommonTableExpr != nil {
+				ctes[strings.ToLower(cte.CommonTableExpr.Ctename)] = true
+				collectCTEsRecursive(cte.CommonTableExpr.Ctequery, ctes)
+			}
+		}
+	}
+	if upd, ok := node.Node.(*pg_query.Node_UpdateStmt); ok && upd.UpdateStmt != nil && upd.UpdateStmt.WithClause != nil {
+		for _, cteNode := range upd.UpdateStmt.WithClause.Ctes {
+			if cte, ok2 := cteNode.Node.(*pg_query.Node_CommonTableExpr); ok2 && cte.CommonTableExpr != nil {
+				ctes[strings.ToLower(cte.CommonTableExpr.Ctename)] = true
+				collectCTEsRecursive(cte.CommonTableExpr.Ctequery, ctes)
+			}
+		}
+	}
+	if del, ok := node.Node.(*pg_query.Node_DeleteStmt); ok && del.DeleteStmt != nil && del.DeleteStmt.WithClause != nil {
+		for _, cteNode := range del.DeleteStmt.WithClause.Ctes {
+			if cte, ok2 := cteNode.Node.(*pg_query.Node_CommonTableExpr); ok2 && cte.CommonTableExpr != nil {
+				ctes[strings.ToLower(cte.CommonTableExpr.Ctename)] = true
+				collectCTEsRecursive(cte.CommonTableExpr.Ctequery, ctes)
+			}
+		}
+	}
+}
+
+// extractPostgresRelationRefs walks an AST node and collects all referenced relations (RangeVar),
+// ignoring query-local CTE names.
+func extractPostgresRelationRefs(node *pg_query.Node) []RelationRef {
 	if node == nil {
 		return nil
 	}
-	var tables []string
-	collectTables(node.Node, &tables)
-	return tables
+	cteNames := collectCTENames(node)
+	var refs []RelationRef
+	seen := make(map[string]bool)
+
+	collectRelationRefs(node.Node, cteNames, &refs, seen)
+	return refs
 }
 
-func collectTables(v interface{}, tables *[]string) {
+func collectRelationRefs(v interface{}, cteNames map[string]bool, refs *[]RelationRef, seen map[string]bool) {
 	if v == nil {
 		return
 	}
 
-	// Fast path type switch for common nodes
 	switch n := v.(type) {
 	case *pg_query.Node_RangeVar:
-		if n.RangeVar != nil && n.RangeVar.Relname != "" {
-			*tables = append(*tables, n.RangeVar.Relname)
+		rv := n.RangeVar
+		if rv != nil && rv.Relname != "" {
+			nameLower := strings.ToLower(rv.Relname)
+			if rv.Schemaname == "" && cteNames[nameLower] {
+				return
+			}
+			key := strings.ToLower(rv.Schemaname) + "." + nameLower
+			if !seen[key] {
+				seen[key] = true
+				*refs = append(*refs, RelationRef{
+					Schema: rv.Schemaname,
+					Name:   rv.Relname,
+				})
+			}
+		}
+		return
+	case *pg_query.RangeVar:
+		rv := n
+		if rv != nil && rv.Relname != "" {
+			nameLower := strings.ToLower(rv.Relname)
+			if rv.Schemaname == "" && cteNames[nameLower] {
+				return
+			}
+			key := strings.ToLower(rv.Schemaname) + "." + nameLower
+			if !seen[key] {
+				seen[key] = true
+				*refs = append(*refs, RelationRef{
+					Schema: rv.Schemaname,
+					Name:   rv.Relname,
+				})
+			}
 		}
 		return
 	case *pg_query.Node_SelectStmt:
 		sel := n.SelectStmt
-		if sel == nil { return }
-		collectTablesNodeSlice(sel.TargetList, tables)
-		collectTablesNodeSlice(sel.FromClause, tables)
-		collectTablesNode(sel.WhereClause, tables)
-		collectTablesNode(sel.WithClause, tables)
+		if sel == nil {
+			return
+		}
+		collectRelationRefsNodeSlice(sel.TargetList, cteNames, refs, seen)
+		collectRelationRefsNodeSlice(sel.FromClause, cteNames, refs, seen)
+		collectRelationRefs(sel.WhereClause, cteNames, refs, seen)
+		collectRelationRefs(sel.WithClause, cteNames, refs, seen)
 		return
 	case *pg_query.Node_JoinExpr:
 		join := n.JoinExpr
-		if join == nil { return }
-		collectTablesNode(join.Larg, tables)
-		collectTablesNode(join.Rarg, tables)
-		collectTablesNode(join.Quals, tables)
+		if join == nil {
+			return
+		}
+		collectRelationRefs(join.Larg, cteNames, refs, seen)
+		collectRelationRefs(join.Rarg, cteNames, refs, seen)
+		collectRelationRefs(join.Quals, cteNames, refs, seen)
 		return
 	case *pg_query.Node_InsertStmt:
 		ins := n.InsertStmt
-		if ins == nil { return }
-		collectTablesNode(ins.Relation, tables)
-		collectTablesNode(ins.SelectStmt, tables)
-		collectTablesNode(ins.WithClause, tables)
+		if ins == nil {
+			return
+		}
+		collectRelationRefs(ins.Relation, cteNames, refs, seen)
+		collectRelationRefs(ins.SelectStmt, cteNames, refs, seen)
+		collectRelationRefs(ins.WithClause, cteNames, refs, seen)
 		return
 	case *pg_query.Node_UpdateStmt:
 		upd := n.UpdateStmt
-		if upd == nil { return }
-		collectTablesNode(upd.Relation, tables)
-		collectTablesNodeSlice(upd.FromClause, tables)
-		collectTablesNode(upd.WhereClause, tables)
-		collectTablesNode(upd.WithClause, tables)
+		if upd == nil {
+			return
+		}
+		collectRelationRefs(upd.Relation, cteNames, refs, seen)
+		collectRelationRefsNodeSlice(upd.FromClause, cteNames, refs, seen)
+		collectRelationRefs(upd.WhereClause, cteNames, refs, seen)
+		collectRelationRefs(upd.WithClause, cteNames, refs, seen)
 		return
 	case *pg_query.Node_DeleteStmt:
 		del := n.DeleteStmt
-		if del == nil { return }
-		collectTablesNode(del.Relation, tables)
-		collectTablesNodeSlice(del.UsingClause, tables)
-		collectTablesNode(del.WhereClause, tables)
-		collectTablesNode(del.WithClause, tables)
+		if del == nil {
+			return
+		}
+		collectRelationRefs(del.Relation, cteNames, refs, seen)
+		collectRelationRefsNodeSlice(del.UsingClause, cteNames, refs, seen)
+		collectRelationRefs(del.WhereClause, cteNames, refs, seen)
+		collectRelationRefs(del.WithClause, cteNames, refs, seen)
 		return
 	case *pg_query.Node_AConst, *pg_query.Node_ColumnRef, *pg_query.Node_ParamRef:
 		return
@@ -196,13 +287,23 @@ func collectTables(v interface{}, tables *[]string) {
 		if val.IsNil() {
 			return
 		}
-		collectTables(val.Elem().Interface(), tables)
+		collectRelationRefs(val.Elem().Interface(), cteNames, refs, seen)
 		return
 	}
-	// Direct RangeVar match
 	if rv, ok := v.(*pg_query.Node_RangeVar); ok {
 		if rv.RangeVar != nil && rv.RangeVar.Relname != "" {
-			*tables = append(*tables, rv.RangeVar.Relname)
+			nameLower := strings.ToLower(rv.RangeVar.Relname)
+			if rv.RangeVar.Schemaname == "" && cteNames[nameLower] {
+				return
+			}
+			key := strings.ToLower(rv.RangeVar.Schemaname) + "." + nameLower
+			if !seen[key] {
+				seen[key] = true
+				*refs = append(*refs, RelationRef{
+					Schema: rv.RangeVar.Schemaname,
+					Name:   rv.RangeVar.Relname,
+				})
+			}
 		}
 		return
 	}
@@ -214,55 +315,139 @@ func collectTables(v interface{}, tables *[]string) {
 			}
 			if field.Kind() == reflect.Ptr && !field.IsNil() {
 				if n, ok := field.Interface().(*pg_query.Node); ok {
-					if rv, ok2 := n.Node.(*pg_query.Node_RangeVar); ok2 {
-						if rv.RangeVar != nil && rv.RangeVar.Relname != "" {
-							*tables = append(*tables, rv.RangeVar.Relname)
-						}
-					}
-					collectTables(n.Node, tables)
+					collectRelationRefs(n.Node, cteNames, refs, seen)
 					continue
 				}
 			}
-			collectTables(field.Interface(), tables)
+			collectRelationRefs(field.Interface(), cteNames, refs, seen)
 		}
 	} else if val.Kind() == reflect.Slice {
 		for i := 0; i < val.Len(); i++ {
 			elem := val.Index(i)
 			if elem.Kind() == reflect.Ptr && !elem.IsNil() {
 				if n, ok := elem.Interface().(*pg_query.Node); ok {
-					if rv, ok2 := n.Node.(*pg_query.Node_RangeVar); ok2 {
-						if rv.RangeVar != nil && rv.RangeVar.Relname != "" {
-							*tables = append(*tables, rv.RangeVar.Relname)
-						}
-					}
-					collectTables(n.Node, tables)
+					collectRelationRefs(n.Node, cteNames, refs, seen)
 					continue
 				}
 			}
-			collectTables(elem.Interface(), tables)
+			collectRelationRefs(elem.Interface(), cteNames, refs, seen)
 		}
 	}
 }
 
-func collectTablesNode(n interface{}, tables *[]string) {
-	if n == nil {
-		return
+func collectRelationRefsNode(node *pg_query.Node, cteNames map[string]bool, refs *[]RelationRef, seen map[string]bool) {
+	if node != nil {
+		collectRelationRefs(node.Node, cteNames, refs, seen)
 	}
-	if node, ok := n.(*pg_query.Node); ok {
-		if node != nil {
-			collectTables(node.Node, tables)
-		}
-		return
-	}
-	collectTables(n, tables)
 }
 
-func collectTablesNodeSlice(nodes []*pg_query.Node, tables *[]string) {
+func collectRelationRefsNodeSlice(nodes []*pg_query.Node, cteNames map[string]bool, refs *[]RelationRef, seen map[string]bool) {
 	for _, n := range nodes {
 		if n != nil {
-			collectTables(n.Node, tables)
+			collectRelationRefs(n.Node, cteNames, refs, seen)
 		}
 	}
+}
+
+// matchesRelation determines if an extracted RelationRef matches an allowed relation pattern.
+// Handles bare names (implying public/default schema) and explicit schema qualification.
+func matchesRelation(ref RelationRef, allowed string) bool {
+	allowedLower := strings.ToLower(strings.TrimSpace(allowed))
+	refNameLower := strings.ToLower(strings.TrimSpace(ref.Name))
+	refSchemaLower := strings.ToLower(strings.TrimSpace(ref.Schema))
+
+	if allowedLower == "*" {
+		return true
+	}
+
+	var allowedSchema, allowedName string
+	if idx := strings.Index(allowedLower, "."); idx != -1 {
+		allowedSchema = allowedLower[:idx]
+		allowedName = allowedLower[idx+1:]
+	} else {
+		allowedName = allowedLower
+	}
+
+	// 1. If allowed specifies schema (e.g. "public.users" or "analytics.report")
+	if allowedSchema != "" {
+		if refSchemaLower != "" {
+			return strings.EqualFold(refSchemaLower, allowedSchema) && strings.EqualFold(refNameLower, allowedName)
+		}
+		// Query omitted schema: matches only if allowedSchema is "public"
+		return allowedSchema == "public" && strings.EqualFold(refNameLower, allowedName)
+	}
+
+	// 2. If allowed did NOT specify schema (e.g. "users")
+	// Matches if query omitted schema OR query specified "public"
+	if refSchemaLower == "" || refSchemaLower == "public" {
+		return strings.EqualFold(refNameLower, allowedName)
+	}
+
+	// Query specified non-public schema (e.g. "private.users") while policy did not: reject
+	return false
+}
+
+// enforceRelationAccess checks that every relation referenced in stmt is explicitly authorized.
+// When sensitive column masking is active, default-deny is strictly enforced: wildcard '*' is prohibited,
+// and relations must match explicitly authorized base tables or approved views.
+func enforceRelationAccess(stmt *pg_query.Node, rules Rules) error {
+	hasMasking := len(rules.MaskedColumns) > 0 || len(rules.Views) > 0
+
+	// If no masking and allowed_tables allows all, nothing to restrict
+	if !hasMasking && (len(rules.AllowedTables) == 0 || isAllowed("*", rules.AllowedTables)) {
+		return nil
+	}
+
+	// When masking is enabled, a wildcard '*' in allowed_tables is forbidden (default-deny requirement)
+	if hasMasking && isAllowed("*", rules.AllowedTables) {
+		return fmt.Errorf("policy configuration error: wildcard '*' in allowed_tables is not permitted when sensitive-column masking is enabled (explicit allowed-relation policy required)")
+	}
+
+	refs := extractPostgresRelationRefs(stmt)
+	for _, ref := range refs {
+		allowed := false
+
+		// 1. Check if ref matches an explicitly authorized base table
+		for _, tbl := range rules.AllowedTables {
+			if tbl == "*" && !hasMasking {
+				allowed = true
+				break
+			}
+			if matchesRelation(ref, tbl) {
+				allowed = true
+				break
+			}
+		}
+
+		// 2. Check if ref matches an explicitly approved view
+		if !allowed && len(rules.Views) > 0 {
+			for _, v := range rules.Views {
+				if matchesRelation(ref, v.Name) {
+					allowed = true
+					break
+				}
+			}
+		}
+
+		if !allowed {
+			relStr := ref.Name
+			if ref.Schema != "" {
+				relStr = ref.Schema + "." + ref.Name
+			}
+			return fmt.Errorf("policy violation: access to relation '%s' is not allowed by policy (default-deny)", relStr)
+		}
+	}
+	return nil
+}
+
+// extractPostgresTables walks an AST node and collects all referenced table names (RangeVar).
+func extractPostgresTables(node *pg_query.Node) []string {
+	refs := extractPostgresRelationRefs(node)
+	var tables []string
+	for _, r := range refs {
+		tables = append(tables, r.Name)
+	}
+	return tables
 }
 
 

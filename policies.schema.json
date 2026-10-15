@@ -64,6 +64,38 @@
               "type": "string"
             }
           },
+          "views": {
+            "type": "array",
+            "description": "Explicitly approved database views, underlying base tables, and column mappings for safe masking",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "description": "Name of the approved view"
+                },
+                "base_table": {
+                  "type": "string",
+                  "description": "Underlying base table or view"
+                },
+                "column_mappings": {
+                  "type": "object",
+                  "description": "Map of view columns to base table columns",
+                  "additionalProperties": {
+                    "type": "string"
+                  }
+                },
+                "masked_columns": {
+                  "type": "array",
+                  "description": "Columns of this view that must be masked directly",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              },
+              "required": ["name"]
+            }
+          },
           "blocked_functions": {
             "type": "array",
             "description": "List of functions that are blocked from execution (e.g. sleep, pg_sleep)",
