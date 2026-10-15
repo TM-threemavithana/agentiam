@@ -53,6 +53,7 @@ type Server struct {
 	latencyBuffer  *UILatencyRingBuffer
 	uiFS           http.FileSystem
 	auditSinks     []AuditSink
+	verifier       *CatalogVerifier
 }
 
 // NewServer initializes a new Server instance.
@@ -104,10 +105,14 @@ func NewServer(listenAddr, upstreamDSN string, store *policy.Store, tlsConfig *t
 		latencyBuffer:  NewUILatencyRingBuffer(60), // 60 seconds of history
 		uiFS:           uiFS,
 		auditSinks:     auditSinks,
+		verifier:       NewCatalogVerifier(upstreamDSN, logger),
 	}
 
 	if store != nil {
 		store.SetPolicyUpdateHook(func(clientID string) {
+			if srv.verifier != nil {
+				_ = srv.verifier.VerifyStore(context.Background(), store)
+			}
 			srv.RevokeSessionsForClient(clientID)
 		})
 	}
@@ -201,9 +206,25 @@ func (s *Server) pollPolicyUpdates() {
 	}
 }
 
-// InitPool initializes the upstream connection pool.
+// InitPool initializes the upstream connection pool and verifies views against the PostgreSQL catalog.
 func (s *Server) InitPool(ctx context.Context) error {
-	return s.pool.Init(ctx)
+	if err := s.pool.Init(ctx); err != nil {
+		return err
+	}
+	if s.verifier != nil && s.store != nil {
+		if err := s.verifier.VerifyStore(ctx, s.store); err != nil {
+			s.logger.Warn("Initial catalog view verification encountered errors", "error", err)
+		}
+	}
+	return nil
+}
+
+func (s *Server) GetCatalogVerifier() *CatalogVerifier {
+	return s.verifier
+}
+
+func (s *Server) SetCatalogVerifier(v *CatalogVerifier) {
+	s.verifier = v
 }
 
 // SetHandler resolves the circular dependency when setting up the protocol handler.

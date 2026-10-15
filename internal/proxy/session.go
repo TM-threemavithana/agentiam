@@ -448,6 +448,9 @@ func (s *Session) Run() (err error) {
 		_ = s.clientBackend.Flush()
 		return fmt.Errorf("password auth failed")
 	}
+	if s.server != nil && s.server.verifier != nil {
+		rules = s.server.verifier.EnrichRulesWithVerifiedViews(rules)
+	}
 	s.rules = rules
 	s.authVersion = authVersion
 	s.clientID = clientID
@@ -692,7 +695,11 @@ func (s *Session) handleParseMsg(ctx context.Context, v *pgproto3.Parse, clientW
 		return fmt.Errorf("session policy revoked")
 	}
 
-	rewrittenSQL, limitParams, err := (&ast.PostgresParser{}).ApplyRules(v.Query, s.rules, s.server.astCache)
+	currentRules := s.rules
+	if s.server != nil && s.server.verifier != nil {
+		currentRules = s.server.verifier.EnrichRulesWithVerifiedViews(s.rules)
+	}
+	rewrittenSQL, limitParams, err := (&ast.PostgresParser{}).ApplyRules(v.Query, currentRules, s.server.astCache)
 	if err != nil {
 		s.server.DispatchAudit(AuditEvent{Event: EventPolicyBlocked, ClientID: s.clientID, SQL: v.Query, Status: "blocked", Error: err.Error()})
 		BlockedQueriesTotal.WithLabelValues("policy").Inc()
@@ -873,7 +880,11 @@ func (s *Session) handleQueryMsg(ctx context.Context, v *pgproto3.Query, clientW
 		return nil
 	}
 
-	rewrittenSQL, _, err := (&ast.PostgresParser{}).ApplyRules(v.String, s.rules, s.server.astCache)
+	currentRules := s.rules
+	if s.server != nil && s.server.verifier != nil {
+		currentRules = s.server.verifier.EnrichRulesWithVerifiedViews(s.rules)
+	}
+	rewrittenSQL, _, err := (&ast.PostgresParser{}).ApplyRules(v.String, currentRules, s.server.astCache)
 	if err != nil {
 		s.server.DispatchAudit(AuditEvent{Event: EventPolicyBlocked, ClientID: s.clientID, SQL: v.String, Status: "blocked", Error: err.Error()})
 		BlockedQueriesTotal.WithLabelValues("policy").Inc()

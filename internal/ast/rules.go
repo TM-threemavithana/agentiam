@@ -22,8 +22,10 @@ type Rules struct {
 	MaxExecutionTimeMs int                 `yaml:"max_execution_time_ms"`
 	PoolMode           string              `yaml:"pool_mode"`
 	Dialect            string              `yaml:"dialect"`
-	MaxComplexity      int                 `yaml:"max_complexity"`
-	TenantIsolation    *TenantIsolationRule `yaml:"tenant_isolation,omitempty"`
+	MaxComplexity              int                  `yaml:"max_complexity"`
+	TenantIsolation            *TenantIsolationRule `yaml:"tenant_isolation,omitempty"`
+	RequireCatalogVerification bool                 `yaml:"require_catalog_verification,omitempty"`
+	VerifiedViews              map[string]bool      `yaml:"verified_views,omitempty"`
 }
 
 type TenantIsolationRule struct {

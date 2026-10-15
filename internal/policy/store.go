@@ -143,8 +143,9 @@ func agentConfigToRules(config AgentConfig) ast.Rules {
 		EnforceSelectLimit: config.SelectLimit,
 		MaxExecutionTimeMs: config.MaxExecutionTimeMs,
 		PoolMode:           config.PoolMode,
-		Dialect:            config.Dialect,
-		MaxComplexity:      config.MaxComplexity,
+		Dialect:                    config.Dialect,
+		MaxComplexity:              config.MaxComplexity,
+		RequireCatalogVerification: true,
 	}
 	if rules.EnforceSelectLimit <= 0 {
 		rules.EnforceSelectLimit = 100
@@ -419,6 +420,15 @@ func (s *Store) GetAgentVersions() (map[string]int, error) {
 		versions[k] = v.version
 	}
 	return versions, nil
+}
+
+func (s *Store) GetAgentPolicy(clientID string) (ast.Rules, int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if state, exists := s.agents[clientID]; exists {
+		return agentConfigToRules(state.config), state.version
+	}
+	return ast.Rules{}, 0
 }
 
 func (s *Store) SetAgentPolicy(clientID string, config AgentConfig) {

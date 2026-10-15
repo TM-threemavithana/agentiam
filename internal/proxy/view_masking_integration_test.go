@@ -27,11 +27,13 @@ import (
 )
 
 type viewMaskingTestEnv struct {
-	proxyDSN   string
-	directDSN  string
-	adminDSN   string
+	proxyDSN    string
+	directDSN   string
+	adminDSN    string
+	agentKey    string
 	policyStore *policy.Store
-	cleanup    func()
+	server      *proxy.Server
+	cleanup     func()
 }
 
 func setupViewMaskingEnv(t *testing.T) *viewMaskingTestEnv {
@@ -125,7 +127,17 @@ func setupViewMaskingEnv(t *testing.T) *viewMaskingTestEnv {
 		t.Fatalf("failed to initialize database schema: %v", err)
 	}
 
-	// 3. Setup AgentIAM Policy Store
+	// 3. Compute real definition fingerprints from PostgreSQL catalog for approved views
+	var defPublic, defRenamed, defNested string
+	_ = adminConn.QueryRow(ctx, "SELECT definition FROM pg_catalog.pg_views WHERE schemaname = 'public' AND viewname = 'customer_public_view'").Scan(&defPublic)
+	_ = adminConn.QueryRow(ctx, "SELECT definition FROM pg_catalog.pg_views WHERE schemaname = 'public' AND viewname = 'customer_renamed_view'").Scan(&defRenamed)
+	_ = adminConn.QueryRow(ctx, "SELECT definition FROM pg_catalog.pg_views WHERE schemaname = 'public' AND viewname = 'customer_nested_view'").Scan(&defNested)
+
+	fpPublic, _ := ast.ComputeViewFingerprint(defPublic)
+	fpRenamed, _ := ast.ComputeViewFingerprint(defRenamed)
+	fpNested, _ := ast.ComputeViewFingerprint(defNested)
+
+	// 4. Setup AgentIAM Policy Store
 	agentHash, _ := bcrypt.GenerateFromPassword([]byte("agent_password_xyz"), bcrypt.DefaultCost)
 	yamlPolicy := fmt.Sprintf(`
 version: "1.0"
@@ -141,6 +153,7 @@ agents:
     views:
       - name: "customer_public_view"
         base_table: "customers"
+        definition_fingerprint: "%s"
         column_mappings:
           id: "id"
           name: "name"
@@ -149,6 +162,7 @@ agents:
           tenant_id: "tenant_id"
       - name: "customer_renamed_view"
         base_table: "customers"
+        definition_fingerprint: "%s"
         column_mappings:
           cust_id: "id"
           full_name: "name"
@@ -157,6 +171,7 @@ agents:
           tenant_id: "tenant_id"
       - name: "customer_nested_view"
         base_table: "customer_renamed_view"
+        definition_fingerprint: "%s"
         column_mappings:
           cust_id: "cust_id"
           full_name: "full_name"
@@ -168,7 +183,7 @@ agents:
       customers:
         - "ssn"
         - "credit_card"
-`, string(agentHash))
+`, string(agentHash), fpPublic, fpRenamed, fpNested)
 
 	tmpFile, err := os.CreateTemp("", "view-policies-*.yaml")
 	if err != nil {
@@ -231,7 +246,9 @@ agents:
 		proxyDSN:    proxyDSN,
 		directDSN:   directDSN,
 		adminDSN:    adminDSN,
+		agentKey:    string(agentHash),
 		policyStore: store,
+		server:      server,
 		cleanup:     cleanup,
 	}
 }
@@ -566,25 +583,47 @@ func TestViewMaskingIntegration(t *testing.T) {
 
 	// 13. Policy reload / schema drift behavior
 	t.Run("13_PolicyReloadBehavior", func(t *testing.T) {
+		adminConn, err := pgx.Connect(ctx, env.adminDSN)
+		if err != nil {
+			t.Fatalf("failed to connect admin: %v", err)
+		}
+		defer adminConn.Close(ctx)
+
+		var defPublic, defUnauthorized string
+		_ = adminConn.QueryRow(ctx, "SELECT definition FROM pg_catalog.pg_views WHERE schemaname = 'public' AND viewname = 'customer_public_view'").Scan(&defPublic)
+		_ = adminConn.QueryRow(ctx, "SELECT definition FROM pg_catalog.pg_views WHERE schemaname = 'public' AND viewname = 'unauthorized_view'").Scan(&defUnauthorized)
+
+		fpPublic, _ := ast.ComputeViewFingerprint(defPublic)
+		fpUnauthorized, _ := ast.ComputeViewFingerprint(defUnauthorized)
+
+		_, _ = adminConn.Exec(ctx, "GRANT SELECT ON unauthorized_view TO agent_db_role;")
+		defer adminConn.Exec(ctx, "REVOKE ALL ON unauthorized_view FROM agent_db_role;")
+
 		// Dynamically add a new view to the policy
-		hash, _ := bcrypt.GenerateFromPassword([]byte("agent_password_xyz"), bcrypt.DefaultCost)
 		updatedConfig := policy.AgentConfig{
 			Name:              "test-analyst",
-			Key:               string(hash),
+			Key:               env.agentKey,
 			AllowedStatements: []string{"SELECT", "SET"},
 			AllowedTables:     []string{"customers", "orders"},
 			Views: []policy.ViewConfig{
 				{
-					Name:      "customer_public_view",
-					BaseTable: "customers",
+					Name:                  "customer_public_view",
+					BaseTable:             "customers",
+					DefinitionFingerprint: fpPublic,
 					ColumnMappings: map[string]string{
-						"ssn": "ssn",
+						"id":          "id",
+						"name":        "name",
+						"ssn":         "ssn",
+						"credit_card": "credit_card",
+						"tenant_id":   "tenant_id",
 					},
 				},
 				{
-					Name:      "unauthorized_view", // Now dynamically authorized!
-					BaseTable: "customers",
+					Name:                  "unauthorized_view", // Now dynamically authorized!
+					BaseTable:             "customers",
+					DefinitionFingerprint: fpUnauthorized,
 					ColumnMappings: map[string]string{
+						"id":  "id",
 						"ssn": "ssn",
 					},
 				},
@@ -875,9 +914,10 @@ func TestViewMaskingIntegration(t *testing.T) {
 		for v := 0; v < 5; v++ {
 			time.Sleep(10 * time.Millisecond)
 			env.policyStore.SetAgentPolicy("test-analyst", policy.AgentConfig{
+				Key:               env.agentKey,
 				AllowedStatements: []string{"SELECT"},
 				AllowedTables:     []string{"customers", "orders"},
-				SelectLimit:        v + 10,
+				SelectLimit:       v + 10,
 			})
 		}
 
@@ -908,6 +948,350 @@ func TestViewMaskingIntegration(t *testing.T) {
 			t.Logf("CONFIRMED SEC-P2-01 / RISK-VIEW-02: Direct database connection bypassed proxy and accessed raw sensitive value '%s' via PostgreSQL definer view. Network isolation of PostgreSQL listener (port 5432) is mandatory.", ssn)
 		} else {
 			t.Fatalf("unexpected raw ssn value: %s", ssn)
+		}
+	})
+
+	// 16. Adversarial: Missing definition fingerprint fails closed
+	t.Run("Adversarial_MissingFingerprint_AccessDenied", func(t *testing.T) {
+		adminConn, err := pgx.Connect(ctx, env.adminDSN)
+		if err != nil {
+			t.Fatalf("failed to connect admin: %v", err)
+		}
+		defer adminConn.Close(ctx)
+
+		_, err = adminConn.Exec(ctx, "CREATE VIEW customer_nofp_view AS SELECT id, name FROM customers;")
+		if err != nil {
+			t.Fatalf("failed to create view: %v", err)
+		}
+		defer adminConn.Exec(ctx, "DROP VIEW IF EXISTS customer_nofp_view;")
+
+		// Configure in policy WITHOUT fingerprint
+		env.policyStore.SetAgentPolicy("test-analyst", policy.AgentConfig{
+			Key:               env.agentKey,
+			AllowedStatements: []string{"SELECT"},
+			AllowedTables:     []string{"customers", "orders"},
+			Views: []policy.ViewConfig{
+				{
+					Name:      "customer_nofp_view",
+					BaseTable: "customers",
+					ColumnMappings: map[string]string{
+						"id":   "id",
+						"name": "name",
+					},
+					DefinitionFingerprint: "",
+				},
+			},
+		})
+
+		conn, err := pgx.Connect(ctx, env.proxyDSN)
+		if err != nil {
+			t.Fatalf("failed to connect: %v", err)
+		}
+		defer conn.Close(ctx)
+
+		_, err = conn.Query(ctx, "SELECT id, name FROM customer_nofp_view;")
+		if err == nil {
+			t.Fatalf("expected view with missing fingerprint to be denied, but succeeded")
+		}
+		if !strings.Contains(err.Error(), "has not been verified against PostgreSQL catalog definition") &&
+			!strings.Contains(err.Error(), "57P01") && !strings.Contains(err.Error(), "policy violation") {
+			t.Fatalf("expected verification denial error, got: %v", err)
+		}
+	})
+
+	// 17. Adversarial: Incorrect definition fingerprint fails closed
+	t.Run("Adversarial_IncorrectFingerprint_AccessDenied", func(t *testing.T) {
+		adminConn, err := pgx.Connect(ctx, env.adminDSN)
+		if err != nil {
+			t.Fatalf("failed to connect admin: %v", err)
+		}
+		defer adminConn.Close(ctx)
+
+		_, err = adminConn.Exec(ctx, "CREATE VIEW customer_badfp_view AS SELECT id, name FROM customers;")
+		if err != nil {
+			t.Fatalf("failed to create view: %v", err)
+		}
+		defer adminConn.Exec(ctx, "DROP VIEW IF EXISTS customer_badfp_view;")
+
+		env.policyStore.SetAgentPolicy("test-analyst", policy.AgentConfig{
+			Key:               env.agentKey,
+			AllowedStatements: []string{"SELECT"},
+			AllowedTables:     []string{"customers", "orders"},
+			Views: []policy.ViewConfig{
+				{
+					Name:                  "customer_badfp_view",
+					BaseTable:             "customers",
+					DefinitionFingerprint: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+					ColumnMappings: map[string]string{
+						"id":   "id",
+						"name": "name",
+					},
+				},
+			},
+		})
+
+		conn, err := pgx.Connect(ctx, env.proxyDSN)
+		if err != nil {
+			t.Fatalf("failed to connect: %v", err)
+		}
+		defer conn.Close(ctx)
+
+		_, err = conn.Query(ctx, "SELECT id, name FROM customer_badfp_view;")
+		if err == nil {
+			t.Fatalf("expected view with incorrect fingerprint to be denied, but succeeded")
+		}
+		if !strings.Contains(err.Error(), "has not been verified against PostgreSQL catalog definition") &&
+			!strings.Contains(err.Error(), "policy violation") {
+			t.Fatalf("expected verification denial error, got: %v", err)
+		}
+	})
+
+	// 18. Adversarial: Changed view definition after approval (Schema Drift) detected
+	t.Run("Adversarial_SchemaDrift_AlteredViewDetected", func(t *testing.T) {
+		adminConn, err := pgx.Connect(ctx, env.adminDSN)
+		if err != nil {
+			t.Fatalf("failed to connect admin: %v", err)
+		}
+		defer adminConn.Close(ctx)
+
+		_, err = adminConn.Exec(ctx, "CREATE VIEW customer_drift_view AS SELECT id, name FROM customers;")
+		if err != nil {
+			t.Fatalf("failed to create view: %v", err)
+		}
+		defer adminConn.Exec(ctx, "DROP VIEW IF EXISTS customer_drift_view;")
+
+		var def string
+		_ = adminConn.QueryRow(ctx, "SELECT definition FROM pg_catalog.pg_views WHERE schemaname = 'public' AND viewname = 'customer_drift_view'").Scan(&def)
+		fp, _ := ast.ComputeViewFingerprint(def)
+
+		env.policyStore.SetAgentPolicy("test-analyst", policy.AgentConfig{
+			Key:               env.agentKey,
+			AllowedStatements: []string{"SELECT"},
+			AllowedTables:     []string{"customers", "orders"},
+			Views: []policy.ViewConfig{
+				{
+					Name:                  "customer_drift_view",
+					BaseTable:             "customers",
+					DefinitionFingerprint: fp,
+					ColumnMappings: map[string]string{
+						"id":   "id",
+						"name": "name",
+					},
+				},
+			},
+		})
+
+		// Query before drift succeeds
+		conn, err := pgx.Connect(ctx, env.proxyDSN)
+		if err != nil {
+			t.Fatalf("failed to connect: %v", err)
+		}
+		defer conn.Close(ctx)
+
+		rows, err := conn.Query(ctx, "SELECT id, name FROM customer_drift_view;")
+		if err != nil {
+			t.Fatalf("expected query on approved view to succeed before drift: %v", err)
+		}
+		rows.Close()
+
+		// DBA alters the view in PostgreSQL after approval
+		_, err = adminConn.Exec(ctx, "CREATE OR REPLACE VIEW customer_drift_view AS SELECT id, name, ssn FROM customers;")
+		if err != nil {
+			t.Fatalf("failed to alter view: %v", err)
+		}
+
+		// Detect drift
+		drift, err := env.server.GetCatalogVerifier().CheckDrift(ctx, "public", "customer_drift_view")
+		if !drift {
+			t.Fatalf("expected schema drift to be detected after CREATE OR REPLACE VIEW")
+		}
+
+		// Invalidate view and revoke sessions
+		env.server.GetCatalogVerifier().InvalidateView("public", "customer_drift_view")
+		env.server.RevokeSessionsForClient("test-analyst")
+
+		// Query after drift fails closed
+		conn2, err2 := pgx.Connect(ctx, env.proxyDSN)
+		if err2 == nil {
+			defer conn2.Close(ctx)
+			_, errQuery := conn2.Query(ctx, "SELECT id, name FROM customer_drift_view;")
+			if errQuery == nil {
+				t.Fatalf("expected query on drifted view to fail closed, but succeeded")
+			}
+		}
+	})
+
+	// 19. Adversarial: Computed sensitive substring projection (SEC-P2-05) rejected
+	t.Run("Adversarial_ComputedSensitiveSubstring_SEC_P2_05", func(t *testing.T) {
+		adminConn, err := pgx.Connect(ctx, env.adminDSN)
+		if err != nil {
+			t.Fatalf("failed to connect admin: %v", err)
+		}
+		defer adminConn.Close(ctx)
+
+		_, err = adminConn.Exec(ctx, "CREATE VIEW customer_computed_view AS SELECT id, substring(ssn FROM 1 FOR 4) AS identity_prefix FROM customers;")
+		if err != nil {
+			t.Fatalf("failed to create computed view: %v", err)
+		}
+		defer adminConn.Exec(ctx, "DROP VIEW IF EXISTS customer_computed_view;")
+
+		var def string
+		_ = adminConn.QueryRow(ctx, "SELECT definition FROM pg_catalog.pg_views WHERE schemaname = 'public' AND viewname = 'customer_computed_view'").Scan(&def)
+		fp, _ := ast.ComputeViewFingerprint(def)
+
+		// Policy maliciously claims ssn is in unexposed_columns
+		env.policyStore.SetAgentPolicy("test-analyst", policy.AgentConfig{
+			Key:               env.agentKey,
+			AllowedStatements: []string{"SELECT"},
+			AllowedTables:     []string{"customers", "orders"},
+			Views: []policy.ViewConfig{
+				{
+					Name:                  "customer_computed_view",
+					BaseTable:             "customers",
+					DefinitionFingerprint: fp,
+					ColumnMappings: map[string]string{
+						"id": "id",
+					},
+					UnexposedColumns: []string{"ssn"},
+				},
+			},
+			MaskedColumns: map[string][]string{
+				"customers": {"ssn"},
+			},
+		})
+
+		conn, err := pgx.Connect(ctx, env.proxyDSN)
+		if err != nil {
+			t.Fatalf("failed to connect: %v", err)
+		}
+		defer conn.Close(ctx)
+
+		// Query attempting to read identity_prefix must be blocked
+		_, err = conn.Query(ctx, "SELECT identity_prefix FROM customer_computed_view;")
+		if err == nil {
+			t.Fatalf("CRITICAL SEC-P2-05: computed sensitive substring escaped masking through approved view!")
+		}
+		if !strings.Contains(err.Error(), "has not been verified against PostgreSQL catalog definition") &&
+			!strings.Contains(err.Error(), "policy violation") {
+			t.Fatalf("expected verification or policy violation error, got: %v", err)
+		}
+	})
+
+	// 20. Adversarial: Sensitive column renamed to innocuous alias without mapping
+	t.Run("Adversarial_SensitiveColumnRenamedToInnocuousAlias_Denied", func(t *testing.T) {
+		adminConn, err := pgx.Connect(ctx, env.adminDSN)
+		if err != nil {
+			t.Fatalf("failed to connect admin: %v", err)
+		}
+		defer adminConn.Close(ctx)
+
+		_, err = adminConn.Exec(ctx, "CREATE VIEW customer_innocuous_view AS SELECT id, ssn AS notes FROM customers;")
+		if err != nil {
+			t.Fatalf("failed to create view: %v", err)
+		}
+		defer adminConn.Exec(ctx, "DROP VIEW IF EXISTS customer_innocuous_view;")
+
+		var def string
+		_ = adminConn.QueryRow(ctx, "SELECT definition FROM pg_catalog.pg_views WHERE schemaname = 'public' AND viewname = 'customer_innocuous_view'").Scan(&def)
+		fp, _ := ast.ComputeViewFingerprint(def)
+
+		// Deceptive policy maps notes to notes (pretending it's not ssn)
+		env.policyStore.SetAgentPolicy("test-analyst", policy.AgentConfig{
+			Key:               env.agentKey,
+			AllowedStatements: []string{"SELECT"},
+			AllowedTables:     []string{"customers", "orders"},
+			Views: []policy.ViewConfig{
+				{
+					Name:                  "customer_innocuous_view",
+					BaseTable:             "customers",
+					DefinitionFingerprint: fp,
+					ColumnMappings: map[string]string{
+						"id":    "id",
+						"notes": "notes",
+					},
+				},
+			},
+			MaskedColumns: map[string][]string{
+				"customers": {"ssn"},
+			},
+		})
+
+		conn, err := pgx.Connect(ctx, env.proxyDSN)
+		if err != nil {
+			t.Fatalf("failed to connect: %v", err)
+		}
+		defer conn.Close(ctx)
+
+		_, err = conn.Query(ctx, "SELECT notes FROM customer_innocuous_view;")
+		if err == nil {
+			t.Fatalf("CRITICAL: renamed sensitive column without mapping escaped masking!")
+		}
+		if !strings.Contains(err.Error(), "has not been verified against PostgreSQL catalog definition") &&
+			!strings.Contains(err.Error(), "policy violation") {
+			t.Fatalf("expected verification failure, got: %v", err)
+		}
+	})
+
+	// 21. Adversarial: Search_path shadowing defense
+	t.Run("Adversarial_SearchPathShadowing_Protected", func(t *testing.T) {
+		adminConn, err := pgx.Connect(ctx, env.adminDSN)
+		if err != nil {
+			t.Fatalf("failed to connect admin: %v", err)
+		}
+		defer adminConn.Close(ctx)
+
+		// Attacker creates an evil schema and shadows customer_public_view
+		_, _ = adminConn.Exec(ctx, "CREATE SCHEMA IF NOT EXISTS evil;")
+		_, _ = adminConn.Exec(ctx, "CREATE TABLE IF NOT EXISTS evil.customer_public_view (id INT, ssn TEXT);")
+		_, _ = adminConn.Exec(ctx, "INSERT INTO evil.customer_public_view VALUES (999, 'unmasked_evil_ssn');")
+		defer adminConn.Exec(ctx, "DROP SCHEMA IF EXISTS evil CASCADE;")
+
+		// Restore clean policy for customer_public_view
+		var defPublic string
+		_ = adminConn.QueryRow(ctx, "SELECT definition FROM pg_catalog.pg_views WHERE schemaname = 'public' AND viewname = 'customer_public_view'").Scan(&defPublic)
+		fpPublic, _ := ast.ComputeViewFingerprint(defPublic)
+
+		env.policyStore.SetAgentPolicy("test-analyst", policy.AgentConfig{
+			Key:               env.agentKey,
+			AllowedStatements: []string{"SELECT", "SET"},
+			AllowedTables:     []string{"customers", "orders"},
+			Views: []policy.ViewConfig{
+				{
+					Name:                  "customer_public_view",
+					BaseTable:             "customers",
+					DefinitionFingerprint: fpPublic,
+					ColumnMappings: map[string]string{
+						"id":          "id",
+						"name":        "name",
+						"ssn":         "ssn",
+						"credit_card": "credit_card",
+						"tenant_id":   "tenant_id",
+					},
+				},
+			},
+			MaskedColumns: map[string][]string{
+				"customers": {"ssn", "credit_card"},
+			},
+		})
+
+		conn, err := pgx.Connect(ctx, env.proxyDSN)
+		if err != nil {
+			t.Fatalf("failed to connect: %v", err)
+		}
+		defer conn.Close(ctx)
+
+		// Attacker attempts to tamper with search_path
+		_, _ = conn.Exec(ctx, "SET search_path = evil, public;")
+
+		// Query on customer_public_view must be canonicalized and masked
+		row := conn.QueryRow(ctx, "SELECT ssn FROM customer_public_view WHERE id = 1;")
+		var ssn string
+		err = row.Scan(&ssn)
+		if err != nil {
+			t.Fatalf("query failed: %v", err)
+		}
+		if ssn != "[REDACTED]" {
+			t.Fatalf("CRITICAL: search_path shadowing leaked unmasked value: %s", ssn)
 		}
 	})
 }

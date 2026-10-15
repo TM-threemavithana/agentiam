@@ -76,6 +76,9 @@ func (p *PostgresParser) ApplyRules(sql string, rules Rules, astCache cache.ASTC
 		if err := enforceRelationAccess(stmt.Stmt, rules); err != nil {
 			return "", nil, err
 		}
+		if err := CanonicalizeRelationSchemas(stmt.Stmt, rules); err != nil {
+			return "", nil, err
+		}
 		if err := InjectTenantIsolation(stmt.Stmt, rules); err != nil {
 			return "", nil, fmt.Errorf("tenant isolation blocked query: %w", err)
 		}
@@ -423,6 +426,24 @@ func enforceRelationAccess(stmt *pg_query.Node, rules Rules) error {
 		if !allowed && len(rules.Views) > 0 {
 			for _, v := range rules.Views {
 				if matchesRelation(ref, v.Name) {
+					if rules.RequireCatalogVerification {
+						normView := strings.ToLower(v.Name)
+						bareView := normView
+						if idx := strings.Index(bareView, "."); idx != -1 {
+							bareView = bareView[idx+1:]
+						}
+						isVerified := false
+						if rules.VerifiedViews != nil {
+							isVerified = rules.VerifiedViews[normView] || rules.VerifiedViews[bareView]
+						}
+						if !isVerified {
+							relStr := ref.Name
+							if ref.Schema != "" {
+								relStr = ref.Schema + "." + ref.Name
+							}
+							return fmt.Errorf("policy violation: approved view '%s' has not been verified against PostgreSQL catalog definition or verification failed (fail-closed)", relStr)
+						}
+					}
 					allowed = true
 					break
 				}
@@ -438,6 +459,227 @@ func enforceRelationAccess(stmt *pg_query.Node, rules Rules) error {
 		}
 	}
 	return nil
+}
+
+// CanonicalizeRelationSchemas canonicalizes unqualified RangeVar relations to their explicit
+// schema-qualified identity based on policy (defaulting to "public"), preventing search_path shadowing attacks.
+func CanonicalizeRelationSchemas(node *pg_query.Node, rules Rules) error {
+	if node == nil || node.Node == nil {
+		return nil
+	}
+
+	cteNames := collectCTENames(node)
+
+	canonicalSchemas := make(map[string]string)
+	for _, v := range rules.Views {
+		schema, name := splitSchemaName(v.Name)
+		canonicalSchemas[strings.ToLower(name)] = schema
+		canonicalSchemas[strings.ToLower(schema+"."+name)] = schema
+	}
+	for _, tbl := range rules.AllowedTables {
+		if tbl == "*" {
+			continue
+		}
+		schema, name := splitSchemaName(tbl)
+		canonicalSchemas[strings.ToLower(name)] = schema
+		canonicalSchemas[strings.ToLower(schema+"."+name)] = schema
+	}
+
+	walkRangeVars(node, func(rv *pg_query.RangeVar) {
+		if rv == nil || rv.Relname == "" {
+			return
+		}
+		nameLower := strings.ToLower(rv.Relname)
+		if rv.Schemaname == "" && !cteNames[nameLower] {
+			if canonicalSchema, ok := canonicalSchemas[nameLower]; ok && canonicalSchema != "" {
+				rv.Schemaname = canonicalSchema
+			}
+		}
+	})
+
+	return nil
+}
+
+func walkRangeVars(v interface{}, fn func(rv *pg_query.RangeVar)) {
+	if v == nil {
+		return
+	}
+
+	switch n := v.(type) {
+	case *pg_query.Node:
+		if n != nil && n.Node != nil {
+			walkRangeVars(n.Node, fn)
+		}
+		return
+	case *pg_query.Node_RangeVar:
+		if n.RangeVar != nil {
+			fn(n.RangeVar)
+		}
+		return
+	case *pg_query.RangeVar:
+		fn(n)
+		return
+	case *pg_query.Node_SelectStmt:
+		sel := n.SelectStmt
+		if sel == nil {
+			return
+		}
+		for _, item := range sel.TargetList {
+			walkRangeVars(item, fn)
+		}
+		for _, item := range sel.FromClause {
+			walkRangeVars(item, fn)
+		}
+		walkRangeVars(sel.WhereClause, fn)
+		walkRangeVars(sel.WithClause, fn)
+		if sel.Larg != nil {
+			walkRangeVars(sel.Larg, fn)
+		}
+		if sel.Rarg != nil {
+			walkRangeVars(sel.Rarg, fn)
+		}
+		return
+	case *pg_query.SelectStmt:
+		sel := n
+		if sel == nil {
+			return
+		}
+		for _, item := range sel.TargetList {
+			walkRangeVars(item, fn)
+		}
+		for _, item := range sel.FromClause {
+			walkRangeVars(item, fn)
+		}
+		walkRangeVars(sel.WhereClause, fn)
+		walkRangeVars(sel.WithClause, fn)
+		if sel.Larg != nil {
+			walkRangeVars(sel.Larg, fn)
+		}
+		if sel.Rarg != nil {
+			walkRangeVars(sel.Rarg, fn)
+		}
+		return
+	case *pg_query.Node_JoinExpr:
+		join := n.JoinExpr
+		if join == nil {
+			return
+		}
+		walkRangeVars(join.Larg, fn)
+		walkRangeVars(join.Rarg, fn)
+		walkRangeVars(join.Quals, fn)
+		return
+	case *pg_query.JoinExpr:
+		join := n
+		if join == nil {
+			return
+		}
+		walkRangeVars(join.Larg, fn)
+		walkRangeVars(join.Rarg, fn)
+		walkRangeVars(join.Quals, fn)
+		return
+	case *pg_query.Node_RangeSubselect:
+		sub := n.RangeSubselect
+		if sub != nil {
+			walkRangeVars(sub.Subquery, fn)
+		}
+		return
+	case *pg_query.RangeSubselect:
+		sub := n
+		if sub != nil {
+			walkRangeVars(sub.Subquery, fn)
+		}
+		return
+	case *pg_query.Node_InsertStmt:
+		ins := n.InsertStmt
+		if ins != nil {
+			walkRangeVars(ins.Relation, fn)
+			walkRangeVars(ins.SelectStmt, fn)
+			walkRangeVars(ins.WithClause, fn)
+		}
+		return
+	case *pg_query.Node_UpdateStmt:
+		upd := n.UpdateStmt
+		if upd != nil {
+			walkRangeVars(upd.Relation, fn)
+			for _, item := range upd.FromClause {
+				walkRangeVars(item, fn)
+			}
+			walkRangeVars(upd.WhereClause, fn)
+			walkRangeVars(upd.WithClause, fn)
+		}
+		return
+	case *pg_query.Node_DeleteStmt:
+		del := n.DeleteStmt
+		if del != nil {
+			walkRangeVars(del.Relation, fn)
+			for _, item := range del.UsingClause {
+				walkRangeVars(item, fn)
+			}
+			walkRangeVars(del.WhereClause, fn)
+			walkRangeVars(del.WithClause, fn)
+		}
+		return
+	case *pg_query.Node_CommonTableExpr:
+		cte := n.CommonTableExpr
+		if cte != nil {
+			walkRangeVars(cte.Ctequery, fn)
+		}
+		return
+	case *pg_query.CommonTableExpr:
+		cte := n
+		if cte != nil {
+			walkRangeVars(cte.Ctequery, fn)
+		}
+		return
+	case *pg_query.Node_WithClause:
+		wc := n.WithClause
+		if wc != nil {
+			for _, cte := range wc.Ctes {
+				walkRangeVars(cte, fn)
+			}
+		}
+		return
+	case []*pg_query.Node:
+		for _, item := range n {
+			walkRangeVars(item, fn)
+		}
+		return
+	}
+
+	val := reflect.ValueOf(v)
+	if !val.IsValid() {
+		return
+	}
+	if val.Kind() == reflect.Ptr || val.Kind() == reflect.Interface {
+		if val.IsNil() {
+			return
+		}
+		walkRangeVars(val.Elem().Interface(), fn)
+		return
+	}
+	if val.Kind() == reflect.Slice {
+		for i := 0; i < val.Len(); i++ {
+			walkRangeVars(val.Index(i).Interface(), fn)
+		}
+		return
+	}
+	if val.Kind() == reflect.Struct {
+		for i := 0; i < val.NumField(); i++ {
+			field := val.Field(i)
+			if !field.CanInterface() {
+				continue
+			}
+			walkRangeVars(field.Interface(), fn)
+		}
+	}
+}
+
+func splitSchemaName(rel string) (string, string) {
+	parts := strings.Split(rel, ".")
+	if len(parts) == 2 {
+		return parts[0], parts[1]
+	}
+	return "public", rel
 }
 
 // extractPostgresTables walks an AST node and collects all referenced table names (RangeVar).
