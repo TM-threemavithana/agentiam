@@ -40,13 +40,25 @@ func (s VerifiedViewStatus) String() string {
 	}
 }
 
-type VerifiedViewInfo struct {
+// CatalogSnapshot represents the raw database catalog state for a PostgreSQL view.
+type CatalogSnapshot struct {
+	CanonicalSchema string
+	CanonicalName   string
+	DefinitionSQL   string
+	Fingerprint     string
+	FetchedAt       time.Time
+}
+
+// ClientViewAuthorization represents the authorization decision for a specific client, policy version, and view.
+type ClientViewAuthorization struct {
+	ClientID            string
+	PolicyVersion       int
 	CanonicalSchema     string
 	CanonicalName       string
 	ExpectedFingerprint string
 	ActualFingerprint   string
-	DefinitionSQL       string
 	Status              VerifiedViewStatus
+	Dependencies        []string // canonical keys of dependent views
 	VerifiedAt          time.Time
 	LastError           error
 }
@@ -102,28 +114,50 @@ func (r *PostgresCatalogReader) QueryViewDefinition(ctx context.Context, schema,
 	return def, nil
 }
 
-// CatalogVerifier validates database view definitions and provenance against live PostgreSQL catalogs.
+// CatalogVerifier validates database view definitions and provenance against live PostgreSQL catalogs,
+// enforcing cross-client isolation (SEC-P2-06), runtime drift detection (RISK-VIEW-01), and nested dependency tracking (SEC-P2-08).
 type CatalogVerifier struct {
-	reader CatalogReader
-	logger *Logger
-	mu     sync.RWMutex
-	views  map[string]*VerifiedViewInfo // key: "schema.viewname"
+	reader          CatalogReader
+	logger          *Logger
+	ttl             time.Duration
+	mu              sync.RWMutex
+	catalogCache    map[string]*CatalogSnapshot         // key: CanonicalViewKey(schema, viewName)
+	clientAuthCache map[string]*ClientViewAuthorization // key: clientAuthKey(clientID, version, schema, viewName)
+	dependencies    map[string][]string                 // key: CanonicalViewKey -> []CanonicalViewKey
 }
 
 func NewCatalogVerifier(upstreamDSN string, logger *Logger) *CatalogVerifier {
 	return &CatalogVerifier{
-		reader: NewPostgresCatalogReader(upstreamDSN),
-		logger: logger,
-		views:  make(map[string]*VerifiedViewInfo),
+		reader:          NewPostgresCatalogReader(upstreamDSN),
+		logger:          logger,
+		ttl:             50 * time.Millisecond, // default low TTL for sub-second drift detection
+		catalogCache:    make(map[string]*CatalogSnapshot),
+		clientAuthCache: make(map[string]*ClientViewAuthorization),
+		dependencies:    make(map[string][]string),
 	}
 }
 
 func NewCatalogVerifierWithReader(reader CatalogReader, logger *Logger) *CatalogVerifier {
 	return &CatalogVerifier{
-		reader: reader,
-		logger: logger,
-		views:  make(map[string]*VerifiedViewInfo),
+		reader:          reader,
+		logger:          logger,
+		ttl:             50 * time.Millisecond,
+		catalogCache:    make(map[string]*CatalogSnapshot),
+		clientAuthCache: make(map[string]*ClientViewAuthorization),
+		dependencies:    make(map[string][]string),
 	}
+}
+
+func (cv *CatalogVerifier) SetTTL(d time.Duration) {
+	cv.mu.Lock()
+	defer cv.mu.Unlock()
+	cv.ttl = d
+}
+
+func (cv *CatalogVerifier) GetTTL() time.Duration {
+	cv.mu.RLock()
+	defer cv.mu.RUnlock()
+	return cv.ttl
 }
 
 func CanonicalViewKey(schema, viewName string) string {
@@ -144,90 +178,184 @@ func SplitSchemaView(name string) (string, string) {
 	return "public", norm
 }
 
-func (cv *CatalogVerifier) recordStatus(schema, viewName, expectedFP, actualFP, defSQL string, status VerifiedViewStatus, err error) *VerifiedViewInfo {
-	key := CanonicalViewKey(schema, viewName)
-	info := &VerifiedViewInfo{
-		CanonicalSchema:     schema,
-		CanonicalName:       viewName,
-		ExpectedFingerprint: expectedFP,
-		ActualFingerprint:   actualFP,
-		DefinitionSQL:       defSQL,
-		Status:              status,
-		VerifiedAt:          time.Now(),
-		LastError:           err,
+func clientAuthKey(clientID string, version int, schema, viewName string) string {
+	cID := strings.ToLower(strings.TrimSpace(clientID))
+	if cID == "" {
+		cID = "default"
 	}
-	cv.mu.Lock()
-	cv.views[key] = info
-	cv.mu.Unlock()
-	return info
+	return fmt.Sprintf("%s:%d:%s", cID, version, CanonicalViewKey(schema, viewName))
 }
 
-// VerifyView verifies a single view policy against the PostgreSQL catalog and AST rules.
-func (cv *CatalogVerifier) VerifyView(ctx context.Context, vp ast.ViewPolicy, maskedColumns map[string][]string, viewPolicyMap map[string]ast.ViewPolicy) (*VerifiedViewInfo, error) {
+// QueryCatalogSnapshot retrieves the canonical view definition and SHA-256 fingerprint from PostgreSQL catalogs,
+// caching the snapshot according to the configured TTL.
+func (cv *CatalogVerifier) QueryCatalogSnapshot(ctx context.Context, schema, viewName string, force bool) (*CatalogSnapshot, error) {
+	key := CanonicalViewKey(schema, viewName)
+
+	if !force {
+		cv.mu.RLock()
+		snap, exists := cv.catalogCache[key]
+		ttl := cv.ttl
+		cv.mu.RUnlock()
+		if exists && snap != nil && (ttl > 0 && time.Since(snap.FetchedAt) < ttl) {
+			return snap, nil
+		}
+	}
+
+	defSQL, err := cv.reader.QueryViewDefinition(ctx, schema, viewName)
+	if err != nil {
+		return nil, err
+	}
+
+	fp, err := ast.ComputeViewFingerprint(defSQL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to compute fingerprint for view '%s': %w", key, err)
+	}
+
+	snap := &CatalogSnapshot{
+		CanonicalSchema: schema,
+		CanonicalName:   viewName,
+		DefinitionSQL:   defSQL,
+		Fingerprint:     fp,
+		FetchedAt:       time.Now(),
+	}
+
+	cv.mu.Lock()
+	cv.catalogCache[key] = snap
+	cv.mu.Unlock()
+
+	return snap, nil
+}
+
+// VerifyClientView validates a single view policy for a specific client against the PostgreSQL catalog,
+// verifying the client's expected fingerprint, AST provenance (SEC-P2-05, SEC-P2-07), and nested view dependencies (SEC-P2-08).
+func (cv *CatalogVerifier) VerifyClientView(
+	ctx context.Context,
+	clientID string,
+	version int,
+	vp ast.ViewPolicy,
+	maskedColumns map[string][]string,
+	viewPolicyMap map[string]ast.ViewPolicy,
+	visited map[string]bool,
+	forceRefresh bool,
+) (*ClientViewAuthorization, error) {
 	schema, viewName := SplitSchemaView(vp.Name)
+	canonKey := CanonicalViewKey(schema, viewName)
 	expectedFP := strings.TrimSpace(vp.DefinitionFingerprint)
+
+	// Cycle detection for nested views
+	if visited == nil {
+		visited = make(map[string]bool)
+	}
+	if visited[canonKey] {
+		err := fmt.Errorf("circular dependency detected in view '%s' (fail-closed)", canonKey)
+		cv.recordClientStatus(clientID, version, schema, viewName, expectedFP, "", StatusError, nil, err)
+		return nil, err
+	}
+	visited[canonKey] = true
+	defer delete(visited, canonKey)
+
+	if len(visited) > 5 {
+		err := fmt.Errorf("view '%s' exceeds maximum nested dependency depth of 5 (fail-closed)", canonKey)
+		cv.recordClientStatus(clientID, version, schema, viewName, expectedFP, "", StatusError, nil, err)
+		return nil, err
+	}
 
 	// 1. Missing fingerprint check (fail closed)
 	if expectedFP == "" {
-		err := fmt.Errorf("missing definition fingerprint for approved view '%s.%s' (fail-closed)", schema, viewName)
-		cv.recordStatus(schema, viewName, expectedFP, "", "", StatusMissing, err)
+		err := fmt.Errorf("missing definition fingerprint for approved view '%s' for client '%s' (fail-closed)", canonKey, clientID)
+		cv.recordClientStatus(clientID, version, schema, viewName, expectedFP, "", StatusMissing, nil, err)
 		return nil, err
 	}
 
 	// 2. Query live PostgreSQL catalog
-	defSQL, err := cv.reader.QueryViewDefinition(ctx, schema, viewName)
+	snap, err := cv.QueryCatalogSnapshot(ctx, schema, viewName, forceRefresh)
 	if err != nil {
-		cv.recordStatus(schema, viewName, expectedFP, "", "", StatusError, err)
+		cv.recordClientStatus(clientID, version, schema, viewName, expectedFP, "", StatusError, nil, err)
 		return nil, err
 	}
 
-	// 3. Compute actual fingerprint
-	actualFP, err := ast.ComputeViewFingerprint(defSQL)
-	if err != nil {
-		cv.recordStatus(schema, viewName, expectedFP, "", defSQL, StatusError, err)
-		return nil, fmt.Errorf("failed to compute fingerprint for view '%s.%s': %w", schema, viewName, err)
-	}
-
-	// 4. Compare fingerprint with owner-approved fingerprint (constant-time, case-insensitive)
-	if !ast.CompareFingerprints(expectedFP, actualFP) {
-		err := fmt.Errorf("view definition fingerprint mismatch for '%s.%s': expected %s, got %s (fail-closed)", schema, viewName, expectedFP, actualFP)
-		cv.recordStatus(schema, viewName, expectedFP, actualFP, defSQL, StatusMismatched, err)
+	// 3. Compare fingerprint with client's approved fingerprint (constant-time, case-insensitive)
+	if !ast.CompareFingerprints(expectedFP, snap.Fingerprint) {
+		err := fmt.Errorf("view definition fingerprint mismatch for '%s': expected %s, got %s (fail-closed)", canonKey, expectedFP, snap.Fingerprint)
+		cv.recordClientStatus(clientID, version, schema, viewName, expectedFP, snap.Fingerprint, StatusMismatched, nil, err)
 		return nil, err
 	}
 
-	// 5. Deep AST provenance analysis (SEC-P2-05)
-	if err := ast.ValidateViewProvenance(defSQL, vp, maskedColumns); err != nil {
-		cv.recordStatus(schema, viewName, expectedFP, actualFP, defSQL, StatusError, err)
-		return nil, fmt.Errorf("view '%s.%s' provenance validation failed: %w (fail-closed)", schema, viewName, err)
+	// 4. Deep AST provenance analysis (SEC-P2-05 computed column check & SEC-P2-07 sensitive predicate check)
+	if err := ast.ValidateViewProvenance(snap.DefinitionSQL, vp, maskedColumns); err != nil {
+		cv.recordClientStatus(clientID, version, schema, viewName, expectedFP, snap.Fingerprint, StatusError, nil, err)
+		return nil, fmt.Errorf("view '%s' provenance validation failed: %w (fail-closed)", canonKey, err)
 	}
 
-	// 6. Recursively validate nested view dependencies
-	baseNorm := strings.ToLower(vp.BaseTable)
-	bareBase := baseNorm
-	if idx := strings.Index(bareBase, "."); idx != -1 {
-		bareBase = bareBase[idx+1:]
-	}
-	if parentVP, isNested := viewPolicyMap[baseNorm]; isNested {
-		if _, err := cv.VerifyView(ctx, parentVP, maskedColumns, viewPolicyMap); err != nil {
-			err = fmt.Errorf("view '%s.%s' dependency '%s' verification failed: %w", schema, viewName, vp.BaseTable, err)
-			cv.recordStatus(schema, viewName, expectedFP, actualFP, defSQL, StatusError, err)
-			return nil, err
-		}
-	} else if parentVP, isNested := viewPolicyMap[bareBase]; isNested {
-		if _, err := cv.VerifyView(ctx, parentVP, maskedColumns, viewPolicyMap); err != nil {
-			err = fmt.Errorf("view '%s.%s' dependency '%s' verification failed: %w", schema, viewName, vp.BaseTable, err)
-			cv.recordStatus(schema, viewName, expectedFP, actualFP, defSQL, StatusError, err)
-			return nil, err
+	// 5. Recursively validate nested view dependencies (SEC-P2-08)
+	var directDependencies []string
+	rawDeps, depErr := ast.ExtractViewDependencies(snap.DefinitionSQL)
+	if depErr == nil {
+		for _, dep := range rawDeps {
+			depSchema, depName := SplitSchemaView(dep)
+			depCanon := CanonicalViewKey(depSchema, depName)
+			depBare := strings.ToLower(depName)
+
+			var parentVP ast.ViewPolicy
+			var isNested bool
+			if p, ok := viewPolicyMap[depCanon]; ok {
+				parentVP = p
+				isNested = true
+			} else if p, ok := viewPolicyMap[depBare]; ok {
+				parentVP = p
+				isNested = true
+			}
+
+			if isNested {
+				directDependencies = append(directDependencies, depCanon)
+				if _, err := cv.VerifyClientView(ctx, clientID, version, parentVP, maskedColumns, viewPolicyMap, visited, forceRefresh); err != nil {
+					nestedErr := fmt.Errorf("view '%s' underlying dependency '%s' verification failed: %w", canonKey, dep, err)
+					cv.recordClientStatus(clientID, version, schema, viewName, expectedFP, snap.Fingerprint, StatusError, directDependencies, nestedErr)
+					return nil, nestedErr
+				}
+			}
 		}
 	}
 
-	info := cv.recordStatus(schema, viewName, expectedFP, actualFP, defSQL, StatusVerified, nil)
-	return info, nil
+	cv.mu.Lock()
+	cv.dependencies[canonKey] = directDependencies
+	cv.mu.Unlock()
+
+	auth := cv.recordClientStatus(clientID, version, schema, viewName, expectedFP, snap.Fingerprint, StatusVerified, directDependencies, nil)
+	return auth, nil
 }
 
-// VerifyRules validates all views defined in an ast.Rules struct against PostgreSQL catalog.
-// It populates rules.VerifiedViews and sets rules.RequireCatalogVerification = true.
-func (cv *CatalogVerifier) VerifyRules(ctx context.Context, rules *ast.Rules) error {
+func (cv *CatalogVerifier) recordClientStatus(
+	clientID string,
+	version int,
+	schema, viewName, expectedFP, actualFP string,
+	status VerifiedViewStatus,
+	dependencies []string,
+	err error,
+) *ClientViewAuthorization {
+	key := clientAuthKey(clientID, version, schema, viewName)
+	auth := &ClientViewAuthorization{
+		ClientID:            clientID,
+		PolicyVersion:       version,
+		CanonicalSchema:     schema,
+		CanonicalName:       viewName,
+		ExpectedFingerprint: expectedFP,
+		ActualFingerprint:   actualFP,
+		Status:              status,
+		Dependencies:        dependencies,
+		VerifiedAt:          time.Now(),
+		LastError:           err,
+	}
+
+	cv.mu.Lock()
+	cv.clientAuthCache[key] = auth
+	cv.mu.Unlock()
+
+	return auth
+}
+
+// VerifyClientRules validates all views defined in an ast.Rules struct for a specific client.
+func (cv *CatalogVerifier) VerifyClientRules(ctx context.Context, clientID string, version int, rules *ast.Rules) error {
 	if len(rules.Views) == 0 {
 		return nil
 	}
@@ -250,7 +378,7 @@ func (cv *CatalogVerifier) VerifyRules(ctx context.Context, rules *ast.Rules) er
 		key := CanonicalViewKey(schema, name)
 		bareKey := strings.ToLower(name)
 
-		_, err := cv.VerifyView(ctx, v, rules.MaskedColumns, viewPolicyMap)
+		_, err := cv.VerifyClientView(ctx, clientID, version, v, rules.MaskedColumns, viewPolicyMap, nil, true)
 		if err != nil {
 			rules.VerifiedViews[key] = false
 			rules.VerifiedViews[bareKey] = false
@@ -266,67 +394,77 @@ func (cv *CatalogVerifier) VerifyRules(ctx context.Context, rules *ast.Rules) er
 	return firstErr
 }
 
-// CheckDrift re-queries the PostgreSQL catalog for the specified view and checks whether its
-// definition has changed since it was verified. Returns true if drift is detected.
-func (cv *CatalogVerifier) CheckDrift(ctx context.Context, schema, viewName string) (bool, error) {
-	key := CanonicalViewKey(schema, viewName)
-	cv.mu.RLock()
-	cached, exists := cv.views[key]
-	cv.mu.RUnlock()
-
-	if !exists || cached.Status != StatusVerified {
-		return true, fmt.Errorf("view '%s' is not in verified state", key)
+// EnsureFreshness checks whether any views referenced in the query need catalog re-verification (RISK-VIEW-01),
+// re-evaluating definition freshness and fail-closing if drift or mismatch is detected.
+func (cv *CatalogVerifier) EnsureFreshness(
+	ctx context.Context,
+	clientID string,
+	version int,
+	rules *ast.Rules,
+	referencedRelations []string,
+) error {
+	if len(rules.Views) == 0 || len(referencedRelations) == 0 {
+		return nil
 	}
 
-	currentDef, err := cv.reader.QueryViewDefinition(ctx, cached.CanonicalSchema, cached.CanonicalName)
-	if err != nil {
-		cv.recordStatus(cached.CanonicalSchema, cached.CanonicalName, cached.ExpectedFingerprint, "", "", StatusError, err)
-		return true, err
+	viewPolicyMap := make(map[string]ast.ViewPolicy)
+	for _, v := range rules.Views {
+		schema, name := SplitSchemaView(v.Name)
+		viewPolicyMap[CanonicalViewKey(schema, name)] = v
+		viewPolicyMap[strings.ToLower(name)] = v
 	}
 
-	currentFP, err := ast.ComputeViewFingerprint(currentDef)
-	if err != nil {
-		return true, err
+	for _, rel := range referencedRelations {
+		schema, name := SplitSchemaView(rel)
+		canonKey := CanonicalViewKey(schema, name)
+		bareKey := strings.ToLower(name)
+
+		vp, isConfigured := viewPolicyMap[canonKey]
+		if !isConfigured {
+			vp, isConfigured = viewPolicyMap[bareKey]
+		}
+		if !isConfigured {
+			continue // Relation is not a view configured in policy
+		}
+
+		authKey := clientAuthKey(clientID, version, schema, name)
+		cv.mu.RLock()
+		auth, authExists := cv.clientAuthCache[authKey]
+		ttl := cv.ttl
+		cv.mu.RUnlock()
+
+		needsCheck := !authExists || auth == nil || (ttl == 0 || time.Since(auth.VerifiedAt) >= ttl)
+		if needsCheck {
+			// Query fresh catalog definition and re-verify
+			newAuth, err := cv.VerifyClientView(ctx, clientID, version, vp, rules.MaskedColumns, viewPolicyMap, nil, true)
+			if err != nil {
+				return fmt.Errorf("policy violation: view '%s' verification failed during runtime freshness check: %w", canonKey, err)
+			}
+			if newAuth.Status != StatusVerified {
+				return fmt.Errorf("policy violation: view '%s' has unverified status '%s' (fail-closed)", canonKey, newAuth.Status)
+			}
+		} else {
+			if auth.Status != StatusVerified {
+				return fmt.Errorf("policy violation: view '%s' is not verified for client '%s' (fail-closed)", canonKey, clientID)
+			}
+			// Check freshness of recorded dependencies (SEC-P2-08)
+			for _, depCanon := range auth.Dependencies {
+				depVP, hasDepVP := viewPolicyMap[depCanon]
+				if hasDepVP {
+					if _, err := cv.VerifyClientView(ctx, clientID, version, depVP, rules.MaskedColumns, viewPolicyMap, nil, false); err != nil {
+						return fmt.Errorf("policy violation: underlying dependency '%s' of view '%s' failed verification: %w", depCanon, canonKey, err)
+					}
+				}
+			}
+		}
 	}
 
-	if !ast.CompareFingerprints(cached.ExpectedFingerprint, currentFP) {
-		err := fmt.Errorf("schema drift detected: view '%s' fingerprint changed from %s to %s", key, cached.ExpectedFingerprint, currentFP)
-		cv.recordStatus(cached.CanonicalSchema, cached.CanonicalName, cached.ExpectedFingerprint, currentFP, currentDef, StatusDriftDetected, err)
-		return true, err
-	}
-
-	return false, nil
+	return nil
 }
 
-// InvalidateView marks a view as unverified in the cache.
-func (cv *CatalogVerifier) InvalidateView(schema, viewName string) {
-	key := CanonicalViewKey(schema, viewName)
-	cv.mu.Lock()
-	if v, ok := cv.views[key]; ok {
-		v.Status = StatusUnverified
-		v.LastError = fmt.Errorf("view explicitly invalidated")
-	}
-	cv.mu.Unlock()
-}
-
-// InvalidateAll clears all cached verified views.
-func (cv *CatalogVerifier) InvalidateAll() {
-	cv.mu.Lock()
-	cv.views = make(map[string]*VerifiedViewInfo)
-	cv.mu.Unlock()
-}
-
-// IsViewVerified returns whether the view is currently verified.
-func (cv *CatalogVerifier) IsViewVerified(schema, viewName string) bool {
-	key := CanonicalViewKey(schema, viewName)
-	cv.mu.RLock()
-	defer cv.mu.RUnlock()
-	v, ok := cv.views[key]
-	return ok && v.Status == StatusVerified
-}
-
-// EnrichRulesWithVerifiedViews creates a copy of rules with current verified view statuses populated.
-func (cv *CatalogVerifier) EnrichRulesWithVerifiedViews(rules ast.Rules) ast.Rules {
+// EnrichRulesWithVerifiedViews returns an isolated, immutable copy of Rules populated with verified view decisions
+// scoped strictly to the given clientID and policy version (SEC-P2-06).
+func (cv *CatalogVerifier) EnrichRulesWithVerifiedViews(clientID string, version int, rules ast.Rules) ast.Rules {
 	cv.mu.RLock()
 	defer cv.mu.RUnlock()
 
@@ -338,20 +476,121 @@ func (cv *CatalogVerifier) EnrichRulesWithVerifiedViews(rules ast.Rules) ast.Rul
 		schema, name := SplitSchemaView(v.Name)
 		key := CanonicalViewKey(schema, name)
 		bareKey := strings.ToLower(name)
+		authKey := clientAuthKey(clientID, version, schema, name)
 
-		if info, exists := cv.views[key]; exists && info.Status == StatusVerified {
-			newRules.VerifiedViews[key] = true
-			newRules.VerifiedViews[bareKey] = true
-		} else {
-			newRules.VerifiedViews[key] = false
-			newRules.VerifiedViews[bareKey] = false
+		auth, exists := cv.clientAuthCache[authKey]
+		if exists && auth != nil && auth.Status == StatusVerified {
+			// Verify that client's configured fingerprint matches the cached actual fingerprint
+			if ast.CompareFingerprints(v.DefinitionFingerprint, auth.ActualFingerprint) {
+				newRules.VerifiedViews[key] = true
+				newRules.VerifiedViews[bareKey] = true
+				continue
+			}
 		}
+		newRules.VerifiedViews[key] = false
+		newRules.VerifiedViews[bareKey] = false
 	}
 
 	return newRules
 }
 
-// VerifyStore verifies all views in the policy store against PostgreSQL catalog.
+// CheckDrift checks whether the live PostgreSQL catalog definition of a view has drifted from its cached snapshot.
+func (cv *CatalogVerifier) CheckDrift(ctx context.Context, schema, viewName string) (bool, error) {
+	key := CanonicalViewKey(schema, viewName)
+
+	cv.mu.RLock()
+	snap, exists := cv.catalogCache[key]
+	cv.mu.RUnlock()
+
+	currentDef, err := cv.reader.QueryViewDefinition(ctx, schema, viewName)
+	if err != nil {
+		return true, fmt.Errorf("catalog query failed for view '%s': %w", key, err)
+	}
+
+	currentFP, err := ast.ComputeViewFingerprint(currentDef)
+	if err != nil {
+		return true, fmt.Errorf("failed to compute fingerprint for view '%s': %w", key, err)
+	}
+
+	if exists && snap != nil {
+		if !ast.CompareFingerprints(snap.Fingerprint, currentFP) {
+			return true, fmt.Errorf("schema drift detected: view '%s' fingerprint changed from %s to %s", key, snap.Fingerprint, currentFP)
+		}
+	}
+
+	return false, nil
+}
+
+// CheckClientDrift checks whether the view has drifted relative to the client's approved fingerprint.
+func (cv *CatalogVerifier) CheckClientDrift(ctx context.Context, clientID string, version int, schema, viewName string) (bool, error) {
+	key := CanonicalViewKey(schema, viewName)
+	authKey := clientAuthKey(clientID, version, schema, viewName)
+
+	cv.mu.RLock()
+	auth, exists := cv.clientAuthCache[authKey]
+	cv.mu.RUnlock()
+
+	if !exists || auth == nil || auth.Status != StatusVerified {
+		return true, fmt.Errorf("view '%s' is not in verified state for client '%s'", key, clientID)
+	}
+
+	currentDef, err := cv.reader.QueryViewDefinition(ctx, schema, viewName)
+	if err != nil {
+		return true, err
+	}
+
+	currentFP, err := ast.ComputeViewFingerprint(currentDef)
+	if err != nil {
+		return true, err
+	}
+
+	if !ast.CompareFingerprints(auth.ExpectedFingerprint, currentFP) {
+		err := fmt.Errorf("schema drift detected: view '%s' fingerprint changed from %s to %s", key, auth.ExpectedFingerprint, currentFP)
+		cv.recordClientStatus(clientID, version, schema, viewName, auth.ExpectedFingerprint, currentFP, StatusDriftDetected, auth.Dependencies, err)
+		return true, err
+	}
+
+	return false, nil
+}
+
+// InvalidateView purges cached catalog and client authorizations for a specific view.
+func (cv *CatalogVerifier) InvalidateView(schema, viewName string) {
+	key := CanonicalViewKey(schema, viewName)
+
+	cv.mu.Lock()
+	defer cv.mu.Unlock()
+
+	delete(cv.catalogCache, key)
+
+	for authKey, auth := range cv.clientAuthCache {
+		if auth.CanonicalSchema == schema && auth.CanonicalName == viewName {
+			auth.Status = StatusUnverified
+			auth.LastError = fmt.Errorf("view explicitly invalidated")
+			delete(cv.clientAuthCache, authKey)
+		}
+	}
+}
+
+// InvalidateAll clears all cached catalog snapshots and client authorizations.
+func (cv *CatalogVerifier) InvalidateAll() {
+	cv.mu.Lock()
+	defer cv.mu.Unlock()
+
+	cv.catalogCache = make(map[string]*CatalogSnapshot)
+	cv.clientAuthCache = make(map[string]*ClientViewAuthorization)
+	cv.dependencies = make(map[string][]string)
+}
+
+// IsViewVerified returns whether the view is currently verified for the given client and policy version.
+func (cv *CatalogVerifier) IsViewVerified(clientID string, version int, schema, viewName string) bool {
+	authKey := clientAuthKey(clientID, version, schema, viewName)
+	cv.mu.RLock()
+	defer cv.mu.RUnlock()
+	auth, ok := cv.clientAuthCache[authKey]
+	return ok && auth != nil && auth.Status == StatusVerified
+}
+
+// VerifyStore verifies all views across all clients in the policy store against live PostgreSQL catalogs.
 func (cv *CatalogVerifier) VerifyStore(ctx context.Context, store *policy.Store) error {
 	if store == nil {
 		return nil
@@ -368,7 +607,7 @@ func (cv *CatalogVerifier) VerifyStore(ctx context.Context, store *policy.Store)
 			continue
 		}
 		if len(rules.Views) > 0 {
-			if err := cv.VerifyRules(ctx, &rules); err != nil && firstErr == nil {
+			if err := cv.VerifyClientRules(ctx, agentID, ver, &rules); err != nil && firstErr == nil {
 				firstErr = err
 			}
 		}

@@ -232,8 +232,87 @@ func TestViewProvenance_SensitiveColumnInViewWhereClause_FalseUnexposed_Rejected
 	if err == nil {
 		t.Fatalf("expected filter on sensitive column with false unexposed claim to fail closed")
 	}
-	if !strings.Contains(err.Error(), "filters on it in WHERE clause") {
+	if !strings.Contains(err.Error(), "in WHERE clause") {
 		t.Fatalf("expected WHERE filter violation error, got: %v", err)
+	}
+}
+
+func TestViewProvenance_SensitivePredicateWithoutUnexposed_SEC_P2_07_Rejected(t *testing.T) {
+	// SEC-P2-07: Even if ssn is NOT declared in unexposed_columns, filtering on it in WHERE is forbidden
+	viewDef := "SELECT id, name FROM customers WHERE ssn > '500';"
+	fp, _ := ast.ComputeViewFingerprint(viewDef)
+
+	vp := ast.ViewPolicy{
+		Name:                  "customer_filter_view",
+		BaseTable:             "customers",
+		DefinitionFingerprint: fp,
+		ColumnMappings: map[string]string{
+			"id":   "id",
+			"name": "name",
+		},
+	}
+	maskedCols := map[string][]string{
+		"customers": {"ssn"},
+	}
+
+	err := ast.ValidateViewProvenance(viewDef, vp, maskedCols)
+	if err == nil {
+		t.Fatalf("expected view definition with sensitive WHERE predicate to fail closed (SEC-P2-07)")
+	}
+	if !strings.Contains(err.Error(), "sensitive predicate/inference prohibited") {
+		t.Fatalf("expected sensitive predicate prohibited error, got: %v", err)
+	}
+}
+
+func TestViewProvenance_SensitiveJoinPredicate_SEC_P2_07_Rejected(t *testing.T) {
+	// SEC-P2-07: JOIN ON referencing sensitive column in view definition is forbidden
+	viewDef := "SELECT customers.id, customers.name FROM customers JOIN secret_vault ON customers.ssn = secret_vault.top_secret;"
+	fp, _ := ast.ComputeViewFingerprint(viewDef)
+
+	vp := ast.ViewPolicy{
+		Name:                  "customer_join_view",
+		BaseTable:             "customers",
+		DefinitionFingerprint: fp,
+		ColumnMappings: map[string]string{
+			"id":   "id",
+			"name": "name",
+		},
+	}
+	maskedCols := map[string][]string{
+		"customers": {"ssn"},
+	}
+
+	err := ast.ValidateViewProvenance(viewDef, vp, maskedCols)
+	if err == nil {
+		t.Fatalf("expected view definition with sensitive JOIN qualifier to fail closed (SEC-P2-07)")
+	}
+	if !strings.Contains(err.Error(), "JOIN ON clause") {
+		t.Fatalf("expected JOIN ON clause violation error, got: %v", err)
+	}
+}
+
+func TestViewProvenance_NonSensitivePredicate_Allowed(t *testing.T) {
+	// Non-sensitive filtering (e.g. tenant_id, id, amount) inside view definition is permitted
+	viewDef := "SELECT id, name, ssn FROM customers WHERE tenant_id = 'tenant-alpha' AND id > 0;"
+	fp, _ := ast.ComputeViewFingerprint(viewDef)
+
+	vp := ast.ViewPolicy{
+		Name:                  "customer_filtered_view",
+		BaseTable:             "customers",
+		DefinitionFingerprint: fp,
+		ColumnMappings: map[string]string{
+			"id":   "id",
+			"name": "name",
+			"ssn":  "ssn",
+		},
+	}
+	maskedCols := map[string][]string{
+		"customers": {"ssn"},
+	}
+
+	err := ast.ValidateViewProvenance(viewDef, vp, maskedCols)
+	if err != nil {
+		t.Fatalf("expected non-sensitive predicates in view definition to pass provenance, got: %v", err)
 	}
 }
 

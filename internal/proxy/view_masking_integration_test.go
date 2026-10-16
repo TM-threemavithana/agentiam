@@ -1294,4 +1294,485 @@ func TestViewMaskingIntegration(t *testing.T) {
 			t.Fatalf("CRITICAL: search_path shadowing leaked unmasked value: %s", ssn)
 		}
 	})
+
+	// 22. Adversarial: Cross-client cache isolation (SEC-P2-06)
+	// Client A has valid fingerprint; Client B has invalid fingerprint for same view.
+	t.Run("Adversarial_CrossClientCache_ClientAValid_ClientBInvalid", func(t *testing.T) {
+		adminConn, err := pgx.Connect(ctx, env.adminDSN)
+		if err != nil {
+			t.Fatalf("failed to connect admin: %v", err)
+		}
+		defer adminConn.Close(ctx)
+
+		_, _ = adminConn.Exec(ctx, "CREATE VIEW customer_shared_view AS SELECT id, name FROM customers;")
+		defer adminConn.Exec(ctx, "DROP VIEW IF EXISTS customer_shared_view;")
+
+		var def string
+		_ = adminConn.QueryRow(ctx, "SELECT definition FROM pg_catalog.pg_views WHERE schemaname = 'public' AND viewname = 'customer_shared_view'").Scan(&def)
+		fp, _ := ast.ComputeViewFingerprint(def)
+
+		// Client A: Valid fingerprint
+		env.policyStore.SetAgentPolicy("client-a", policy.AgentConfig{
+			Key:               env.agentKey,
+			AllowedStatements: []string{"SELECT"},
+			AllowedTables:     []string{"customers"},
+			Views: []policy.ViewConfig{
+				{
+					Name:                  "customer_shared_view",
+					BaseTable:             "customers",
+					DefinitionFingerprint: fp,
+					ColumnMappings:        map[string]string{"id": "id", "name": "name"},
+				},
+			},
+		})
+
+		// Client B: Invalid/tampered fingerprint
+		env.policyStore.SetAgentPolicy("client-b", policy.AgentConfig{
+			Key:               env.agentKey,
+			AllowedStatements: []string{"SELECT"},
+			AllowedTables:     []string{"customers"},
+			Views: []policy.ViewConfig{
+				{
+					Name:                  "customer_shared_view",
+					BaseTable:             "customers",
+					DefinitionFingerprint: "sha256:badbeefbadbeefbadbeefbadbeefbadbeefbadbeefbadbeefbadbeefbadbeef",
+					ColumnMappings:        map[string]string{"id": "id", "name": "name"},
+				},
+			},
+		})
+
+		// Connect Client A -> Must succeed
+		dsnA, _ := url.Parse(env.proxyDSN)
+		dsnA.User = url.UserPassword("client-a", "agent_password_xyz")
+		connA, err := pgx.Connect(ctx, dsnA.String())
+		if err != nil {
+			t.Fatalf("client-a failed to connect: %v", err)
+		}
+		defer connA.Close(ctx)
+
+		rowsA, err := connA.Query(ctx, "SELECT id, name FROM customer_shared_view;")
+		if err != nil {
+			t.Fatalf("client-a expected to succeed on valid view, got: %v", err)
+		}
+		rowsA.Close()
+
+		// Connect Client B -> Must FAIL CLOSED (cannot reuse Client A's verification)
+		dsnB, _ := url.Parse(env.proxyDSN)
+		dsnB.User = url.UserPassword("client-b", "agent_password_xyz")
+		connB, err := pgx.Connect(ctx, dsnB.String())
+		if err != nil {
+			t.Fatalf("client-b failed to connect: %v", err)
+		}
+		defer connB.Close(ctx)
+
+		_, errB := connB.Query(ctx, "SELECT id, name FROM customer_shared_view;")
+		if errB == nil {
+			t.Fatalf("CRITICAL SEC-P2-06: client-b with invalid fingerprint was authorized via client-a's cache!")
+		}
+		if !strings.Contains(errB.Error(), "policy violation") {
+			t.Fatalf("expected policy violation for client-b, got: %v", errB)
+		}
+	})
+
+	// 23. Adversarial: Reverse verification order (Client B verified first, then Client A)
+	t.Run("Adversarial_CrossClientCache_ReverseVerificationOrder", func(t *testing.T) {
+		adminConn, err := pgx.Connect(ctx, env.adminDSN)
+		if err != nil {
+			t.Fatalf("failed to connect admin: %v", err)
+		}
+		defer adminConn.Close(ctx)
+
+		_, _ = adminConn.Exec(ctx, "CREATE VIEW customer_shared_rev_view AS SELECT id, name FROM customers;")
+		defer adminConn.Exec(ctx, "DROP VIEW IF EXISTS customer_shared_rev_view;")
+
+		var def string
+		_ = adminConn.QueryRow(ctx, "SELECT definition FROM pg_catalog.pg_views WHERE schemaname = 'public' AND viewname = 'customer_shared_rev_view'").Scan(&def)
+		fp, _ := ast.ComputeViewFingerprint(def)
+
+		// Client A: Valid fingerprint
+		env.policyStore.SetAgentPolicy("client-a", policy.AgentConfig{
+			Key:               env.agentKey,
+			AllowedStatements: []string{"SELECT"},
+			AllowedTables:     []string{"customers"},
+			Views: []policy.ViewConfig{
+				{
+					Name:                  "customer_shared_rev_view",
+					BaseTable:             "customers",
+					DefinitionFingerprint: fp,
+					ColumnMappings:        map[string]string{"id": "id", "name": "name"},
+				},
+			},
+		})
+
+		// Client B: Invalid/tampered fingerprint
+		env.policyStore.SetAgentPolicy("client-b", policy.AgentConfig{
+			Key:               env.agentKey,
+			AllowedStatements: []string{"SELECT"},
+			AllowedTables:     []string{"customers"},
+			Views: []policy.ViewConfig{
+				{
+					Name:                  "customer_shared_rev_view",
+					BaseTable:             "customers",
+					DefinitionFingerprint: "sha256:badbeefbadbeefbadbeefbadbeefbadbeefbadbeefbadbeefbadbeefbadbeef",
+					ColumnMappings:        map[string]string{"id": "id", "name": "name"},
+				},
+			},
+		})
+
+		dsnB, _ := url.Parse(env.proxyDSN)
+		dsnB.User = url.UserPassword("client-b", "agent_password_xyz")
+		connB, err := pgx.Connect(ctx, dsnB.String())
+		if err != nil {
+			t.Fatalf("client-b failed to connect: %v", err)
+		}
+		defer connB.Close(ctx)
+
+		// Client B queries first -> fails
+		rowsB, errB := connB.Query(ctx, "SELECT id, name FROM customer_shared_rev_view;")
+		if errB == nil {
+			defer rowsB.Close()
+			for rowsB.Next() {
+			}
+			errB = rowsB.Err()
+		}
+		if errB == nil {
+			t.Fatalf("client-b expected to fail closed")
+		}
+
+		// Client A queries second -> must still succeed (Client B's failure does not contaminate Client A)
+		dsnA, _ := url.Parse(env.proxyDSN)
+		dsnA.User = url.UserPassword("client-a", "agent_password_xyz")
+		connA, err := pgx.Connect(ctx, dsnA.String())
+		if err != nil {
+			t.Fatalf("client-a failed to connect: %v", err)
+		}
+		defer connA.Close(ctx)
+
+		rowsA, err := connA.Query(ctx, "SELECT id, name FROM customer_shared_rev_view;")
+		if err != nil {
+			t.Fatalf("client-a expected to succeed despite client-b failure, got: %v", err)
+		}
+		defer rowsA.Close()
+		var countA int
+		for rowsA.Next() {
+			countA++
+		}
+		if err := rowsA.Err(); err != nil {
+			t.Fatalf("client-a query execution failed: %v", err)
+		}
+		if countA == 0 {
+			t.Fatalf("expected rows for client-a, got 0")
+		}
+	})
+
+	// 24. Adversarial: Automatic runtime schema drift detection on existing connection (RISK-VIEW-01)
+	t.Run("Adversarial_AutomaticRuntimeSchemaDrift_WithoutPolicyReload", func(t *testing.T) {
+		adminConn, err := pgx.Connect(ctx, env.adminDSN)
+		if err != nil {
+			t.Fatalf("failed to connect admin: %v", err)
+		}
+		defer adminConn.Close(ctx)
+
+		_, _ = adminConn.Exec(ctx, "CREATE VIEW customer_auto_drift_view AS SELECT id, name FROM customers;")
+		defer adminConn.Exec(ctx, "DROP VIEW IF EXISTS customer_auto_drift_view;")
+
+		var def string
+		_ = adminConn.QueryRow(ctx, "SELECT definition FROM pg_catalog.pg_views WHERE schemaname = 'public' AND viewname = 'customer_auto_drift_view'").Scan(&def)
+		fp, _ := ast.ComputeViewFingerprint(def)
+
+		env.policyStore.SetAgentPolicy("test-analyst", policy.AgentConfig{
+			Key:               env.agentKey,
+			AllowedStatements: []string{"SELECT"},
+			AllowedTables:     []string{"customers"},
+			Views: []policy.ViewConfig{
+				{
+					Name:                  "customer_auto_drift_view",
+					BaseTable:             "customers",
+					DefinitionFingerprint: fp,
+					ColumnMappings:        map[string]string{"id": "id", "name": "name"},
+				},
+			},
+		})
+
+		// Configure strict query-time catalog freshness
+		env.server.GetCatalogVerifier().SetTTL(0)
+
+		// 1. Establish connection and execute query successfully
+		conn, err := pgx.Connect(ctx, env.proxyDSN)
+		if err != nil {
+			t.Fatalf("failed to connect: %v", err)
+		}
+		defer conn.Close(ctx)
+
+		rows, err := conn.Query(ctx, "SELECT id, name FROM customer_auto_drift_view;")
+		if err != nil {
+			t.Fatalf("expected initial query to succeed: %v", err)
+		}
+		rows.Close()
+
+		// 2. Out-of-band DDL alters view definition in PostgreSQL without touching AgentIAM policy!
+		_, err = adminConn.Exec(ctx, "CREATE OR REPLACE VIEW customer_auto_drift_view AS SELECT id, name, ssn FROM customers;")
+		if err != nil {
+			t.Fatalf("admin failed to alter view: %v", err)
+		}
+
+		// 3. Query again through the ALREADY CONNECTED client without manual CheckDrift or policy reload!
+		rowsDrift, errDrift := conn.Query(ctx, "SELECT id, name FROM customer_auto_drift_view;")
+		if errDrift == nil {
+			defer rowsDrift.Close()
+			for rowsDrift.Next() {
+			}
+			errDrift = rowsDrift.Err()
+		}
+		if errDrift == nil {
+			t.Fatalf("CRITICAL RISK-VIEW-01: out-of-band view alteration was not detected automatically at runtime!")
+		}
+		if !strings.Contains(errDrift.Error(), "policy violation") {
+			t.Fatalf("expected policy violation for drifted view, got: %v", errDrift)
+		}
+	})
+
+	// 25. Adversarial: Prepared statement execution fails closed after runtime view drift
+	t.Run("Adversarial_PreparedStatement_FailsAfterRuntimeDrift", func(t *testing.T) {
+		adminConn, err := pgx.Connect(ctx, env.adminDSN)
+		if err != nil {
+			t.Fatalf("failed to connect admin: %v", err)
+		}
+		defer adminConn.Close(ctx)
+
+		_, _ = adminConn.Exec(ctx, "CREATE VIEW customer_prep_drift_view AS SELECT id, name FROM customers;")
+		defer adminConn.Exec(ctx, "DROP VIEW IF EXISTS customer_prep_drift_view;")
+
+		var def string
+		_ = adminConn.QueryRow(ctx, "SELECT definition FROM pg_catalog.pg_views WHERE schemaname = 'public' AND viewname = 'customer_prep_drift_view'").Scan(&def)
+		fp, _ := ast.ComputeViewFingerprint(def)
+
+		env.policyStore.SetAgentPolicy("test-analyst", policy.AgentConfig{
+			Key:               env.agentKey,
+			AllowedStatements: []string{"SELECT"},
+			AllowedTables:     []string{"customers"},
+			Views: []policy.ViewConfig{
+				{
+					Name:                  "customer_prep_drift_view",
+					BaseTable:             "customers",
+					DefinitionFingerprint: fp,
+					ColumnMappings:        map[string]string{"id": "id", "name": "name"},
+				},
+			},
+		})
+
+		env.server.GetCatalogVerifier().SetTTL(0)
+
+		conn, err := pgx.Connect(ctx, env.proxyDSN)
+		if err != nil {
+			t.Fatalf("failed to connect: %v", err)
+		}
+		defer conn.Close(ctx)
+
+		// Prepare statement on approved view
+		_, err = conn.Prepare(ctx, "stmt_prep_drift", "SELECT id, name FROM customer_prep_drift_view WHERE id = $1")
+		if err != nil {
+			t.Fatalf("failed to prepare statement: %v", err)
+		}
+
+		// Execute successfully before drift
+		var id int
+		var name string
+		err = conn.QueryRow(ctx, "stmt_prep_drift", 1).Scan(&id, &name)
+		if err != nil {
+			t.Fatalf("expected prepared statement to succeed before drift: %v", err)
+		}
+
+		// Out-of-band DDL alters view definition
+		_, err = adminConn.Exec(ctx, "CREATE OR REPLACE VIEW customer_prep_drift_view AS SELECT id, name, ssn FROM customers;")
+		if err != nil {
+			t.Fatalf("failed to alter view: %v", err)
+		}
+
+		// Execute prepared statement again -> must fail closed on Bind
+		err = conn.QueryRow(ctx, "stmt_prep_drift", 1).Scan(&id, &name)
+		if err == nil {
+			t.Fatalf("CRITICAL: prepared statement succeeded after runtime view drift!")
+		}
+		if !strings.Contains(err.Error(), "policy violation") && !strings.Contains(err.Error(), "57P01") {
+			t.Fatalf("expected policy violation for prepared statement after drift, got: %v", err)
+		}
+	})
+
+	// 26. Adversarial: Sensitive WHERE predicate in view definition rejected (SEC-P2-07)
+	t.Run("Adversarial_SensitiveWherePredicate_InViewDefinition_Denied", func(t *testing.T) {
+		adminConn, err := pgx.Connect(ctx, env.adminDSN)
+		if err != nil {
+			t.Fatalf("failed to connect admin: %v", err)
+		}
+		defer adminConn.Close(ctx)
+
+		// Attacker defines view that filters rows using sensitive ssn
+		_, err = adminConn.Exec(ctx, "CREATE VIEW customer_where_leak_view AS SELECT id, name FROM customers WHERE ssn > '500';")
+		if err != nil {
+			t.Fatalf("failed to create view: %v", err)
+		}
+		defer adminConn.Exec(ctx, "DROP VIEW IF EXISTS customer_where_leak_view;")
+
+		var def string
+		_ = adminConn.QueryRow(ctx, "SELECT definition FROM pg_catalog.pg_views WHERE schemaname = 'public' AND viewname = 'customer_where_leak_view'").Scan(&def)
+		fp, _ := ast.ComputeViewFingerprint(def)
+
+		env.policyStore.SetAgentPolicy("test-analyst", policy.AgentConfig{
+			Key:               env.agentKey,
+			AllowedStatements: []string{"SELECT"},
+			AllowedTables:     []string{"customers"},
+			Views: []policy.ViewConfig{
+				{
+					Name:                  "customer_where_leak_view",
+					BaseTable:             "customers",
+					DefinitionFingerprint: fp,
+					ColumnMappings:        map[string]string{"id": "id", "name": "name"},
+				},
+			},
+			MaskedColumns: map[string][]string{
+				"customers": {"ssn"},
+			},
+		})
+
+		conn, err := pgx.Connect(ctx, env.proxyDSN)
+		if err != nil {
+			t.Fatalf("failed to connect: %v", err)
+		}
+		defer conn.Close(ctx)
+
+		_, err = conn.Query(ctx, "SELECT id, name FROM customer_where_leak_view;")
+		if err == nil {
+			t.Fatalf("CRITICAL SEC-P2-07: view definition with sensitive WHERE predicate was permitted!")
+		}
+		if !strings.Contains(err.Error(), "policy violation") {
+			t.Fatalf("expected policy violation for sensitive WHERE predicate, got: %v", err)
+		}
+	})
+
+	// 27. Adversarial: Sensitive JOIN ON predicate in view definition rejected (SEC-P2-07)
+	t.Run("Adversarial_SensitiveJoinPredicate_InViewDefinition_Denied", func(t *testing.T) {
+		adminConn, err := pgx.Connect(ctx, env.adminDSN)
+		if err != nil {
+			t.Fatalf("failed to connect admin: %v", err)
+		}
+		defer adminConn.Close(ctx)
+
+		_, err = adminConn.Exec(ctx, "CREATE VIEW customer_join_leak_view AS SELECT customers.id, customers.name FROM customers JOIN secret_vault ON customers.ssn = secret_vault.top_secret;")
+		if err != nil {
+			t.Fatalf("failed to create view: %v", err)
+		}
+		defer adminConn.Exec(ctx, "DROP VIEW IF EXISTS customer_join_leak_view;")
+
+		var def string
+		_ = adminConn.QueryRow(ctx, "SELECT definition FROM pg_catalog.pg_views WHERE schemaname = 'public' AND viewname = 'customer_join_leak_view'").Scan(&def)
+		fp, _ := ast.ComputeViewFingerprint(def)
+
+		env.policyStore.SetAgentPolicy("test-analyst", policy.AgentConfig{
+			Key:               env.agentKey,
+			AllowedStatements: []string{"SELECT"},
+			AllowedTables:     []string{"customers"},
+			Views: []policy.ViewConfig{
+				{
+					Name:                  "customer_join_leak_view",
+					BaseTable:             "customers",
+					DefinitionFingerprint: fp,
+					ColumnMappings:        map[string]string{"id": "id", "name": "name"},
+				},
+			},
+			MaskedColumns: map[string][]string{
+				"customers": {"ssn"},
+			},
+		})
+
+		conn, err := pgx.Connect(ctx, env.proxyDSN)
+		if err != nil {
+			t.Fatalf("failed to connect: %v", err)
+		}
+		defer conn.Close(ctx)
+
+		_, err = conn.Query(ctx, "SELECT id, name FROM customer_join_leak_view;")
+		if err == nil {
+			t.Fatalf("CRITICAL SEC-P2-07: view definition with sensitive JOIN predicate was permitted!")
+		}
+		if !strings.Contains(err.Error(), "policy violation") {
+			t.Fatalf("expected policy violation for sensitive JOIN predicate, got: %v", err)
+		}
+	})
+
+	// 28. Adversarial: Nested view - altered inner view causes outer view query to fail closed (SEC-P2-08)
+	t.Run("Adversarial_NestedView_AlteredInnerView_FailsOuterQuery", func(t *testing.T) {
+		adminConn, err := pgx.Connect(ctx, env.adminDSN)
+		if err != nil {
+			t.Fatalf("failed to connect admin: %v", err)
+		}
+		defer adminConn.Close(ctx)
+
+		_, _ = adminConn.Exec(ctx, "CREATE VIEW inner_dep_view AS SELECT id, name FROM customers;")
+		_, _ = adminConn.Exec(ctx, "CREATE VIEW outer_nested_view AS SELECT id, name FROM inner_dep_view;")
+		defer adminConn.Exec(ctx, "DROP VIEW IF EXISTS outer_nested_view;")
+		defer adminConn.Exec(ctx, "DROP VIEW IF EXISTS inner_dep_view;")
+
+		var defInner, defOuter string
+		_ = adminConn.QueryRow(ctx, "SELECT definition FROM pg_catalog.pg_views WHERE schemaname = 'public' AND viewname = 'inner_dep_view'").Scan(&defInner)
+		_ = adminConn.QueryRow(ctx, "SELECT definition FROM pg_catalog.pg_views WHERE schemaname = 'public' AND viewname = 'outer_nested_view'").Scan(&defOuter)
+		fpInner, _ := ast.ComputeViewFingerprint(defInner)
+		fpOuter, _ := ast.ComputeViewFingerprint(defOuter)
+
+		env.policyStore.SetAgentPolicy("test-analyst", policy.AgentConfig{
+			Key:               env.agentKey,
+			AllowedStatements: []string{"SELECT"},
+			AllowedTables:     []string{"customers"},
+			Views: []policy.ViewConfig{
+				{
+					Name:                  "inner_dep_view",
+					BaseTable:             "customers",
+					DefinitionFingerprint: fpInner,
+					ColumnMappings:        map[string]string{"id": "id", "name": "name"},
+				},
+				{
+					Name:                  "outer_nested_view",
+					BaseTable:             "inner_dep_view",
+					DefinitionFingerprint: fpOuter,
+					ColumnMappings:        map[string]string{"id": "id", "name": "name"},
+				},
+			},
+		})
+
+		env.server.GetCatalogVerifier().SetTTL(0)
+
+		conn, err := pgx.Connect(ctx, env.proxyDSN)
+		if err != nil {
+			t.Fatalf("failed to connect: %v", err)
+		}
+		defer conn.Close(ctx)
+
+		// 1. Query outer view -> succeeds before inner drift
+		rows, err := conn.Query(ctx, "SELECT id, name FROM outer_nested_view;")
+		if err != nil {
+			t.Fatalf("expected outer view query to succeed: %v", err)
+		}
+		rows.Close()
+
+		// 2. DBA alters INNER view in PostgreSQL (outer view SQL remains completely unchanged!)
+		_, err = adminConn.Exec(ctx, "CREATE OR REPLACE VIEW inner_dep_view AS SELECT id, name, ssn FROM customers;")
+		if err != nil {
+			t.Fatalf("failed to alter inner view: %v", err)
+		}
+
+		// 3. Query outer view again -> must fail closed because inner dependency drifted!
+		rowsOuter, errOuter := conn.Query(ctx, "SELECT id, name FROM outer_nested_view;")
+		if errOuter == nil {
+			defer rowsOuter.Close()
+			for rowsOuter.Next() {
+			}
+			errOuter = rowsOuter.Err()
+		}
+		if errOuter == nil {
+			t.Fatalf("CRITICAL SEC-P2-08: outer view succeeded despite underlying inner view definition drift!")
+		}
+		if !strings.Contains(errOuter.Error(), "policy violation") {
+			t.Fatalf("expected policy violation on outer view, got: %v", errOuter)
+		}
+	})
 }

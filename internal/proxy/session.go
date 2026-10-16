@@ -449,7 +449,7 @@ func (s *Session) Run() (err error) {
 		return fmt.Errorf("password auth failed")
 	}
 	if s.server != nil && s.server.verifier != nil {
-		rules = s.server.verifier.EnrichRulesWithVerifiedViews(rules)
+		rules = s.server.verifier.EnrichRulesWithVerifiedViews(clientID, authVersion, rules)
 	}
 	s.rules = rules
 	s.authVersion = authVersion
@@ -695,9 +695,26 @@ func (s *Session) handleParseMsg(ctx context.Context, v *pgproto3.Parse, clientW
 		return fmt.Errorf("session policy revoked")
 	}
 
+	if s.server != nil && s.server.verifier != nil && len(s.rules.Views) > 0 {
+		refs, refErr := ast.ExtractReferencedRelations(v.Query)
+		if refErr == nil && len(refs) > 0 {
+			if freshErr := s.server.verifier.EnsureFreshness(ctx, s.clientID, s.authVersion, &s.rules, refs); freshErr != nil {
+				s.server.DispatchAudit(AuditEvent{Event: EventPolicyBlocked, ClientID: s.clientID, SQL: v.Query, Status: "blocked", Error: freshErr.Error()})
+				BlockedQueriesTotal.WithLabelValues("policy").Inc()
+				clientWriteCh <- &pgproto3.ErrorResponse{
+					Severity: "ERROR",
+					Code:     "57P01",
+					Message:  fmt.Sprintf("AgentIAM Policy Violation: %v", freshErr),
+				}
+				s.errorDiscard.Store(true)
+				return nil
+			}
+		}
+	}
+
 	currentRules := s.rules
 	if s.server != nil && s.server.verifier != nil {
-		currentRules = s.server.verifier.EnrichRulesWithVerifiedViews(s.rules)
+		currentRules = s.server.verifier.EnrichRulesWithVerifiedViews(s.clientID, s.authVersion, s.rules)
 	}
 	rewrittenSQL, limitParams, err := (&ast.PostgresParser{}).ApplyRules(v.Query, currentRules, s.server.astCache)
 	if err != nil {
@@ -776,6 +793,23 @@ func (s *Session) handleBindMsg(ctx context.Context, v *pgproto3.Bind, clientWri
 
 	ps, exists := s.preparedStatements[v.PreparedStatement]
 	if exists {
+		if s.server != nil && s.server.verifier != nil && len(s.rules.Views) > 0 {
+			refs, refErr := ast.ExtractReferencedRelations(ps.SQL)
+			if refErr == nil && len(refs) > 0 {
+				if freshErr := s.server.verifier.EnsureFreshness(ctx, s.clientID, s.authVersion, &s.rules, refs); freshErr != nil {
+					s.server.DispatchAudit(AuditEvent{Event: EventPolicyBlocked, ClientID: s.clientID, SQL: ps.SQL, Status: "blocked", Error: freshErr.Error()})
+					BlockedQueriesTotal.WithLabelValues("policy").Inc()
+					clientWriteCh <- &pgproto3.ErrorResponse{
+						Severity: "FATAL",
+						Code:     "57P01",
+						Message:  fmt.Sprintf("AgentIAM Policy Violation: %v", freshErr),
+					}
+					s.errorDiscard.Store(true)
+					return nil
+				}
+			}
+		}
+
 		u.SwallowParseComplete.Add(1)
 		u.Frontend.Send(&pgproto3.Parse{
 			Name:          "",
@@ -880,9 +914,26 @@ func (s *Session) handleQueryMsg(ctx context.Context, v *pgproto3.Query, clientW
 		return nil
 	}
 
+	if s.server != nil && s.server.verifier != nil && len(s.rules.Views) > 0 {
+		refs, refErr := ast.ExtractReferencedRelations(v.String)
+		if refErr == nil && len(refs) > 0 {
+			if freshErr := s.server.verifier.EnsureFreshness(ctx, s.clientID, s.authVersion, &s.rules, refs); freshErr != nil {
+				s.server.DispatchAudit(AuditEvent{Event: EventPolicyBlocked, ClientID: s.clientID, SQL: v.String, Status: "blocked", Error: freshErr.Error()})
+				BlockedQueriesTotal.WithLabelValues("policy").Inc()
+				clientWriteCh <- &pgproto3.ErrorResponse{
+					Severity: "ERROR",
+					Code:     "57P01",
+					Message:  fmt.Sprintf("AgentIAM Policy Violation: %v", freshErr),
+				}
+				clientWriteCh <- &pgproto3.ReadyForQuery{TxStatus: 'I'}
+				return nil
+			}
+		}
+	}
+
 	currentRules := s.rules
 	if s.server != nil && s.server.verifier != nil {
-		currentRules = s.server.verifier.EnrichRulesWithVerifiedViews(s.rules)
+		currentRules = s.server.verifier.EnrichRulesWithVerifiedViews(s.clientID, s.authVersion, s.rules)
 	}
 	rewrittenSQL, _, err := (&ast.PostgresParser{}).ApplyRules(v.String, currentRules, s.server.astCache)
 	if err != nil {

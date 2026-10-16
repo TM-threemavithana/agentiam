@@ -265,18 +265,114 @@ func ValidateViewProvenance(viewDef string, v ViewPolicy, maskedColumns map[stri
 		}
 	}
 
-	// Inspect WHERE clause and JOIN qualifiers for sensitive column leakage
-	if sel.WhereClause != nil {
-		whereCols := extractColumnsFromNode(sel.WhereClause)
-		for _, wc := range whereCols {
-			wcNorm := strings.ToLower(wc)
-			if sensitiveCols[wcNorm] && unexposedCols[wcNorm] {
-				return fmt.Errorf("policy error: view '%s' declared sensitive column '%s' in unexposed_columns, but definition filters on it in WHERE clause (fail-closed)", v.Name, wc)
-			}
+	// Inspect WHERE, HAVING, GROUP BY, ORDER BY, WINDOW clauses and JOIN qualifiers
+	// for sensitive column leakage/inference (SEC-P2-07 fail-closed)
+	if err := checkClauseNoSensitiveColumns(sel.WhereClause, sensitiveCols, "WHERE clause", v.Name); err != nil {
+		return err
+	}
+	if err := checkClauseNoSensitiveColumns(sel.HavingClause, sensitiveCols, "HAVING clause", v.Name); err != nil {
+		return err
+	}
+	for _, item := range sel.GroupClause {
+		if err := checkClauseNoSensitiveColumns(item, sensitiveCols, "GROUP BY clause", v.Name); err != nil {
+			return err
 		}
+	}
+	for _, item := range sel.SortClause {
+		if err := checkClauseNoSensitiveColumns(item, sensitiveCols, "ORDER BY clause", v.Name); err != nil {
+			return err
+		}
+	}
+	for _, item := range sel.WindowClause {
+		if err := checkClauseNoSensitiveColumns(item, sensitiveCols, "WINDOW clause", v.Name); err != nil {
+			return err
+		}
+	}
+	if err := checkJoinQualsNoSensitiveColumns(sel.FromClause, sensitiveCols, v.Name); err != nil {
+		return err
 	}
 
 	return nil
+}
+
+func checkClauseNoSensitiveColumns(node *pg_query.Node, sensitiveCols map[string]bool, clauseName, viewName string) error {
+	if node == nil {
+		return nil
+	}
+	cols := extractColumnsFromNode(node)
+	for _, c := range cols {
+		cNorm := strings.ToLower(c)
+		if sensitiveCols[cNorm] {
+			return fmt.Errorf("security violation: view '%s' references sensitive column '%s' in %s (sensitive predicate/inference prohibited, SEC-P2-07 fail-closed)", viewName, c, clauseName)
+		}
+	}
+	return nil
+}
+
+func checkJoinQualsNoSensitiveColumns(fromList []*pg_query.Node, sensitiveCols map[string]bool, viewName string) error {
+	for _, n := range fromList {
+		if n == nil || n.Node == nil {
+			continue
+		}
+		if err := walkJoinQuals(n, func(quals *pg_query.Node) error {
+			return checkClauseNoSensitiveColumns(quals, sensitiveCols, "JOIN ON clause", viewName)
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func walkJoinQuals(node *pg_query.Node, fn func(quals *pg_query.Node) error) error {
+	if node == nil || node.Node == nil {
+		return nil
+	}
+	switch n := node.Node.(type) {
+	case *pg_query.Node_JoinExpr:
+		je := n.JoinExpr
+		if je != nil {
+			if je.Quals != nil {
+				if err := fn(je.Quals); err != nil {
+					return err
+				}
+			}
+			if je.Larg != nil {
+				if err := walkJoinQuals(je.Larg, fn); err != nil {
+					return err
+				}
+			}
+			if je.Rarg != nil {
+				if err := walkJoinQuals(je.Rarg, fn); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// ExtractViewDependencies parses a view definition SQL and extracts all table/view names referenced in its FROM clause.
+func ExtractViewDependencies(viewDef string) ([]string, error) {
+	trimmed := strings.TrimSpace(viewDef)
+	if trimmed == "" {
+		return nil, fmt.Errorf("empty view definition")
+	}
+	b, err := parser.ParseToProtobuf(trimmed)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse view definition: %w", err)
+	}
+	var tree pg_query.ParseResult
+	if err := proto.Unmarshal(b, &tree); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal view AST: %w", err)
+	}
+	if len(tree.Stmts) != 1 || tree.Stmts[0].Stmt == nil {
+		return nil, fmt.Errorf("view definition must contain exactly one statement")
+	}
+	selNode, ok := tree.Stmts[0].Stmt.Node.(*pg_query.Node_SelectStmt)
+	if !ok || selNode.SelectStmt == nil {
+		return nil, fmt.Errorf("view definition is not a SELECT statement")
+	}
+	return extractTablesFromFromClause(selNode.SelectStmt.FromClause), nil
 }
 
 func extractColumnNameFromRef(colRef *pg_query.ColumnRef) string {
@@ -397,6 +493,18 @@ func extractColumnsFromNode(node *pg_query.Node) []string {
 			if n.SubLink.Subselect != nil {
 				cols = append(cols, extractColumnsFromNode(n.SubLink.Subselect)...)
 			}
+		}
+
+	case *pg_query.Node_SelectStmt:
+		if n.SelectStmt != nil {
+			for _, item := range n.SelectStmt.TargetList {
+				cols = append(cols, extractColumnsFromNode(item)...)
+			}
+			for _, item := range n.SelectStmt.FromClause {
+				cols = append(cols, extractColumnsFromNode(item)...)
+			}
+			cols = append(cols, extractColumnsFromNode(n.SelectStmt.WhereClause)...)
+			cols = append(cols, extractColumnsFromNode(n.SelectStmt.HavingClause)...)
 		}
 
 	default:

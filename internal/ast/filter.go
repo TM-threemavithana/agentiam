@@ -176,6 +176,35 @@ func collectCTEsRecursive(node *pg_query.Node, ctes map[string]bool) {
 	}
 }
 
+// ExtractReferencedRelations parses SQL and extracts all relation names (RangeVar) referenced in it,
+// returning lowercase canonical identifiers (e.g. "public.customers" or "customers").
+func ExtractReferencedRelations(sql string) ([]string, error) {
+	b, err := parser.ParseToProtobuf(sql)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse SQL: %w", err)
+	}
+	var tree pg_query.ParseResult
+	if err := proto.Unmarshal(b, &tree); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal AST: %w", err)
+	}
+	var rels []string
+	seen := make(map[string]bool)
+	for _, stmt := range tree.Stmts {
+		refs := extractPostgresRelationRefs(stmt.Stmt)
+		for _, r := range refs {
+			name := strings.ToLower(r.Name)
+			if r.Schema != "" {
+				name = strings.ToLower(r.Schema) + "." + name
+			}
+			if !seen[name] {
+				seen[name] = true
+				rels = append(rels, name)
+			}
+		}
+	}
+	return rels, nil
+}
+
 // extractPostgresRelationRefs walks an AST node and collects all referenced relations (RangeVar),
 // ignoring query-local CTE names.
 func extractPostgresRelationRefs(node *pg_query.Node) []RelationRef {
