@@ -192,9 +192,9 @@ func ExtractReferencedRelations(sql string) ([]string, error) {
 	for _, stmt := range tree.Stmts {
 		refs := extractPostgresRelationRefs(stmt.Stmt)
 		for _, r := range refs {
-			name := strings.ToLower(r.Name)
+			name := QuoteIdentIfNeeded(r.Name)
 			if r.Schema != "" {
-				name = strings.ToLower(r.Schema) + "." + name
+				name = QuoteIdentIfNeeded(r.Schema) + "." + name
 			}
 			if !seen[name] {
 				seen[name] = true
@@ -232,7 +232,7 @@ func collectRelationRefs(v interface{}, cteNames map[string]bool, refs *[]Relati
 			if rv.Schemaname == "" && cteNames[nameLower] {
 				return
 			}
-			key := strings.ToLower(rv.Schemaname) + "." + nameLower
+			key := rv.Schemaname + "." + rv.Relname
 			if !seen[key] {
 				seen[key] = true
 				*refs = append(*refs, RelationRef{
@@ -249,7 +249,7 @@ func collectRelationRefs(v interface{}, cteNames map[string]bool, refs *[]Relati
 			if rv.Schemaname == "" && cteNames[nameLower] {
 				return
 			}
-			key := strings.ToLower(rv.Schemaname) + "." + nameLower
+			key := rv.Schemaname + "." + rv.Relname
 			if !seen[key] {
 				seen[key] = true
 				*refs = append(*refs, RelationRef{
@@ -383,40 +383,34 @@ func collectRelationRefsNodeSlice(nodes []*pg_query.Node, cteNames map[string]bo
 
 // matchesRelation determines if an extracted RelationRef matches an allowed relation pattern.
 // Handles bare names (implying public/default schema) and explicit schema qualification.
+// Respects PostgreSQL quoted identifier exact casing and unquoted folding.
 func matchesRelation(ref RelationRef, allowed string) bool {
-	allowedLower := strings.ToLower(strings.TrimSpace(allowed))
-	refNameLower := strings.ToLower(strings.TrimSpace(ref.Name))
-	refSchemaLower := strings.ToLower(strings.TrimSpace(ref.Schema))
-
-	if allowedLower == "*" {
+	allowedTrimmed := strings.TrimSpace(allowed)
+	if allowedTrimmed == "*" {
 		return true
 	}
 
-	var allowedSchema, allowedName string
-	if idx := strings.Index(allowedLower, "."); idx != -1 {
-		allowedSchema = allowedLower[:idx]
-		allowedName = allowedLower[idx+1:]
-	} else {
-		allowedName = allowedLower
-	}
+	allowedSchema, allowedName := SplitSchemaView(allowedTrimmed)
+	refSchema := CanonicalizeIdentifier(ref.Schema)
+	refName := CanonicalizeIdentifier(ref.Name)
 
-	// 1. If allowed specifies schema (e.g. "public.users" or "analytics.report")
-	if allowedSchema != "" {
-		if refSchemaLower != "" {
-			return strings.EqualFold(refSchemaLower, allowedSchema) && strings.EqualFold(refNameLower, allowedName)
+	// Schema check
+	schemaMatches := false
+	if strings.Contains(allowedTrimmed, ".") {
+		if refSchema != "" {
+			schemaMatches = (refSchema == allowedSchema)
+		} else {
+			schemaMatches = (allowedSchema == "public")
 		}
-		// Query omitted schema: matches only if allowedSchema is "public"
-		return allowedSchema == "public" && strings.EqualFold(refNameLower, allowedName)
+	} else {
+		schemaMatches = (refSchema == "" || refSchema == "public")
 	}
 
-	// 2. If allowed did NOT specify schema (e.g. "users")
-	// Matches if query omitted schema OR query specified "public"
-	if refSchemaLower == "" || refSchemaLower == "public" {
-		return strings.EqualFold(refNameLower, allowedName)
+	if !schemaMatches {
+		return false
 	}
 
-	// Query specified non-public schema (e.g. "private.users") while policy did not: reject
-	return false
+	return refName == allowedName
 }
 
 // enforceRelationAccess checks that every relation referenced in stmt is explicitly authorized.
@@ -456,14 +450,12 @@ func enforceRelationAccess(stmt *pg_query.Node, rules Rules) error {
 			for _, v := range rules.Views {
 				if matchesRelation(ref, v.Name) {
 					if rules.RequireCatalogVerification {
-						normView := strings.ToLower(v.Name)
-						bareView := normView
-						if idx := strings.Index(bareView, "."); idx != -1 {
-							bareView = bareView[idx+1:]
-						}
+						schema, name := SplitSchemaView(v.Name)
+						canonKey := CanonicalViewKey(schema, name)
+						bareKey := CanonicalizeIdentifier(name)
 						isVerified := false
 						if rules.VerifiedViews != nil {
-							isVerified = rules.VerifiedViews[normView] || rules.VerifiedViews[bareView]
+							isVerified = rules.VerifiedViews[canonKey] || rules.VerifiedViews[bareKey]
 						}
 						if !isVerified {
 							relStr := ref.Name

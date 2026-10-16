@@ -414,3 +414,81 @@ func TestViewProvenance_EnforceRelationAccess_VerifiedView_Allowed(t *testing.T)
 		t.Fatalf("expected ssn to be redacted on verified view: %s", rewritten2)
 	}
 }
+
+func TestExtractReferencedRelations_QuotedIdentifiers(t *testing.T) {
+	sqlUnquoted := "SELECT * FROM reports;"
+	rels1, err1 := ast.ExtractReferencedRelations(sqlUnquoted)
+	if err1 != nil {
+		t.Fatalf("unexpected error: %v", err1)
+	}
+
+	sqlQuoted := "SELECT * FROM \"Reports\";"
+	rels2, err2 := ast.ExtractReferencedRelations(sqlQuoted)
+	if err2 != nil {
+		t.Fatalf("unexpected error: %v", err2)
+	}
+
+	if len(rels1) != 1 || rels1[0] != "reports" {
+		t.Fatalf("expected unquoted relation 'reports', got %v", rels1)
+	}
+	if len(rels2) != 1 || rels2[0] != "\"Reports\"" {
+		t.Fatalf("expected quoted relation '\"Reports\"', got %v", rels2)
+	}
+}
+
+func TestExtractViewDependencies_FailClosedAndEdgeCases(t *testing.T) {
+	// 1. Empty SQL fails closed
+	if _, err := ast.ExtractViewDependencies(""); err == nil {
+		t.Fatalf("expected error on empty view definition")
+	}
+
+	// 2. Malformed SQL fails closed
+	if _, err := ast.ExtractViewDependencies("SELECT FROM WHERE 1 = ;"); err == nil {
+		t.Fatalf("expected error on malformed SQL view definition")
+	}
+
+	// 3. Non-SELECT statement fails closed
+	if _, err := ast.ExtractViewDependencies("INSERT INTO customers (id) VALUES (1);"); err == nil {
+		t.Fatalf("expected error on non-SELECT view definition")
+	}
+
+	// 4. Multiple statements fail closed
+	if _, err := ast.ExtractViewDependencies("SELECT 1; SELECT 2;"); err == nil {
+		t.Fatalf("expected error on multiple statements in view definition")
+	}
+
+	// 5. CTE names ignored, real dependencies extracted
+	cteSQL := "WITH local_cte AS (SELECT id, name FROM base_table) SELECT * FROM local_cte JOIN other_table ON id;"
+	deps, err := ast.ExtractViewDependencies(cteSQL)
+	if err != nil {
+		t.Fatalf("unexpected error parsing CTE SQL: %v", err)
+	}
+	foundBase := false
+	foundOther := false
+	for _, d := range deps {
+		if d == "local_cte" {
+			t.Fatalf("local CTE should NOT be extracted as external dependency")
+		}
+		if d == "base_table" {
+			foundBase = true
+		}
+		if d == "other_table" {
+			foundOther = true
+		}
+	}
+	if !foundBase || !foundOther {
+		t.Fatalf("expected base_table and other_table dependencies, got %v", deps)
+	}
+
+	// 6. Quoted vs unquoted casing preserved in dependencies
+	quotedSQL := "SELECT * FROM public.\"SpecialView\" JOIN public.regular_table ON id;"
+	quotedDeps, err := ast.ExtractViewDependencies(quotedSQL)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	expectedDeps := []string{"public.\"SpecialView\"", "public.regular_table"}
+	if len(quotedDeps) != 2 || quotedDeps[0] != expectedDeps[0] || quotedDeps[1] != expectedDeps[1] {
+		t.Fatalf("expected deps %v, got %v", expectedDeps, quotedDeps)
+	}
+}
+

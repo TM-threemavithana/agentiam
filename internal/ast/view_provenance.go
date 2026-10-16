@@ -351,28 +351,43 @@ func walkJoinQuals(node *pg_query.Node, fn func(quals *pg_query.Node) error) err
 	return nil
 }
 
-// ExtractViewDependencies parses a view definition SQL and extracts all table/view names referenced in its FROM clause.
+// ExtractViewDependencies parses a view definition SQL and extracts all table/view names referenced in it,
+// excluding query-local CTE names, and preserving exact PostgreSQL canonical relation names.
 func ExtractViewDependencies(viewDef string) ([]string, error) {
 	trimmed := strings.TrimSpace(viewDef)
 	if trimmed == "" {
-		return nil, fmt.Errorf("empty view definition")
+		return nil, fmt.Errorf("empty view definition (fail-closed)")
 	}
 	b, err := parser.ParseToProtobuf(trimmed)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse view definition: %w", err)
+		return nil, fmt.Errorf("failed to parse view definition: %w (fail-closed)", err)
 	}
 	var tree pg_query.ParseResult
 	if err := proto.Unmarshal(b, &tree); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal view AST: %w", err)
+		return nil, fmt.Errorf("failed to unmarshal view AST: %w (fail-closed)", err)
 	}
 	if len(tree.Stmts) != 1 || tree.Stmts[0].Stmt == nil {
-		return nil, fmt.Errorf("view definition must contain exactly one statement")
+		return nil, fmt.Errorf("view definition must contain exactly one statement (fail-closed)")
 	}
 	selNode, ok := tree.Stmts[0].Stmt.Node.(*pg_query.Node_SelectStmt)
 	if !ok || selNode.SelectStmt == nil {
-		return nil, fmt.Errorf("view definition is not a SELECT statement")
+		return nil, fmt.Errorf("view definition is not a SELECT statement (fail-closed)")
 	}
-	return extractTablesFromFromClause(selNode.SelectStmt.FromClause), nil
+
+	refs := extractPostgresRelationRefs(tree.Stmts[0].Stmt)
+	var deps []string
+	seen := make(map[string]bool)
+	for _, r := range refs {
+		ident := QuoteIdentIfNeeded(r.Name)
+		if r.Schema != "" {
+			ident = QuoteIdentIfNeeded(r.Schema) + "." + ident
+		}
+		if !seen[ident] {
+			seen[ident] = true
+			deps = append(deps, ident)
+		}
+	}
+	return deps, nil
 }
 
 func extractColumnNameFromRef(colRef *pg_query.ColumnRef) string {

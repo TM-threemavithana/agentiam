@@ -73,22 +73,25 @@ While network isolation prevents unauthorized direct connections, defense-in-dep
 
 ## 4. Runtime Verification Guarantees & Operational Trade-offs
 
-### Freshness Verification Lifecycle (RISK-VIEW-01)
-- **Invocation Path:** Query-time catalog freshness verification is invoked on every simple query (`handleQueryMsg`), extended query parse (`handleParseMsg`), and prepared statement bind (`handleBindMsg`) whenever an approved view or dependent relation is referenced.
-- **Fail-Closed Semantics:** If catalog verification times out, connection to `pg_catalog` is lost, or the view fingerprint does not match the approved definition, the query is rejected immediately with `SQLSTATE 57P01`. Old trusted results are never retained on error.
-- **Freshness Window & TTL Trade-off:**
-  - When `TTL = 0` (strict mode): Catalog definitions are verified synchronously against `pg_catalog.pg_views` on every query dispatch. The stale-authorization window is 0 (immediate drift detection). Operational cost: One catalog query per client query referencing views.
-  - When `TTL > 0` (cached mode): Catalog definitions are cached for up to the configured duration (e.g. 5 seconds). The maximum potential stale-authorization window is bounded by the TTL value. High-volume read environments may choose a small non-zero TTL to balance database catalog load.
-- **TOCTOU Considerations:** Time-of-check to time-of-use (TOCTOU) gap is bounded by PostgreSQL transaction commit serialization. If a DDL transaction commits concurrently with a running query, the change takes effect on the next query or bind. Zero-window atomicity across concurrent DDL requires database-level advisory locking or deployment freeze windows.
+### Freshness Verification Lifecycle (RISK-VIEW-01 & Priority D)
+- **Invocation Points:** Freshness verification is enforced at query-time on every simple query (`handleQueryMsg`), extended query parse (`handleParseMsg`), and prepared statement bind (`handleBindMsg`) via `EnsureFreshness` whenever an approved view or dependent relation is referenced. Freshness is enforced on-demand during query processing; there is no periodic background polling ticker.
+- **Production TTL Default:** The default production cache TTL is **50ms** (`CatalogVerifier.ttl = 50 * time.Millisecond`), chosen to provide rapid drift mitigation while shielding system catalogs from connection saturation during tight query loops.
+- **Behavior of TTL = 0:** Setting `TTL = 0` forces `EnsureFreshness` to bypass the cache and query live system catalogs synchronously on every query/bind dispatch.
+  > [!IMPORTANT]
+  > **No Transactional Cross-Connection Atomicity:** Even with `TTL = 0`, catalog checking and client SQL execution are **NOT transactionally atomic**. The catalog check executes on a dedicated proxy connection to `pg_catalog`, while the client's query subsequently executes over an upstream pool connection. A concurrent PostgreSQL DDL transaction (e.g. `CREATE OR REPLACE VIEW`) committing between the catalog check and execution creates an inherent Time-of-Check to Time-of-Use (TOCTOU) gap. PostgreSQL DDL commit serialization does not provide cross-connection transactional atomicity. Zero-window atomicity against concurrent DDL requires database-level migration maintenance windows or advisory locks.
+- **Catalog Verification Failures:** If a catalog query fails (timeout, connection loss, missing relation, or corrupted catalog), `EnsureFreshness` fails closed immediately with `SQLSTATE 57P01`. Cached `StatusVerified` authorizations are never restored after newer failures.
+- **Prepared Statements & Existing Sessions:** Prepared statements do not bypass drift detection; `handleBindMsg` re-evaluates `EnsureFreshness` against current catalog snapshots before execution.
+- **Database Connection & Catalog Overhead:** `TTL = 0` adds a synchronous catalog round-trip (`pg_views` and `pg_class.relkind`) per query. The default 50ms window amortizes this overhead while bounding stale exposure to 50ms.
 
-### Cross-Client Cache Isolation (SEC-P2-06)
-- **Isolation Boundary:** Verified decisions are indexed by `clientID:policyVersion:schema.viewName`.
-- Verification performed for Client A is cryptographically isolated and never applied to Client B.
-- Conflicting fingerprints or verification errors for Client B do not invalidate Client A's cached authorization.
+### Concurrency Ordering & Generation Safeguards (Priority B)
+- **Generation Counters:** Both catalog snapshots and client authorizations maintain monotonic generation counters (`catalogGens`, `clientGens`).
+- **Out-of-Order Rejection:** An in-flight verification or catalog snapshot started before an invalidation or newer failed verification cannot write `StatusVerified` back into cache upon completion.
+- **Barrier Hooks:** Deterministic synchronization barriers (`SetBeforeAuthWriteHook`, `SetBeforeSnapshotWriteHook`) verify that out-of-order completions fail closed without race conditions.
 
-### Nested View Dependency Verification (SEC-P2-08)
-- Outer views automatically resolve and verify all underlying view dependencies recursively up to depth 5.
-- Circular dependencies, missing dependencies, or alterations to inner views trigger cascading fail-closed denial on the outer view.
+### Canonical Identity & Client Isolation (Priority C & SEC-P2-06)
+- **PostgreSQL Identifier Semantics:** Quoted identifiers (e.g. `public."Reports"`) preserve exact case, while unquoted identifiers (e.g. `public.reports`) fold to lowercase. They are treated as distinct database relations in both catalog snapshots and policy lookups.
+- **Client Identity Isolation:** Authenticated client IDs are case-sensitive. Client `agent-alpha` and `AGENT-ALPHA` maintain completely separate authorization caches (`clientID:policyVersion:schema.viewName`).
+- **Nested View Provenance (SEC-P2-08 & Priority A):** All dependencies must be explicitly approved views (relkind `'v'`) or base tables (relkind `'r'`, `'p'`). Unapproved inner views, extraction failures, unknown relations, or unsupported relation kinds (`'m'`, `'f'`) strictly fail closed.
 
 ---
 
@@ -96,25 +99,25 @@ While network isolation prevents unauthorized direct connections, defense-in-dep
 
 | Risk ID | Title | Component | Status | Mitigation / Operational Boundary |
 |---|---|---|---|---|
-| **RISK-VIEW-02** (SEC-P2-01) | Direct PostgreSQL Access Bypass | Network / Infra | **OPEN (RELEASE BLOCKER)** | Requires physical/VPC network isolation and credential separation. Cannot be resolved by proxy alone. |
-| **RISK-VIEW-01** | Database-View Definition Drift | `CatalogVerifier` / `Session` | **RESOLVED / MITIGATED** | Query-time freshness checks (`EnsureFreshness`) on `Query`, `Parse`, and `Bind`. Fail-closed on mismatch. |
-| **SEC-P2-06** | Cross-Client Cache Pollution | `CatalogVerifier` | **RESOLVED** | Cache keys partitioned by `clientID:policyVersion:schema.viewName`. Total tenant isolation. |
+| **RISK-VIEW-02** (SEC-P2-01) | Direct PostgreSQL Access Bypass | Network / Infra | **OPEN (RELEASE BLOCKER)** | Requires physical/VPC network isolation and credential separation. Cannot be resolved by proxy software alone. |
+| **RISK-VIEW-01** | Database-View Definition Drift | `CatalogVerifier` / `Session` | **MITIGATED (Bounded TOCTOU)** | Query-time freshness checks (`EnsureFreshness`) on `Query`, `Parse`, and `Bind` with 50ms default TTL. Multi-connection TOCTOU gap documented. |
+| **SEC-P2-06** | Cross-Client Cache Pollution | `CatalogVerifier` | **RESOLVED** | Cache keys partitioned by `clientID:policyVersion:schema.viewName`. Case-sensitive client isolation. |
 | **SEC-P2-07** | Sensitive View Predicates | `ast.ValidateViewProvenance` | **RESOLVED** | Strict rejection of sensitive columns in WHERE, JOIN ON, HAVING, GROUP BY, ORDER BY, WINDOW, and subqueries. |
-| **SEC-P2-08** | Nested View Dependency Drift | `CatalogVerifier` / `ast` | **RESOLVED** | Recursive dependency resolution and cascading drift invalidation. Depth capped at 5; cycles rejected. |
-| **RISK-LOG-01** | Panic Diagnostic Secret Exposure | `Session` / `Logger` | **RESOLVED** | Sanitized stack traces, safe panic summaries, regex credential redaction. |
-| **RISK-POOL-01** | Terminal CAS Cleanup Failure | `Pool` / `Worker` | **RESOLVED** | Atomic CAS state transitions, idempotent release, connection discarding on failure. |
+| **SEC-P2-08** | Nested View Dependency Drift | `CatalogVerifier` / `ast` | **RESOLVED (Fail-Closed)** | Recursive dependency extraction and classification. Unapproved views, extraction errors, and drift trigger immediate fail-closed denial. |
+| **RISK-LOG-01** | Panic Diagnostic Secret Exposure | `Session` / `Logger` | **MITIGATED** | Sanitized stack traces, safe panic summaries, regex credential redaction in panic handlers. |
+| **RISK-POOL-01** | Terminal CAS Cleanup Failure | `Pool` / `Worker` | **MITIGATED** | Atomic CAS state transitions, idempotent release, connection discarding on failure. |
 | **RISK-AUDIT-01** | External Audit Sink Delivery Drops | `AuditSink` | **MONITORED** | Asynchronous buffered delivery; errors logged to local system logger. |
-| **RISK-POOL-02** | Session Variable Sanitization | `Session` / `Pool` | **RESOLVED** | Connection discard on acquire failure and explicit session state replay (`SET`). |
+| **RISK-POOL-02** | Session Variable Sanitization | `Session` / `Pool` | **MITIGATED** | Connection discard on acquire failure and explicit session state replay (`SET`). |
 
 ---
 
 ## 6. Integration Test Suite Verification
 
-The Phase 2 integration test suite (`internal/proxy/view_masking_integration_test.go`) contains **33 automated integration subtests** running against live PostgreSQL 15 containers:
+The Phase 2 integration test suite (`internal/proxy/view_masking_integration_test.go`) contains **35 automated integration subtests** running against live PostgreSQL 15 containers:
 - **26 Baseline Phase 2 Subtests:**
   - 15 Core view masking, renaming, CTE, JOIN, subquery, identifier, and transaction isolation tests.
   - 11 Initial adversarial tests covering search_path shadowing, policy reload revocation, concurrent sessions, direct connection demonstration, and computed substrings (SEC-P2-05).
-- **7 New Adversarial Subtests (Phase 2 Final Patch):**
+- **9 Adversarial Subtests (Phase 2 Final Correctness Suite):**
   - `Adversarial_CrossClientCache_ClientAValid_ClientBInvalid` (SEC-P2-06)
   - `Adversarial_CrossClientCache_ReverseVerificationOrder` (SEC-P2-06)
   - `Adversarial_AutomaticRuntimeSchemaDrift_WithoutPolicyReload` (RISK-VIEW-01)
@@ -122,5 +125,7 @@ The Phase 2 integration test suite (`internal/proxy/view_masking_integration_tes
   - `Adversarial_SensitiveWherePredicate_InViewDefinition_Denied` (SEC-P2-07)
   - `Adversarial_SensitiveJoinPredicate_InViewDefinition_Denied` (SEC-P2-07)
   - `Adversarial_NestedView_AlteredInnerView_FailsOuterQuery` (SEC-P2-08)
+  - `Adversarial_NestedView_UnapprovedInnerView_FailsClosed` (Priority A)
+  - `Adversarial_QuotedVsUnquoted_LiveIsolation` (Priority C)
 
-All 33 subtests pass cleanly (100% pass rate).
+All 35 subtests pass cleanly (100% pass rate). In addition, 14 dedicated deterministic concurrency barrier and unit tests in `internal/proxy/catalog_verifier_unit_test.go` verify forced out-of-order completion, generation invalidation, and fail-closed edge cases.

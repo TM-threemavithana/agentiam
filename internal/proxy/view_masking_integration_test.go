@@ -1775,4 +1775,130 @@ func TestViewMaskingIntegration(t *testing.T) {
 			t.Fatalf("expected policy violation on outer view, got: %v", errOuter)
 		}
 	})
+
+	// 29. Adversarial: Nested view depending on unapproved inner view fails closed (Priority A)
+	t.Run("Adversarial_NestedView_UnapprovedInnerView_FailsClosed", func(t *testing.T) {
+		adminConn, err := pgx.Connect(ctx, env.adminDSN)
+		if err != nil {
+			t.Fatalf("failed to connect admin: %v", err)
+		}
+		defer adminConn.Close(ctx)
+
+		_, _ = adminConn.Exec(ctx, "CREATE VIEW unapproved_subview AS SELECT id, name FROM customers;")
+		_, _ = adminConn.Exec(ctx, "CREATE VIEW dependent_outer_view AS SELECT id, name FROM unapproved_subview;")
+		defer adminConn.Exec(ctx, "DROP VIEW IF EXISTS dependent_outer_view;")
+		defer adminConn.Exec(ctx, "DROP VIEW IF EXISTS unapproved_subview;")
+
+		var defOuter string
+		_ = adminConn.QueryRow(ctx, "SELECT definition FROM pg_catalog.pg_views WHERE schemaname = 'public' AND viewname = 'dependent_outer_view'").Scan(&defOuter)
+		fpOuter, _ := ast.ComputeViewFingerprint(defOuter)
+
+		// Policy only approves dependent_outer_view, intentionally omitting unapproved_subview
+		env.policyStore.SetAgentPolicy("test-analyst", policy.AgentConfig{
+			Key:               env.agentKey,
+			AllowedStatements: []string{"SELECT"},
+			AllowedTables:     []string{"customers"},
+			Views: []policy.ViewConfig{
+				{
+					Name:                  "dependent_outer_view",
+					BaseTable:             "unapproved_subview",
+					DefinitionFingerprint: fpOuter,
+					ColumnMappings:        map[string]string{"id": "id", "name": "name"},
+				},
+			},
+		})
+
+		env.server.GetCatalogVerifier().SetTTL(0)
+
+		conn, err := pgx.Connect(ctx, env.proxyDSN)
+		if err != nil {
+			t.Fatalf("failed to connect: %v", err)
+		}
+		defer conn.Close(ctx)
+
+		rows, errQuery := conn.Query(ctx, "SELECT id, name FROM dependent_outer_view;")
+		if errQuery == nil {
+			defer rows.Close()
+			for rows.Next() {
+			}
+			errQuery = rows.Err()
+		}
+		if errQuery == nil {
+			t.Fatalf("CRITICAL: dependent_outer_view succeeded despite depending on an unapproved inner view!")
+		}
+		if !strings.Contains(errQuery.Error(), "policy violation") {
+			t.Fatalf("expected policy violation for unapproved inner view, got: %v", errQuery)
+		}
+	})
+
+	// 30. Adversarial: Quoted vs unquoted live view canonicalization isolation (Priority C)
+	t.Run("Adversarial_QuotedVsUnquoted_LiveIsolation", func(t *testing.T) {
+		adminConn, err := pgx.Connect(ctx, env.adminDSN)
+		if err != nil {
+			t.Fatalf("failed to connect admin: %v", err)
+		}
+		defer adminConn.Close(ctx)
+
+		// Create two distinct relations in PostgreSQL: unquoted reports vs quoted "Reports"
+		_, _ = adminConn.Exec(ctx, "CREATE VIEW reports AS SELECT id, name FROM customers;")
+		_, _ = adminConn.Exec(ctx, "CREATE VIEW \"Reports\" AS SELECT id, tenant_id FROM customers;")
+		defer adminConn.Exec(ctx, "DROP VIEW IF EXISTS reports;")
+		defer adminConn.Exec(ctx, "DROP VIEW IF EXISTS \"Reports\";")
+
+		var defLower, defUpper string
+		_ = adminConn.QueryRow(ctx, "SELECT definition FROM pg_catalog.pg_views WHERE schemaname = 'public' AND viewname = 'reports'").Scan(&defLower)
+		_ = adminConn.QueryRow(ctx, "SELECT definition FROM pg_catalog.pg_views WHERE schemaname = 'public' AND viewname = 'Reports'").Scan(&defUpper)
+		fpLower, _ := ast.ComputeViewFingerprint(defLower)
+		fpUpper, _ := ast.ComputeViewFingerprint(defUpper)
+
+		env.policyStore.SetAgentPolicy("test-analyst", policy.AgentConfig{
+			Key:               env.agentKey,
+			AllowedStatements: []string{"SELECT"},
+			AllowedTables:     []string{"customers"},
+			Views: []policy.ViewConfig{
+				{
+					Name:                  "reports",
+					BaseTable:             "customers",
+					DefinitionFingerprint: fpLower,
+					ColumnMappings:        map[string]string{"id": "id", "name": "name"},
+				},
+				{
+					Name:                  "public.\"Reports\"",
+					BaseTable:             "customers",
+					DefinitionFingerprint: fpUpper,
+					ColumnMappings:        map[string]string{"id": "id", "tenant_id": "tenant_id"},
+				},
+			},
+		})
+
+		env.server.GetCatalogVerifier().SetTTL(0)
+
+		conn, err := pgx.Connect(ctx, env.proxyDSN)
+		if err != nil {
+			t.Fatalf("failed to connect: %v", err)
+		}
+		defer conn.Close(ctx)
+
+		// 1. Query unquoted reports -> returns name
+		var id int
+		var name string
+		err = conn.QueryRow(ctx, "SELECT id, name FROM reports WHERE id = 1;").Scan(&id, &name)
+		if err != nil {
+			t.Fatalf("unexpected error querying unquoted reports: %v", err)
+		}
+		if name != "Alice Smith" {
+			t.Fatalf("expected 'Alice Smith', got %q", name)
+		}
+
+		// 2. Query quoted "Reports" -> returns tenant_id
+		var id2 int
+		var tenant string
+		err = conn.QueryRow(ctx, "SELECT id, tenant_id FROM \"Reports\" WHERE id = 1;").Scan(&id2, &tenant)
+		if err != nil {
+			t.Fatalf("unexpected error querying quoted \"Reports\": %v", err)
+		}
+		if tenant != "tenant-alpha" {
+			t.Fatalf("expected 'tenant-alpha', got %q", tenant)
+		}
+	})
 }
