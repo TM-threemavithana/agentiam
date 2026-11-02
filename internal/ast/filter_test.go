@@ -514,3 +514,139 @@ func TestAllowedTablesPostgres(t *testing.T) {
 		}
 	})
 }
+
+
+func TestPostgresAnalyticalClassification_NestedAndWindow(t *testing.T) {
+	rules := Rules{
+		AllowedStatements:  []string{"SELECT"},
+		AllowedTables:      []string{"*"},
+		EnforceSelectLimit: 10,
+	}
+	parser := &PostgresParser{}
+
+	tests := []struct {
+		name            string
+		sql             string
+		wantOuterLimit  bool
+		wantSubstring   string
+		wantLimitParams []int
+		description     string
+	}{
+		{
+			name:           "Scalar aggregate subquery in projection does not exempt outer SELECT",
+			sql:            "SELECT id, (SELECT COUNT(*) FROM orders) AS total FROM users",
+			wantOuterLimit: true,
+			wantSubstring:  "users LIMIT 10",
+			description:    "Outer SELECT returns all users; scalar subquery produces 1 count per outer row. Outer must be limited, inner subquery is exempt.",
+		},
+		{
+			name:           "WHERE EXISTS subquery with aggregate",
+			sql:            "SELECT id FROM users WHERE EXISTS (SELECT COUNT(*) FROM orders)",
+			wantOuterLimit: true,
+			wantSubstring:  "orders) LIMIT 10",
+			description:    "Outer SELECT returns unaggregated user rows and is limited; inner aggregate subquery in WHERE EXISTS is exempt.",
+		},
+		{
+			name:           "CTE with aggregate joined to table",
+			sql:            "WITH totals AS (SELECT COUNT(*) FROM orders) SELECT users.id FROM users CROSS JOIN totals",
+			wantOuterLimit: true,
+			wantSubstring:  "totals LIMIT 10",
+			description:    "CTE totals is an exempt aggregate; outer SELECT returns all rows of users and is limited.",
+		},
+		{
+			name:           "ROW_NUMBER() window function without limit",
+			sql:            "SELECT id, ROW_NUMBER() OVER () FROM users",
+			wantOuterLimit: true,
+			wantSubstring:  "users LIMIT 10",
+			description:    "Window functions do not collapse rows; outer SELECT must be limited.",
+		},
+		{
+			name:           "COUNT(*) OVER () window aggregate without limit",
+			sql:            "SELECT id, COUNT(*) OVER () FROM users",
+			wantOuterLimit: true,
+			wantSubstring:  "users LIMIT 10",
+			description:    "Window COUNT(*) OVER () evaluates over window frame without collapsing; outer SELECT must be limited.",
+		},
+		{
+			name:           "COUNT(*) scalar aggregate without GROUP BY",
+			sql:            "SELECT COUNT(*) FROM users",
+			wantOuterLimit: false,
+			wantSubstring:  "SELECT count(*) FROM users",
+			description:    "Direct scalar aggregate collapses entire table to single row; exempt from artificial LIMIT injection.",
+		},
+		{
+			name:           "GROUP BY aggregate without limit",
+			sql:            "SELECT status, COUNT(*) FROM orders GROUP BY status",
+			wantOuterLimit: false,
+			wantSubstring:  "GROUP BY status",
+			description:    "GROUP BY analytical query without explicit limit remains exempt from artificial LIMIT injection (intentional policy limitation).",
+		},
+		{
+			name:           "GROUP BY aggregate with explicit excessive limit",
+			sql:            "SELECT status, COUNT(*) FROM orders GROUP BY status LIMIT 1000",
+			wantOuterLimit: true,
+			wantSubstring:  "LIMIT 10",
+			description:    "GROUP BY query with explicit limit exceeding policy is strictly clamped to EnforceSelectLimit.",
+		},
+		{
+			name:           "Subquery in FROM: non-aggregate joined to aggregate subquery",
+			sql:            "SELECT * FROM (SELECT id FROM users) u JOIN (SELECT COUNT(*) FROM orders) o ON true",
+			wantOuterLimit: true,
+			wantSubstring:  "LIMIT 10",
+			description:    "Outer SELECT is limited; inner users subquery is limited; inner orders aggregate subquery is exempt.",
+		},
+		{
+			name:           "Nested scalar subquery without aggregates in projection",
+			sql:            "SELECT (SELECT id FROM users) FROM orders",
+			wantOuterLimit: true,
+			wantSubstring:  "orders LIMIT 10",
+			description:    "Both outer SELECT and inner scalar subquery are non-analytical and both receive LIMIT injection.",
+		},
+		{
+			name:           "Outer aggregate with non-aggregate subquery in test expression",
+			sql:            "SELECT count(*) IN (SELECT id FROM users) FROM orders",
+			wantOuterLimit: false,
+			wantSubstring:  "SELECT count(*) IN (SELECT id FROM users LIMIT 10) FROM orders",
+			description:    "Outer query has direct COUNT(*) aggregate and is exempt; inner subquery is non-analytical and gets LIMIT 10.",
+		},
+		{
+			name:            "Prepared statement window function with LIMIT $1",
+			sql:             "SELECT id, row_number() OVER () FROM users LIMIT $1",
+			wantOuterLimit:  false,
+			wantSubstring:   "LIMIT $1",
+			wantLimitParams: []int{1},
+			description:     "LIMIT $1 parameter index is captured into limitParams for runtime Bind clamping.",
+		},
+		{
+			name:            "Prepared statement GROUP BY with LIMIT $1",
+			sql:             "SELECT status, count(*) FROM orders GROUP BY status LIMIT $1",
+			wantOuterLimit:  false,
+			wantSubstring:   "LIMIT $1",
+			wantLimitParams: []int{1},
+			description:     "LIMIT $1 parameter index on GROUP BY query is captured into limitParams for runtime Bind clamping.",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, limitParams, err := parser.ApplyRules(tt.sql, rules, nil)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !strings.Contains(result, tt.wantSubstring) {
+				t.Errorf("expected result to contain %q, got: %s", tt.wantSubstring, result)
+			}
+			if tt.wantLimitParams != nil {
+				if len(limitParams) != len(tt.wantLimitParams) {
+					t.Errorf("limitParams mismatch: got %v, want %v", limitParams, tt.wantLimitParams)
+				} else {
+					for i, p := range tt.wantLimitParams {
+						if limitParams[i] != p {
+							t.Errorf("limitParams[%d] mismatch: got %v, want %v", i, limitParams[i], p)
+						}
+					}
+				}
+			}
+		})
+	}
+}

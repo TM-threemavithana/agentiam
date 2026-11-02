@@ -656,12 +656,16 @@ func hasAnalyticalNodes(v interface{}) bool {
 			return true
 		}
 		return false
+	case *pg_query.Node_SubLink:
+		sl := n.SubLink
+		if sl == nil { return false }
+		// A subquery represents an independent query scope with its own result cardinality.
+		// Aggregates inside its subselect do NOT collapse rows of the enclosing query.
+		// Only check the test expression (e.g., COUNT(*) IN (SELECT ...)) which belongs to this level.
+		return hasAnalyticalNodesNode(sl.Testexpr)
 	case *pg_query.Node_SelectStmt:
-		sel := n.SelectStmt
-		if sel == nil { return false }
-		if hasAnalyticalNodesNodeSlice(sel.TargetList) || hasAnalyticalNodesNodeSlice(sel.FromClause) || hasAnalyticalNodesNode(sel.WhereClause) || hasAnalyticalNodesNodeSlice(sel.GroupClause) || hasAnalyticalNodesNode(sel.HavingClause) || hasAnalyticalNodesNodeSlice(sel.SortClause) {
-			return true
-		}
+		// Sub-queries represent an independent query scope with their own cardinality.
+		// Their analytical properties do not transfer to an enclosing SELECT statement.
 		return false
 	case *pg_query.Node_JoinExpr:
 		join := n.JoinExpr
