@@ -293,17 +293,17 @@ func enforceRules(node *pg_query.Node, rules Rules, depth int, limitParams *[]in
 		}
 
 		if rules.EnforceSelectLimit > 0 {
-			// Smart LIMIT: Skip injection for analytical queries
-			isAnalytical := len(sel.GroupClause) > 0 || hasAnalyticalNodes(sel.TargetList)
-			if !isAnalytical {
-				var isNoLimit bool
-				if sel.LimitCount == nil {
-					isNoLimit = true
-				} else if aconst, ok := sel.LimitCount.Node.(*pg_query.Node_AConst); ok && aconst.AConst.Isnull {
-					isNoLimit = true // LIMIT ALL
-				}
+			var isNoLimit bool
+			if sel.LimitCount == nil {
+				isNoLimit = true
+			} else if aconst, ok := sel.LimitCount.Node.(*pg_query.Node_AConst); ok && aconst.AConst.Isnull {
+				isNoLimit = true // LIMIT ALL
+			}
 
-				if isNoLimit {
+			if isNoLimit {
+				// Smart LIMIT: Skip injection for analytical queries (aggregates or GROUP BY that collapse rows)
+				isAnalytical := len(sel.GroupClause) > 0 || hasAnalyticalNodes(sel.TargetList)
+				if !isAnalytical {
 					// No limit, or LIMIT ALL
 					sel.LimitCount = &pg_query.Node{
 						Node: &pg_query.Node_AConst{
@@ -318,21 +318,21 @@ func enforceRules(node *pg_query.Node, rules Rules, depth int, limitParams *[]in
 					}
 					// Force standard limit syntax
 					sel.LimitOption = pg_query.LimitOption_LIMIT_OPTION_COUNT
-				} else {
-					// A limit is specified. We must ensure it's not dynamic, and cap it.
-					switch n := sel.LimitCount.Node.(type) {
-					case *pg_query.Node_AConst:
-						// Cap existing limit using 'lesser of'
-						if ival, ok := n.AConst.Val.(*pg_query.A_Const_Ival); ok {
-							if ival.Ival.Ival > int32(rules.EnforceSelectLimit) {
-								ival.Ival.Ival = int32(rules.EnforceSelectLimit)
-							}
+				}
+			} else {
+				// A limit is specified. We must ensure it's not dynamic, and cap it.
+				switch n := sel.LimitCount.Node.(type) {
+				case *pg_query.Node_AConst:
+					// Cap existing limit using 'lesser of'
+					if ival, ok := n.AConst.Val.(*pg_query.A_Const_Ival); ok {
+						if ival.Ival.Ival > int32(rules.EnforceSelectLimit) {
+							ival.Ival.Ival = int32(rules.EnforceSelectLimit)
 						}
-					case *pg_query.Node_ParamRef:
-						*limitParams = append(*limitParams, int(n.ParamRef.Number))
-					default:
-						return fmt.Errorf("dynamic limits are not allowed by policy")
 					}
+				case *pg_query.Node_ParamRef:
+					*limitParams = append(*limitParams, int(n.ParamRef.Number))
+				default:
+					return fmt.Errorf("dynamic limits are not allowed by policy")
 				}
 			}
 		}
@@ -635,7 +635,13 @@ func hasAnalyticalNodes(v interface{}) bool {
 	case *pg_query.Node_FuncCall:
 		fc := n.FuncCall
 		if fc == nil { return false }
-		if fc.Over != nil || fc.AggStar || fc.AggDistinct {
+		// Window functions (fc.Over != nil) evaluate across a window partition/frame and output
+		// a value for every input row; they do not group or collapse rows. Therefore, window functions
+		// must NOT be treated as row-collapsing analytical nodes.
+		if fc.Over != nil {
+			return false
+		}
+		if fc.AggStar || fc.AggDistinct {
 			return true
 		}
 		for _, fn := range fc.Funcname {
@@ -646,16 +652,20 @@ func hasAnalyticalNodes(v interface{}) bool {
 				}
 			}
 		}
-		if hasAnalyticalNodesNodeSlice(fc.Args) || hasAnalyticalNodesNode(fc.AggFilter) || hasAnalyticalNodesNode(fc.Over) {
+		if hasAnalyticalNodesNodeSlice(fc.Args) || hasAnalyticalNodesNode(fc.AggFilter) {
 			return true
 		}
 		return false
+	case *pg_query.Node_SubLink:
+		sl := n.SubLink
+		if sl == nil { return false }
+		// A subquery represents an independent query scope with its own result cardinality.
+		// Aggregates inside its subselect do NOT collapse rows of the enclosing query.
+		// Only check the test expression (e.g., COUNT(*) IN (SELECT ...)) which belongs to this level.
+		return hasAnalyticalNodesNode(sl.Testexpr)
 	case *pg_query.Node_SelectStmt:
-		sel := n.SelectStmt
-		if sel == nil { return false }
-		if hasAnalyticalNodesNodeSlice(sel.TargetList) || hasAnalyticalNodesNodeSlice(sel.FromClause) || hasAnalyticalNodesNode(sel.WhereClause) || hasAnalyticalNodesNodeSlice(sel.GroupClause) || hasAnalyticalNodesNode(sel.HavingClause) || hasAnalyticalNodesNodeSlice(sel.WindowClause) || hasAnalyticalNodesNodeSlice(sel.SortClause) {
-			return true
-		}
+		// Sub-queries represent an independent query scope with their own cardinality.
+		// Their analytical properties do not transfer to an enclosing SELECT statement.
 		return false
 	case *pg_query.Node_JoinExpr:
 		join := n.JoinExpr
@@ -705,14 +715,16 @@ func hasAnalyticalNodes(v interface{}) bool {
 					switch node := n.Node.(type) {
 					case *pg_query.Node_FuncCall:
 						fc := node.FuncCall
-						if fc.Over != nil || fc.AggStar || fc.AggDistinct {
-							return true
-						}
-						for _, fn := range fc.Funcname {
-							if strNode, ok := fn.Node.(*pg_query.Node_String_); ok {
-								name := strings.ToLower(strNode.String_.Sval)
-								if name == "count" || name == "sum" || name == "avg" || name == "min" || name == "max" {
-									return true
+						if fc.Over == nil {
+							if fc.AggStar || fc.AggDistinct {
+								return true
+							}
+							for _, fn := range fc.Funcname {
+								if strNode, ok := fn.Node.(*pg_query.Node_String_); ok {
+									name := strings.ToLower(strNode.String_.Sval)
+									if name == "count" || name == "sum" || name == "avg" || name == "min" || name == "max" {
+										return true
+									}
 								}
 							}
 						}
@@ -731,14 +743,16 @@ func hasAnalyticalNodes(v interface{}) bool {
 					switch node := n.Node.(type) {
 					case *pg_query.Node_FuncCall:
 						fc := node.FuncCall
-						if fc.Over != nil || fc.AggStar || fc.AggDistinct {
-							return true
-						}
-						for _, fn := range fc.Funcname {
-							if strNode, ok := fn.Node.(*pg_query.Node_String_); ok {
-								name := strings.ToLower(strNode.String_.Sval)
-								if name == "count" || name == "sum" || name == "avg" || name == "min" || name == "max" {
-									return true
+						if fc.Over == nil {
+							if fc.AggStar || fc.AggDistinct {
+								return true
+							}
+							for _, fn := range fc.Funcname {
+								if strNode, ok := fn.Node.(*pg_query.Node_String_); ok {
+									name := strings.ToLower(strNode.String_.Sval)
+									if name == "count" || name == "sum" || name == "avg" || name == "min" || name == "max" {
+										return true
+									}
 								}
 							}
 						}
