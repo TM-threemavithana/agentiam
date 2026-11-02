@@ -14,10 +14,10 @@ import (
 )
 
 // mockUpstreamWithDialCount starts a mock PostgreSQL server that counts connection handshakes.
-func mockUpstreamWithDialCount(t *testing.T, dialCount *atomic.Int64) net.Listener {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+func mockUpstreamWithDialCount(t *testing.T, listenAddr string, dialCount *atomic.Int64) net.Listener {
+	l, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		t.Fatalf("failed to start mock upstream: %v", err)
+		t.Fatalf("failed to start mock upstream on %s: %v", listenAddr, err)
 	}
 	go func() {
 		for {
@@ -75,7 +75,7 @@ func mockUpstreamWithDialCount(t *testing.T, dialCount *atomic.Int64) net.Listen
 // marks it broken, and triggers EXACTLY ONE replacement dial, preserving pool capacity.
 func TestCancelQuery_SingleReplacement(t *testing.T) {
 	var dialCount atomic.Int64
-	l := mockUpstreamWithDialCount(t, &dialCount)
+	l := mockUpstreamWithDialCount(t, "127.0.0.1:0", &dialCount)
 	defer l.Close()
 
 	dsn := "postgres://user:pass@" + l.Addr().String() + "/db?sslmode=disable"
@@ -162,7 +162,7 @@ func TestCancelQuery_SingleReplacement(t *testing.T) {
 // in succession or concurrently is completely idempotent and triggers at most 1 replacement.
 func TestCancelQuery_IdempotentRepeated(t *testing.T) {
 	var dialCount atomic.Int64
-	l := mockUpstreamWithDialCount(t, &dialCount)
+	l := mockUpstreamWithDialCount(t, "127.0.0.1:0", &dialCount)
 	defer l.Close()
 
 	dsn := "postgres://user:pass@" + l.Addr().String() + "/db?sslmode=disable"
@@ -226,7 +226,7 @@ func TestCancelQuery_IdempotentRepeated(t *testing.T) {
 // releaseUpstream() or Close() does NOT cause a double release or duplicate replacement.
 func TestCancelQuery_ConcurrentWithUpstreamEOF(t *testing.T) {
 	var dialCount atomic.Int64
-	l := mockUpstreamWithDialCount(t, &dialCount)
+	l := mockUpstreamWithDialCount(t, "127.0.0.1:0", &dialCount)
 	defer l.Close()
 
 	dsn := "postgres://user:pass@" + l.Addr().String() + "/db?sslmode=disable"
@@ -314,7 +314,7 @@ func TestCancelQuery_ConcurrentWithUpstreamEOF(t *testing.T) {
 // racing against each other cannot double-release the upstream connection.
 func TestCancelQuery_ConcurrentWithSessionClose(t *testing.T) {
 	var dialCount atomic.Int64
-	l := mockUpstreamWithDialCount(t, &dialCount)
+	l := mockUpstreamWithDialCount(t, "127.0.0.1:0", &dialCount)
 	defer l.Close()
 
 	dsn := "postgres://user:pass@" + l.Addr().String() + "/db?sslmode=disable"
@@ -375,7 +375,7 @@ func TestCancelQuery_ConcurrentWithSessionClose(t *testing.T) {
 // is executing does not cause goroutine leaks, channel write panics, or deadlocks.
 func TestCancelQuery_ConcurrentWithPoolClose(t *testing.T) {
 	var dialCount atomic.Int64
-	l := mockUpstreamWithDialCount(t, &dialCount)
+	l := mockUpstreamWithDialCount(t, "127.0.0.1:0", &dialCount)
 	defer l.Close()
 
 	dsn := "postgres://user:pass@" + l.Addr().String() + "/db?sslmode=disable"
@@ -453,7 +453,7 @@ func TestCancelQuery_ConcurrentWithPoolClose(t *testing.T) {
 // the pool replaces the canceled connection with a healthy one, and subsequent queries succeed.
 func TestCancelQuery_SubsequentQueryUsesHealthyConnection(t *testing.T) {
 	var dialCount atomic.Int64
-	l := mockUpstreamWithDialCount(t, &dialCount)
+	l := mockUpstreamWithDialCount(t, "127.0.0.1:0", &dialCount)
 	defer l.Close()
 
 	dsn := "postgres://user:pass@" + l.Addr().String() + "/db?sslmode=disable"
@@ -531,7 +531,7 @@ func TestCancelQuery_SubsequentQueryUsesHealthyConnection(t *testing.T) {
 // is canceled, it is marked Broken and never recycled back into the pool as healthy.
 func TestCancelQuery_CanceledConnectionNeverReturnedAsHealthy(t *testing.T) {
 	var dialCount atomic.Int64
-	l := mockUpstreamWithDialCount(t, &dialCount)
+	l := mockUpstreamWithDialCount(t, "127.0.0.1:0", &dialCount)
 	defer l.Close()
 
 	dsn := "postgres://user:pass@" + l.Addr().String() + "/db?sslmode=disable"
@@ -598,7 +598,7 @@ func TestCancelQuery_CanceledConnectionNeverReturnedAsHealthy(t *testing.T) {
 // gracefully without crashing, and subsequent dial succeeds once upstream recovers.
 func TestCancelQuery_DialFailureGraceful(t *testing.T) {
 	var dialCount atomic.Int64
-	l := mockUpstreamWithDialCount(t, &dialCount)
+	l := mockUpstreamWithDialCount(t, "127.0.0.1:0", &dialCount)
 	listenAddr := l.Addr().String()
 
 	dsn := "postgres://user:pass@" + listenAddr + "/db?sslmode=disable"
@@ -638,13 +638,14 @@ func TestCancelQuery_DialFailureGraceful(t *testing.T) {
 
 	session.CancelQuery()
 
-	// Wait for the background dial to attempt and fail
-	time.Sleep(150 * time.Millisecond)
+	// Wait for the background dial to attempt and fail, placing the broken placeholder into the pool channel
+	deadline := time.Now().Add(2 * time.Second)
+	for len(pool.conns) < 2 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
 
-	// Restart upstream server on the same address
-	l2 := mockUpstreamWithDialCount(t, &dialCount)
-	// We can't guarantee same port, so update pool DSN
-	pool.dsn = "postgres://user:pass@" + l2.Addr().String() + "/db?sslmode=disable"
+	// Restart upstream server on the exact same address
+	l2 := mockUpstreamWithDialCount(t, listenAddr, &dialCount)
 	defer l2.Close()
 
 	// Acquire again: the pool should pop the broken placeholder, discard it, and synchronously re-dial
@@ -663,7 +664,7 @@ func TestCancelQuery_DialFailureGraceful(t *testing.T) {
 // PoolIdleConnections metrics remain completely consistent after multiple cancellations.
 func TestPoolMetrics_AccurateAfterCancellation(t *testing.T) {
 	var dialCount atomic.Int64
-	l := mockUpstreamWithDialCount(t, &dialCount)
+	l := mockUpstreamWithDialCount(t, "127.0.0.1:0", &dialCount)
 	defer l.Close()
 
 	dsn := "postgres://user:pass@" + l.Addr().String() + "/db?sslmode=disable"
