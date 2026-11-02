@@ -99,7 +99,7 @@ func (h *MySQLProtocolHandler) HandleSession(ctx context.Context, clientConn net
 	if h.server != nil && h.server.tlsConfig != nil {
 		tlsCfg = h.server.tlsConfig
 	}
-	serverConf := server.NewServer("8.0.11", 255, "mysql_clear_password", nil, tlsCfg)
+	serverConf := server.NewServer("8.0.11", 255, "mysql_native_password", nil, tlsCfg)
 
 	conn, err := serverConf.NewCustomizedConn(clientConn, authHandler, proxyHandler)
 	if err != nil {
@@ -162,6 +162,7 @@ func (a *AgentIAMAuthHandler) Authenticate(c *server.Conn, authPluginName string
 		} else if authPluginName == "mysql_native_password" {
 			if clientID == "root" && len(clientAuthData) == 0 {
 				suppliedPassword = ""
+				mtlsVerified = true
 			} else {
 				return fmt.Errorf("authentication plugin %s not supported without mTLS (use mysql_clear_password for password auth)", authPluginName)
 			}
@@ -195,7 +196,20 @@ func (a *AgentIAMAuthHandler) GetCredential(username string) (server.Credential,
 
 // OnAuthSuccess is called after a successful password authentication.
 func (a *AgentIAMAuthHandler) OnAuthSuccess(conn *server.Conn) error {
-	a.logger.Info("MySQL Auth Success", "user", conn.GetUser())
+	clientID := conn.GetUser()
+	a.logger.Info("MySQL Auth Success", "user", clientID)
+
+	if a.mysqlHandler != nil {
+		a.mysqlHandler.clientID = clientID
+		if a.store != nil {
+			rules, _, err := a.store.GetRulesForAgent(clientID, "", true)
+			if err != nil {
+				a.logger.Error("MySQL failed to load rules after auth success", "user", clientID, "error", err)
+				return fmt.Errorf("invalid Agent Credentials: %w", err)
+			}
+			a.mysqlHandler.rules = rules
+		}
+	}
 	return nil
 }
 
