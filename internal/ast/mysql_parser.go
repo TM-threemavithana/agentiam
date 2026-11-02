@@ -59,8 +59,23 @@ func (p *MySQLParser) ApplyRules(sql string, rules Rules, astCache cache.ASTCach
 	}
 	v.resolveLimitParams()
 
+	// Policy enforcement: fail-closed rejection of statements that require stateful sessions
+	// regardless of what rules.AllowedStatements contains. In a stateless proxy, transaction control,
+	// session variable/configuration mutation, and table locks cannot be executed safely.
+	switch v.stmtType {
+	case "BEGIN", "COMMIT", "ROLLBACK":
+		return "", nil, fmt.Errorf("policy violation: statement %s not allowed: transaction control unsupported in stateless proxy", v.stmtType)
+	case "SET":
+		return "", nil, fmt.Errorf("policy violation: statement SET not allowed: session configuration mutation unsupported in stateless proxy")
+	case "LOCK":
+		return "", nil, fmt.Errorf("policy violation: statement LOCK not allowed: table locking unsupported in stateless proxy")
+	}
+
 	// Policy enforcement: check if statement type is allowed
 	if !isAllowed(v.stmtType, rules.AllowedStatements) {
+		if v.stmtType == "" {
+			return "", nil, fmt.Errorf("policy violation: statement not allowed")
+		}
 		return "", nil, fmt.Errorf("policy violation: statement %s not allowed", v.stmtType)
 	}
 
@@ -189,15 +204,80 @@ func (v *mysqlVisitor) Enter(in ast.Node) (ast.Node, bool) {
 		if v.stmtType == "" {
 			v.stmtType = "DELETE"
 		}
+	case *ast.BeginStmt:
+		if v.stmtType == "" {
+			v.stmtType = "BEGIN"
+		}
+		v.blocked = true
+		v.blockErr = fmt.Errorf("policy violation: statement BEGIN not allowed: transaction control unsupported in stateless proxy")
+		return in, true
+	case *ast.CommitStmt:
+		if v.stmtType == "" {
+			v.stmtType = "COMMIT"
+		}
+		v.blocked = true
+		v.blockErr = fmt.Errorf("policy violation: statement COMMIT not allowed: transaction control unsupported in stateless proxy")
+		return in, true
+	case *ast.RollbackStmt:
+		if v.stmtType == "" {
+			v.stmtType = "ROLLBACK"
+		}
+		v.blocked = true
+		v.blockErr = fmt.Errorf("policy violation: statement ROLLBACK not allowed: transaction control unsupported in stateless proxy")
+		return in, true
+	case *ast.SetStmt:
+		if v.stmtType == "" {
+			v.stmtType = "SET"
+		}
+		v.blocked = true
+		v.blockErr = fmt.Errorf("policy violation: statement SET not allowed: session configuration mutation unsupported in stateless proxy")
+		return in, true
+	case *ast.LockTablesStmt, *ast.UnlockTablesStmt:
+		if v.stmtType == "" {
+			v.stmtType = "LOCK"
+		}
+		v.blocked = true
+		v.blockErr = fmt.Errorf("policy violation: statement LOCK not allowed: table locking unsupported in stateless proxy")
+		return in, true
+	case *ast.CreateTableStmt:
+		if node.TemporaryKeyword != ast.TemporaryNone {
+			v.blocked = true
+			v.blockErr = fmt.Errorf("policy violation: statement CREATE TEMPORARY TABLE not allowed: temporary tables unsupported in stateless proxy")
+			return in, true
+		}
+		if v.stmtType == "" {
+			v.stmtType = "CREATE"
+		}
+	case *ast.VariableExpr:
+		if node.Value != nil {
+			v.blocked = true
+			v.blockErr = fmt.Errorf("policy violation: variable assignment not allowed: session variables unsupported in stateless proxy")
+			return in, true
+		}
+	case *ast.VariableAssignment:
+		v.blocked = true
+		v.blockErr = fmt.Errorf("policy violation: variable assignment not allowed: session variables unsupported in stateless proxy")
+		return in, true
 	case *ast.TableName:
 		// Extract table names
 		v.tables = append(v.tables, node.Name.O)
 	case *ast.FuncCallExpr:
-		funcName := node.FnName.O
+		funcName := strings.ToLower(node.FnName.O)
+		switch funcName {
+		case "get_lock", "release_lock", "release_all_locks":
+			v.blocked = true
+			v.blockErr = fmt.Errorf("policy violation: function %s is blocked: advisory locking unsupported in stateless proxy", strings.ToUpper(node.FnName.O))
+			return in, true
+		}
+		if funcName == "last_insert_id" && len(node.Args) > 0 {
+			v.blocked = true
+			v.blockErr = fmt.Errorf("policy violation: function LAST_INSERT_ID with argument not allowed: session mutation unsupported in stateless proxy")
+			return in, true
+		}
 		for _, blocked := range v.rules.BlockedFunctions {
 			if strings.EqualFold(funcName, blocked) {
 				v.blocked = true
-				v.blockErr = fmt.Errorf("policy violation: function %s is blocked", funcName)
+				v.blockErr = fmt.Errorf("policy violation: function %s is blocked", node.FnName.O)
 				return in, true
 			}
 		}

@@ -57,6 +57,11 @@ func (h *MySQLProtocolHandler) InitPool() error {
 	return nil
 }
 
+// SetPool sets a custom upstream connection pool on the handler (useful for testing pool isolation).
+func (h *MySQLProtocolHandler) SetPool(p *MySQLPool) {
+	h.pool = p
+}
+
 // Close releases the MySQL connection pool resources.
 func (h *MySQLProtocolHandler) Close() error {
 	if h.pool != nil {
@@ -156,7 +161,7 @@ func (a *AgentIAMAuthHandler) Authenticate(c *server.Conn, authPluginName string
 		if authPluginName == "mysql_clear_password" {
 			suppliedPassword = string(bytes.TrimRight(clientAuthData, "\x00"))
 		} else if authPluginName == "mysql_native_password" {
-			if a.insecureAuth && clientID == "root" {
+			if a.insecureAuth {
 				if len(clientAuthData) == 0 || (len(clientAuthData) == 1 && clientAuthData[0] == 0) {
 					suppliedPassword = ""
 					mtlsVerified = true
