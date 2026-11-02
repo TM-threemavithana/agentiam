@@ -122,10 +122,15 @@ func NewSession(clientConn net.Conn, upstreamDSN string, store *policy.Store, tl
 func (s *Session) CancelQuery() {
 	s.uconnMu.Lock()
 	u := s.uconn
+	s.uconn = nil
 	s.uconnMu.Unlock()
 	if u != nil {
 		u.Broken.Store(true)
-		s.server.pool.Release(u)
+		if s.server != nil && s.server.pool != nil {
+			s.server.pool.Release(u)
+		} else {
+			u.Close()
+		}
 	}
 }
 
@@ -547,7 +552,11 @@ func (s *Session) releaseUpstream() {
 	s.uconnMu.Unlock()
 
 	if u != nil {
-		s.server.pool.Release(u)
+		if s.server != nil && s.server.pool != nil {
+			s.server.pool.Release(u)
+		} else {
+			u.Close()
+		}
 	}
 }
 
@@ -559,7 +568,11 @@ func (s *Session) recoverBrokenTransaction() {
 
 	if u != nil {
 		u.Broken.Store(true)
-		s.server.pool.Release(u)
+		if s.server != nil && s.server.pool != nil {
+			s.server.pool.Release(u)
+		} else {
+			u.Close()
+		}
 	}
 }
 
