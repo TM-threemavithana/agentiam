@@ -18,7 +18,7 @@ import (
 	"github.com/tm-threemavithana/agentiam/internal/ast"
 	"github.com/tm-threemavithana/agentiam/internal/policy"
 
-	"github.com/jackc/pgproto3/v2"
+	"github.com/jackc/pgx/v5/pgproto3"
 )
 
 var setCmdRegex = regexp.MustCompile(`(?i)^\s*SET\s+([a-zA-Z0-9_]+)\s*(?:TO|=)\s*(.+)$`)
@@ -50,7 +50,7 @@ func NewPostgresProtocolHandler(upstreamDSN string, store *policy.Store, tlsConf
 }
 
 func (h *PostgresProtocolHandler) HandleSession(ctx context.Context, clientConn net.Conn) error {
-	clientBackend := pgproto3.NewBackend(pgproto3.NewChunkReader(clientConn), clientConn)
+	clientBackend := pgproto3.NewBackend(clientConn, clientConn)
 	clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	startupMsg, err := clientBackend.ReceiveStartupMessage()
 	clientConn.SetReadDeadline(time.Time{})
@@ -113,7 +113,7 @@ func NewSession(clientConn net.Conn, upstreamDSN string, store *policy.Store, tl
 		logger:             logger,
 		server:             server,
 		insecureAuth:       insecureAuth,
-		clientBackend:      pgproto3.NewBackend(pgproto3.NewChunkReader(clientConn), clientConn),
+		clientBackend:      pgproto3.NewBackend(clientConn, clientConn),
 		preparedStatements: make(map[string]PreparedStatement),
 		sessionVars:        make(map[string]string),
 	}
@@ -178,6 +178,7 @@ func (s *Session) Run() error {
 			_, isTLS := s.clientConn.(*tls.Conn)
 			if s.tlsConfig != nil && !isTLS {
 				s.clientBackend.Send(&pgproto3.ErrorResponse{Severity: "FATAL", Message: "SSL connection is required"})
+				_ = s.clientBackend.Flush()
 				return fmt.Errorf("client attempted plaintext connection when TLS is enforced")
 			}
 			clientID = msg.Parameters["user"]
@@ -199,7 +200,7 @@ func (s *Session) Run() error {
 			}
 
 			s.clientConn = tlsConn
-			s.clientBackend = pgproto3.NewBackend(pgproto3.NewChunkReader(s.clientConn), s.clientConn)
+			s.clientBackend = pgproto3.NewBackend(s.clientConn, s.clientConn)
 			s.startupMsg = nil
 			continue
 
@@ -220,6 +221,7 @@ func (s *Session) Run() error {
 	if err != nil {
 		s.logger.Error("Auth failed: invalid client ID", "client", clientID, "error", err)
 		s.clientBackend.Send(&pgproto3.ErrorResponse{Severity: "FATAL", Message: "Invalid Agent Credentials"})
+		_ = s.clientBackend.Flush()
 		return fmt.Errorf("invalid client ID")
 	}
 
@@ -241,12 +243,16 @@ func (s *Session) Run() error {
 	if !mtlsVerified && !s.insecureAuth {
 		s.logger.Error("Client attempted cleartext authentication without --insecure-cleartext-auth flag")
 		s.clientBackend.Send(&pgproto3.ErrorResponse{Severity: "FATAL", Message: "mTLS is required. Cleartext auth is disabled."})
+		_ = s.clientBackend.Flush()
 		return fmt.Errorf("insecure auth rejected")
 	}
 
 	if !mtlsVerified {
 		if strings.HasPrefix(agentKey, "SCRAM-SHA-256$") {
 			s.clientBackend.Send(&pgproto3.AuthenticationSASL{AuthMechanisms: []string{"SCRAM-SHA-256"}})
+			if err := s.clientBackend.Flush(); err != nil {
+				return err
+			}
 			s.clientBackend.SetAuthType(pgproto3.AuthTypeSASL)
 
 			s.clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -287,6 +293,9 @@ func (s *Session) Run() error {
 			saltStr := base64.StdEncoding.EncodeToString(salt)
 			serverFirst := fmt.Sprintf("r=%s,s=%s,i=%d", serverNonce, saltStr, iters)
 			s.clientBackend.Send(&pgproto3.AuthenticationSASLContinue{Data: []byte(serverFirst)})
+			if err := s.clientBackend.Flush(); err != nil {
+				return err
+			}
 
 			s.clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
 			authMsg, err = s.clientBackend.Receive()
@@ -311,13 +320,18 @@ func (s *Session) Run() error {
 			serverSignature, err := VerifySCRAM(clientFirstBare, serverFirst, clientFinalWithoutProof, clientProofStr, storedKey, serverKey)
 			if err != nil {
 				s.clientBackend.Send(&pgproto3.ErrorResponse{Severity: "FATAL", Message: "Password authentication failed"})
+				_ = s.clientBackend.Flush()
 				return fmt.Errorf("SCRAM auth failed")
 			}
 
 			s.clientBackend.Send(&pgproto3.AuthenticationSASLFinal{Data: []byte("v=" + serverSignature)})
+			_ = s.clientBackend.Flush()
 			mtlsVerified = true // Re-use mtlsVerified to signify pre-verified auth (SCRAM)
 		} else {
 			s.clientBackend.Send(&pgproto3.AuthenticationCleartextPassword{})
+			if err := s.clientBackend.Flush(); err != nil {
+				return err
+			}
 			s.clientBackend.SetAuthType(pgproto3.AuthTypeCleartextPassword)
 
 			s.clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -338,6 +352,7 @@ func (s *Session) Run() error {
 	rules, authVersion, err := s.store.GetRulesForAgent(clientID, suppliedPassword, mtlsVerified)
 	if err != nil {
 		s.clientBackend.Send(&pgproto3.ErrorResponse{Severity: "FATAL", Message: "Password authentication failed"})
+		_ = s.clientBackend.Flush()
 		return fmt.Errorf("password auth failed")
 	}
 	s.rules = rules
@@ -355,8 +370,13 @@ func (s *Session) Run() error {
 	s.clientBackend.Send(&pgproto3.ParameterStatus{Name: "client_encoding", Value: "UTF8"})
 	s.clientBackend.Send(&pgproto3.ParameterStatus{Name: "standard_conforming_strings", Value: "on"})
 
-	s.clientBackend.Send(&pgproto3.BackendKeyData{ProcessID: s.virtualPID, SecretKey: s.virtualSec})
+	secBytes := make([]byte, 4)
+	binary.BigEndian.PutUint32(secBytes, s.virtualSec)
+	s.clientBackend.Send(&pgproto3.BackendKeyData{ProcessID: s.virtualPID, SecretKey: secBytes})
 	s.clientBackend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+	if err := s.clientBackend.Flush(); err != nil {
+		return err
+	}
 
 	return s.proxyLoop(ctx, cancel, clientID)
 }
@@ -388,19 +408,46 @@ func (s *Session) getOrAcquireUpstream(ctx context.Context, clientWriteCh chan p
 		stateQueries = append(stateQueries, fmt.Sprintf("SET %s = %s", k, v))
 	}
 
-	for _, q := range stateQueries {
+	for range stateQueries {
 		u.SwallowSetTimeout.Add(1)
-		u.Frontend.Send(&pgproto3.Query{String: q})
+	}
+	if len(stateQueries) > 0 {
+		u.mu.Lock()
+		for _, q := range stateQueries {
+			u.Frontend.Send(&pgproto3.Query{String: q})
+		}
+		err := u.Frontend.Flush()
+		u.mu.Unlock()
+		if err != nil {
+			u.Broken.Store(true)
+			if s.server != nil && s.server.pool != nil {
+				s.server.pool.Release(u)
+			} else {
+				u.Close()
+			}
+			return nil, err
+		}
 	}
 
 	s.uconn = u
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				s.logger.Error("Uncaught panic in upstream reader goroutine; terminating session", "panic", r, "client", s.clientID)
+				u.Broken.Store(true)
+				s.releaseUpstream()
+				s.Close()
+			}
+		}()
+
 		for {
 			msg, err := u.Frontend.Receive()
 			if err != nil {
+				s.logger.Error("Upstream read error; terminating session", "error", err, "client", s.clientID)
 				u.Broken.Store(true)
 				s.releaseUpstream()
+				s.Close()
 				return
 			}
 
@@ -424,6 +471,8 @@ func (s *Session) getOrAcquireUpstream(ctx context.Context, clientWriteCh chan p
 			} else if cc, ok := msg.(*pgproto3.CommandComplete); ok {
 				newTag := append([]byte(nil), cc.CommandTag...)
 				msg = &pgproto3.CommandComplete{CommandTag: newTag}
+			} else if rfq, ok := msg.(*pgproto3.ReadyForQuery); ok {
+				msg = &pgproto3.ReadyForQuery{TxStatus: rfq.TxStatus}
 			}
 
 			if _, ok := msg.(*pgproto3.ParseComplete); ok {
@@ -551,8 +600,7 @@ func (s *Session) handleParseMsg(ctx context.Context, v *pgproto3.Parse, clientW
 	if err != nil {
 		return err
 	}
-	u.Frontend.Send(v)
-	return nil
+	return u.SendAndFlush(v)
 }
 
 // handleBindMsg processes a Bind message (Extended Query Protocol).
@@ -584,13 +632,14 @@ func (s *Session) handleBindMsg(ctx context.Context, v *pgproto3.Bind, clientWri
 	}
 
 	ps, exists := s.preparedStatements[v.PreparedStatement]
+	var parseMsg *pgproto3.Parse
 	if exists {
 		u.SwallowParseComplete.Add(1)
-		u.Frontend.Send(&pgproto3.Parse{
+		parseMsg = &pgproto3.Parse{
 			Name:          "",
 			Query:         ps.SQL,
 			ParameterOIDs: ps.ParameterOIDs,
-		})
+		}
 
 		if len(ps.LimitParams) > 0 && s.rules.EnforceSelectLimit > 0 {
 			for _, paramIdx := range ps.LimitParams {
@@ -641,8 +690,10 @@ func (s *Session) handleBindMsg(ctx context.Context, v *pgproto3.Bind, clientWri
 
 	v.PreparedStatement = ""
 	v.DestinationPortal = ""
-	u.Frontend.Send(v)
-	return nil
+	if parseMsg != nil {
+		return u.SendAndFlush(parseMsg, v)
+	}
+	return u.SendAndFlush(v)
 }
 
 // handleQueryMsg processes a simple Query message (Simple Query Protocol).
@@ -698,8 +749,7 @@ func (s *Session) handleQueryMsg(ctx context.Context, v *pgproto3.Query, clientW
 	if err != nil {
 		return err
 	}
-	u.Frontend.Send(v)
-	return nil
+	return u.SendAndFlush(v)
 }
 
 // handleSyncMsg processes a Sync message (Extended Query Protocol).
@@ -720,8 +770,7 @@ func (s *Session) handleSyncMsg(ctx context.Context, v *pgproto3.Sync, clientWri
 	if err != nil {
 		return err
 	}
-	u.Frontend.Send(v)
-	return nil
+	return u.SendAndFlush(v)
 }
 
 // proxyLoop is the main read loop for a session.
@@ -741,6 +790,13 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 					return
 				}
 				s.clientBackend.Send(msg)
+				for len(clientWriteCh) > 0 {
+					next := <-clientWriteCh
+					s.clientBackend.Send(next)
+				}
+				if err := s.clientBackend.Flush(); err != nil {
+					return
+				}
 			}
 		}
 	}()
@@ -787,19 +843,29 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 				span.End()
 				return err
 			}
+			var parseMsg *pgproto3.Parse
 			if v.ObjectType == 'S' {
 				ps, exists := s.preparedStatements[v.Name]
 				if exists {
 					u.SwallowParseComplete.Add(1)
-					u.Frontend.Send(&pgproto3.Parse{
+					parseMsg = &pgproto3.Parse{
 						Name:          "",
 						Query:         ps.SQL,
 						ParameterOIDs: ps.ParameterOIDs,
-					})
+					}
 				}
 			}
 			v.Name = ""
-			u.Frontend.Send(v)
+			var sendErr error
+			if parseMsg != nil {
+				sendErr = u.SendAndFlush(parseMsg, v)
+			} else {
+				sendErr = u.SendAndFlush(v)
+			}
+			if sendErr != nil {
+				span.End()
+				return sendErr
+			}
 			span.End()
 
 		case *pgproto3.Execute:
@@ -816,7 +882,10 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 				return err
 			}
 			v.Portal = ""
-			u.Frontend.Send(v)
+			if err := u.SendAndFlush(v); err != nil {
+				span.End()
+				return err
+			}
 			span.End()
 
 		case *pgproto3.Close:
@@ -828,7 +897,7 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 				u, err := s.getOrAcquireUpstream(ctx, clientWriteCh)
 				if err == nil {
 					v.Name = ""
-					u.Frontend.Send(v)
+					_ = u.SendAndFlush(v)
 				}
 			}
 			span.End()
@@ -853,7 +922,9 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 				if err != nil {
 					return err
 				}
-				u.Frontend.Send(msg)
+				if err := u.SendAndFlush(msg); err != nil {
+					return err
+				}
 			}
 		}
 	}

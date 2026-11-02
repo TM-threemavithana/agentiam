@@ -16,7 +16,7 @@ import (
 	"github.com/tm-threemavithana/agentiam/internal/cache"
 	"github.com/tm-threemavithana/agentiam/internal/policy"
 
-	"github.com/jackc/pgproto3/v2"
+	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -386,8 +386,13 @@ func (s *Server) handleCancelRequest(conn net.Conn, msg *pgproto3.CancelRequest)
 	session, ok := s.sessionByPID[msg.ProcessID]
 	s.mu.RUnlock()
 
+	var cancelSec uint32
+	if len(msg.SecretKey) >= 4 {
+		cancelSec = binary.BigEndian.Uint32(msg.SecretKey)
+	}
+
 	if ok {
-		if session.virtualSec == msg.SecretKey {
+		if session.virtualSec == cancelSec {
 			s.logger.Info("Routing CancelRequest", "virtual_pid", msg.ProcessID)
 			session.CancelQuery()
 		} else {

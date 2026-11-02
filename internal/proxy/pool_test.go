@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgproto3/v2"
+	"github.com/jackc/pgx/v5/pgproto3"
 )
 
 // mockUpstream represents a dummy upstream database to test pool dialing.
@@ -24,12 +24,13 @@ func mockUpstream(t *testing.T, listenAddr string) net.Listener {
 				return
 			}
 			go func(c net.Conn) {
-				backend := pgproto3.NewBackend(pgproto3.NewChunkReader(c), c)
+				backend := pgproto3.NewBackend(c, c)
 				// Consume startup message
 				_, _ = backend.ReceiveStartupMessage()
 				// Send AuthenticationOk and ReadyForQuery
-				_ = backend.Send(&pgproto3.AuthenticationOk{})
-				_ = backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+				backend.Send(&pgproto3.AuthenticationOk{})
+				backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+				_ = backend.Flush()
 				// Wait for DISCARD ALL or close
 				_, _ = backend.Receive()
 				c.Close()
