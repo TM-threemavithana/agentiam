@@ -2,7 +2,9 @@ package proxy
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -52,6 +54,36 @@ func (u *MySQLUpstreamConn) Execute(command string, args ...any) (*mysql.Result,
 		u.Broken.Store(true)
 	}
 	return res, err
+}
+
+// IsTLS returns true if the underlying connection is encrypted via TLS.
+func (u *MySQLUpstreamConn) IsTLS() bool {
+	if u == nil {
+		return false
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.Conn == nil || u.Conn.Conn == nil || u.Conn.Conn.Conn == nil {
+		return false
+	}
+	_, ok := u.Conn.Conn.Conn.(*tls.Conn)
+	return ok
+}
+
+// TLSConnectionState returns the TLS connection state if the connection is TLS-encrypted.
+func (u *MySQLUpstreamConn) TLSConnectionState() (tls.ConnectionState, bool) {
+	if u == nil {
+		return tls.ConnectionState{}, false
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.Conn == nil || u.Conn.Conn == nil || u.Conn.Conn.Conn == nil {
+		return tls.ConnectionState{}, false
+	}
+	if tc, ok := u.Conn.Conn.Conn.(*tls.Conn); ok {
+		return tc.ConnectionState(), true
+	}
+	return tls.ConnectionState{}, false
 }
 
 func isBadConn(err error) bool {
@@ -124,6 +156,7 @@ type MySQLPool struct {
 	initSQL              string
 	size                 int
 	logger               *Logger
+	tlsConfig            *tls.Config
 	conns                chan *MySQLUpstreamConn
 	ready                atomic.Bool
 	closed               atomic.Bool
@@ -132,8 +165,8 @@ type MySQLPool struct {
 	avgAcquireDurationNs atomic.Int64
 }
 
-func NewMySQLPool(addr, user, pass, dbName string, size int, logger *Logger) *MySQLPool {
-	return &MySQLPool{
+func NewMySQLPool(addr, user, pass, dbName string, size int, logger *Logger, tlsConfigs ...*tls.Config) *MySQLPool {
+	p := &MySQLPool{
 		addr:   addr,
 		user:   user,
 		pass:   pass,
@@ -142,6 +175,27 @@ func NewMySQLPool(addr, user, pass, dbName string, size int, logger *Logger) *My
 		logger: logger,
 		conns:  make(chan *MySQLUpstreamConn, size),
 	}
+	if len(tlsConfigs) > 0 && tlsConfigs[0] != nil {
+		p.tlsConfig = tlsConfigs[0].Clone()
+	}
+	return p
+}
+
+// SetTLSConfig configures the TLS configuration used for upstream connections.
+func (p *MySQLPool) SetTLSConfig(cfg *tls.Config) {
+	if cfg != nil {
+		p.tlsConfig = cfg.Clone()
+	} else {
+		p.tlsConfig = nil
+	}
+}
+
+// GetTLSConfig returns a copy of the pool's TLS configuration, or nil if unencrypted.
+func (p *MySQLPool) GetTLSConfig() *tls.Config {
+	if p.tlsConfig != nil {
+		return p.tlsConfig.Clone()
+	}
+	return nil
 }
 
 // SetInitSQL configures a session initialization SQL statement (e.g. custom timezone, sql_mode, or charset)
@@ -171,7 +225,23 @@ func (p *MySQLPool) dial(ctx context.Context) (*MySQLUpstreamConn, error) {
 	if p.closed.Load() {
 		return nil, fmt.Errorf("pool is closed")
 	}
-	conn, err := client.ConnectWithContext(ctx, p.addr, p.user, p.pass, p.dbName, 10*time.Second)
+	var opts []client.Option
+	if p.tlsConfig != nil {
+		tlsClone := p.tlsConfig.Clone()
+		if tlsClone.ServerName == "" && !tlsClone.InsecureSkipVerify {
+			host, _, err := net.SplitHostPort(p.addr)
+			if err == nil {
+				tlsClone.ServerName = host
+			} else {
+				tlsClone.ServerName = p.addr
+			}
+		}
+		opts = append(opts, func(c *client.Conn) error {
+			c.SetTLSConfig(tlsClone)
+			return nil
+		})
+	}
+	conn, err := client.ConnectWithContext(ctx, p.addr, p.user, p.pass, p.dbName, 10*time.Second, opts...)
 	if err != nil {
 		return nil, err
 	}

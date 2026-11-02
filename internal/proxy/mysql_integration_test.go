@@ -4,6 +4,8 @@ package proxy_test
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
 	"fmt"
 	"io"
@@ -988,6 +990,168 @@ func TestMySQLAdapterIntegration(t *testing.T) {
 			t.Logf("  Ping():            min=%v, median=%v, p95=%v, max=%v", pingMin, pingMedian, pingP95, pingMax)
 			t.Logf("  ResetConnection(): min=%v, median=%v, p95=%v, max=%v", resetMin, resetMedian, resetP95, resetMax)
 			t.Logf("  Median Overhead:   %v", resetMedian-pingMedian)
+		})
+	})
+
+	// Subtest 12: Upstream MySQL TLS Security Verification (Part A, B, D)
+	t.Run("Subtest 12: Upstream MySQL TLS Security Verification", func(t *testing.T) {
+		// 1. Upstream TLS Connection with ?tls=skip-verify negotiates TLS with real MySQL 8.0
+		t.Run("12a_Upstream_TLS_Negotiated_Real_MySQL", func(t *testing.T) {
+			tlsDSN := upstreamDSN
+			if strings.Contains(tlsDSN, "?") {
+				tlsDSN += "&tls=skip-verify"
+			} else {
+				tlsDSN += "?tls=skip-verify"
+			}
+			cfg, err := driver.ParseDSN(tlsDSN)
+			if err != nil {
+				t.Fatalf("failed to parse TLS DSN: %v", err)
+			}
+			tlsPool := proxy.NewMySQLPool(cfg.Addr, cfg.User, cfg.Passwd, cfg.DBName, 2, logger, cfg.TLS)
+			if err := tlsPool.Init(ctx); err != nil {
+				t.Fatalf("failed to init TLS pool against real MySQL 8.0: %v", err)
+			}
+			defer tlsPool.Close()
+
+			conn, err := tlsPool.Acquire(ctx)
+			if err != nil {
+				t.Fatalf("failed to acquire TLS connection: %v", err)
+			}
+			defer tlsPool.Release(conn)
+
+			if !conn.IsTLS() {
+				t.Fatal("expected connection to real MySQL 8.0 to be TLS-encrypted")
+			}
+
+			res, err := conn.Execute("SHOW STATUS LIKE 'Ssl_cipher'")
+			if err != nil {
+				t.Fatalf("failed to query Ssl_cipher over TLS: %v", err)
+			}
+			cipherVal, _ := res.GetString(0, 1)
+			if cipherVal == "" {
+				t.Fatal("expected non-empty Ssl_cipher on TLS connection to real MySQL 8.0")
+			}
+			t.Logf("PASS: Real MySQL 8.0 upstream TLS connection established with cipher: %s", cipherVal)
+
+			resVer, err := conn.Execute("SHOW STATUS LIKE 'Ssl_version'")
+			if err != nil {
+				t.Fatalf("failed to query Ssl_version over TLS: %v", err)
+			}
+			verVal, _ := resVer.GetString(0, 1)
+			t.Logf("PASS: Real MySQL 8.0 upstream TLS version: %s", verVal)
+		})
+
+		// 2. COM_RESET_CONNECTION preserves TLS on real MySQL 8.0 upstream connection
+		t.Run("12b_COM_RESET_CONNECTION_Preserves_Upstream_TLS", func(t *testing.T) {
+			tlsDSN := upstreamDSN + "?tls=skip-verify"
+			cfg, err := driver.ParseDSN(tlsDSN)
+			if err != nil {
+				t.Fatalf("failed to parse TLS DSN: %v", err)
+			}
+			tlsPool := proxy.NewMySQLPool(cfg.Addr, cfg.User, cfg.Passwd, cfg.DBName, 1, logger, cfg.TLS)
+			if err := tlsPool.Init(ctx); err != nil {
+				t.Fatalf("failed to init TLS pool: %v", err)
+			}
+			defer tlsPool.Close()
+
+			conn, err := tlsPool.Acquire(ctx)
+			if err != nil {
+				t.Fatalf("failed to acquire connection: %v", err)
+			}
+			if !conn.IsTLS() {
+				t.Fatal("expected connection to be TLS before release")
+			}
+
+			tlsPool.Release(conn)
+
+			conn2, err := tlsPool.Acquire(ctx)
+			if err != nil {
+				t.Fatalf("failed to re-acquire connection: %v", err)
+			}
+			defer tlsPool.Release(conn2)
+
+			if !conn2.IsTLS() {
+				t.Fatal("expected connection to remain TLS after COM_RESET_CONNECTION")
+			}
+
+			res, err := conn2.Execute("SHOW STATUS LIKE 'Ssl_cipher'")
+			if err != nil {
+				t.Fatalf("failed to execute query after reset: %v", err)
+			}
+			cipherVal, _ := res.GetString(0, 1)
+			if cipherVal == "" {
+				t.Fatal("expected non-empty Ssl_cipher after COM_RESET_CONNECTION")
+			}
+			t.Logf("PASS: COM_RESET_CONNECTION preserved TLS with cipher: %s", cipherVal)
+		})
+
+		// 3. Replacement connections inherit TLS configuration
+		t.Run("12c_Replacement_Connection_Inherits_TLS", func(t *testing.T) {
+			tlsDSN := upstreamDSN + "?tls=skip-verify"
+			cfg, err := driver.ParseDSN(tlsDSN)
+			if err != nil {
+				t.Fatalf("failed to parse TLS DSN: %v", err)
+			}
+			tlsPool := proxy.NewMySQLPool(cfg.Addr, cfg.User, cfg.Passwd, cfg.DBName, 1, logger, cfg.TLS)
+			if err := tlsPool.Init(ctx); err != nil {
+				t.Fatalf("failed to init TLS pool: %v", err)
+			}
+			defer tlsPool.Close()
+
+			conn, err := tlsPool.Acquire(ctx)
+			if err != nil {
+				t.Fatalf("failed to acquire: %v", err)
+			}
+
+			conn.Broken.Store(true)
+			tlsPool.Release(conn)
+
+			connRepl, err := tlsPool.Acquire(ctx)
+			if err != nil {
+				t.Fatalf("failed to acquire replacement: %v", err)
+			}
+			defer tlsPool.Release(connRepl)
+
+			if !connRepl.IsTLS() {
+				t.Fatal("replacement connection must be TLS-encrypted")
+			}
+			res, err := connRepl.Execute("SHOW STATUS LIKE 'Ssl_cipher'")
+			if err != nil {
+				t.Fatalf("failed to query replacement connection: %v", err)
+			}
+			cipherVal, _ := res.GetString(0, 1)
+			if cipherVal == "" {
+				t.Fatal("expected non-empty Ssl_cipher on replacement connection")
+			}
+			t.Logf("PASS: Replacement connection inherited TLS with cipher: %s", cipherVal)
+		})
+
+		// 4. Untrusted CA / Invalid Certificate Fails Closed
+		t.Run("12d_Untrusted_CA_FailsClosed", func(t *testing.T) {
+			customKey := fmt.Sprintf("untrusted-integration-%d", time.Now().UnixNano())
+			emptyPool := x509.NewCertPool()
+			untrustedTLS := &tls.Config{
+				RootCAs:            emptyPool,
+				InsecureSkipVerify: false,
+			}
+			if err := driver.RegisterTLSConfig(customKey, untrustedTLS); err != nil {
+				t.Fatalf("failed to register TLS config: %v", err)
+			}
+			defer driver.DeregisterTLSConfig(customKey)
+
+			tlsDSN := fmt.Sprintf("%s?tls=%s", upstreamDSN, customKey)
+			cfg, err := driver.ParseDSN(tlsDSN)
+			if err != nil {
+				t.Fatalf("failed to parse DSN: %v", err)
+			}
+
+			badPool := proxy.NewMySQLPool(cfg.Addr, cfg.User, cfg.Passwd, cfg.DBName, 1, logger, cfg.TLS)
+			err = badPool.Init(ctx)
+			if err == nil {
+				badPool.Close()
+				t.Fatal("expected pool init to fail against real MySQL with untrusted CA, got nil")
+			}
+			t.Logf("PASS: Real MySQL 8.0 dial failed closed on untrusted CA as expected: %v", err)
 		})
 	})
 }
