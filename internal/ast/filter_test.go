@@ -275,11 +275,6 @@ func TestApplyRules_Analytical_Queries_Bypass_Limit(t *testing.T) {
 			sql:      "SELECT status, count(*) FROM orders GROUP BY status",
 			expected: "SELECT status, count(*) FROM orders GROUP BY status",
 		},
-		{
-			name:     "Window Function",
-			sql:      "SELECT id, sum(amount) OVER (PARTITION BY user_id) FROM orders",
-			expected: "SELECT id, sum(amount) OVER (PARTITION BY user_id) FROM orders",
-		},
 	}
 
 	for _, tt := range tests {
@@ -290,6 +285,116 @@ func TestApplyRules_Analytical_Queries_Bypass_Limit(t *testing.T) {
 			}
 			if result != tt.expected {
 				t.Errorf("expected %q, got %q", tt.expected, result)
+			}
+		})
+	}
+}
+
+func TestPostgresWindowFunction_LimitEnforcement(t *testing.T) {
+	rules := Rules{
+		AllowedStatements:  []string{"SELECT"},
+		AllowedTables:      []string{"users", "orders"},
+		EnforceSelectLimit: 10,
+	}
+	parser := &PostgresParser{}
+
+	tests := []struct {
+		name         string
+		sql          string
+		rules        Rules
+		wantContains string
+	}{
+		{
+			name:         "Ordinary SELECT without LIMIT injects limit",
+			sql:          "SELECT id, name FROM users",
+			rules:        rules,
+			wantContains: "LIMIT 10",
+		},
+		{
+			name:         "Ordinary SELECT with excessive LIMIT clamps limit",
+			sql:          "SELECT id, name FROM users LIMIT 1000000",
+			rules:        rules,
+			wantContains: "LIMIT 10",
+		},
+		{
+			name:         "ROW_NUMBER() OVER () without LIMIT injects limit",
+			sql:          "SELECT id, row_number() OVER () FROM users",
+			rules:        rules,
+			wantContains: "LIMIT 10",
+		},
+		{
+			name:         "ROW_NUMBER() OVER () with excessive LIMIT clamps limit",
+			sql:          "SELECT id, row_number() OVER () FROM users LIMIT 1000000",
+			rules:        rules,
+			wantContains: "LIMIT 10",
+		},
+		{
+			name:         "RANK() OVER () without LIMIT injects limit",
+			sql:          "SELECT id, rank() OVER (ORDER BY id) FROM users",
+			rules:        rules,
+			wantContains: "LIMIT 10",
+		},
+		{
+			name:         "COUNT(*) OVER () window function without LIMIT injects limit",
+			sql:          "SELECT id, count(*) OVER () FROM users",
+			rules:        rules,
+			wantContains: "LIMIT 10",
+		},
+		{
+			name:         "COUNT(*) scalar aggregate without OVER preserves analytical exemption",
+			sql:          "SELECT count(*) FROM users",
+			rules:        rules,
+			wantContains: "SELECT count(*) FROM users",
+		},
+		{
+			name:         "Mixed window functions with projected columns and excessive LIMIT clamps limit",
+			sql:          "SELECT id, name, email, row_number() OVER (PARTITION BY id) FROM users LIMIT 1000000",
+			rules:        rules,
+			wantContains: "LIMIT 10",
+		},
+		{
+			name:         "Nested subquery containing window function clamps inner and injects outer",
+			sql:          "SELECT * FROM (SELECT id, row_number() OVER () FROM users) sub",
+			rules:        rules,
+			wantContains: "LIMIT 10",
+		},
+		{
+			name: "Tenant isolation with window function injects limit and tenant filter",
+			sql:  "SELECT id, row_number() OVER () FROM users",
+			rules: Rules{
+				AllowedStatements:  []string{"SELECT"},
+				AllowedTables:      []string{"users"},
+				EnforceSelectLimit: 10,
+				TenantIsolation: &TenantIsolationRule{
+					Enabled:      true,
+					TenantColumn: "tenant_id",
+					TenantID:     "tenant-1",
+				},
+			},
+			wantContains: "LIMIT 10",
+		},
+		{
+			name:         "Group By analytical query with excessive LIMIT clamps limit",
+			sql:          "SELECT status, count(*) FROM orders GROUP BY status LIMIT 1000000",
+			rules:        rules,
+			wantContains: "LIMIT 10",
+		},
+		{
+			name:         "Window Function SUM OVER PARTITION BY injects limit",
+			sql:          "SELECT id, sum(amount) OVER (PARTITION BY user_id) FROM orders",
+			rules:        rules,
+			wantContains: "LIMIT 10",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, _, err := parser.ApplyRules(tt.sql, tt.rules, nil)
+			if err != nil {
+				t.Fatalf("unexpected error for %q: %v", tt.sql, err)
+			}
+			if !strings.Contains(result, tt.wantContains) {
+				t.Errorf("expected result to contain %q, got: %s", tt.wantContains, result)
 			}
 		})
 	}
