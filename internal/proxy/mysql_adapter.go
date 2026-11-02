@@ -12,7 +12,7 @@ import (
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/server"
-	_ "github.com/go-sql-driver/mysql"
+	driver "github.com/go-sql-driver/mysql"
 )
 
 // MySQLProtocolHandler implements the ProtocolHandler interface for the MySQL wire protocol.
@@ -32,7 +32,28 @@ func NewMySQLProtocolHandler(store *policy.Store, logger *Logger, server *Server
 
 // InitPool initializes the upstream *sql.DB connection pool.
 func (h *MySQLProtocolHandler) InitPool() error {
-	p := NewMySQLPool("127.0.0.1:3306", "root", "", "", 50, h.logger)
+	addr := "127.0.0.1:3306"
+	user := "root"
+	pass := ""
+	dbName := ""
+
+	dsn := h.upstreamDSN
+	if h.server != nil && h.server.upstreamDSN != "" {
+		dsn = h.server.upstreamDSN
+	}
+
+	if cfg, err := driver.ParseDSN(dsn); err == nil {
+		if cfg.Addr != "" {
+			addr = cfg.Addr
+		}
+		if cfg.User != "" {
+			user = cfg.User
+		}
+		pass = cfg.Passwd
+		dbName = cfg.DBName
+	}
+
+	p := NewMySQLPool(addr, user, pass, dbName, 50, h.logger)
 	if err := p.Init(context.Background()); err != nil {
 		return err
 	}

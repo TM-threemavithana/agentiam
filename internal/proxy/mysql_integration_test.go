@@ -5,7 +5,9 @@ package proxy_test
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"io"
+	"os"
 	"testing"
 	"time"
 
@@ -31,6 +33,9 @@ func TestMySQLAdapterIntegration(t *testing.T) {
 			wait.ForLog("port: 3306  MySQL Community Server").WithOccurrence(1).WithStartupTimeout(2*time.Minute)),
 	)
 	if err != nil {
+		if os.Getenv("CI") != "" {
+			t.Fatalf("failed to start mysql container in CI: %v", err)
+		}
 		t.Skipf("failed to start mysql container (skipping test): %v", err)
 	}
 	defer func() {
@@ -44,36 +49,58 @@ func TestMySQLAdapterIntegration(t *testing.T) {
 		t.Fatalf("failed to get connection string: %s", err)
 	}
 
-	// Create an empty Redis client to satisfy Logger/Cache dependencies
 	logger := proxy.NewLogger(io.Discard)
 
-	// 2. Setup AgentIAM Proxy with MySQL Dialect
+	// 2. Setup AgentIAM Proxy with MySQL Dialect and policy allowing root client
 	store, _ := policy.NewStore("", "", logger.Logger)
-	store.SetAgentPolicy("test-agent", policy.AgentConfig{
-		Name:          "test-agent",
-		Key:           "test-key",
-		AllowedTables: []string{"test_table"},
-		Dialect:       "mysql",
+	store.SetAgentPolicy("root", policy.AgentConfig{
+		Name:              "root",
+		AllowedStatements: []string{"SELECT", "SHOW", "SET"},
+		AllowedTables:     []string{"*"},
+		Dialect:           "mysql",
 	})
 
 	handlers := make(map[proxy.ProtocolType]proxy.ProtocolHandler)
-	srv := proxy.NewServer("127.0.0.1:3308", upstreamDSN, store, nil, logger, nil, handlers, false, ":0", 5, nil, nil)
-	mysqlHandler := proxy.NewMySQLProtocolHandler(store, logger, srv, false)
+	// Bind to 127.0.0.1:0 to safely allocate an ephemeral port and avoid collisions
+	srv := proxy.NewServer("127.0.0.1:0", upstreamDSN, store, nil, logger, nil, handlers, true, ":0", 5, nil, nil)
+	mysqlHandler := proxy.NewMySQLProtocolHandler(store, logger, srv, true)
 	srv.SetHandler(proxy.ProtocolMySQL, mysqlHandler)
 	go srv.Start()
-	time.Sleep(1 * time.Second) // wait for server to start
+	defer srv.Shutdown(context.Background())
+
+	// Poll until listener address is assigned
+	var proxyAddr string
+	for i := 0; i < 50; i++ {
+		if addr := srv.Addr(); addr != nil {
+			proxyAddr = addr.String()
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if proxyAddr == "" {
+		t.Fatalf("timed out waiting for proxy server to start listening")
+	}
 
 	// 3. Connect to Proxy with go-sql-driver/mysql
-	// (This will test the handshake Auth Handler and COM_QUERY pass-through)
-	// For testing the stubbed auth, we connect as root
-	db, err := sql.Open("mysql", "root@tcp(127.0.0.1:3308)/")
+	db, err := sql.Open("mysql", fmt.Sprintf("root@tcp(%s)/", proxyAddr))
 	if err != nil {
 		t.Fatalf("failed to connect to proxy: %v", err)
 	}
 	defer db.Close()
 
+	// Assert ping succeeds against upstream through proxy
 	err = db.Ping()
 	if err != nil {
-		t.Logf("Ping expected to fail gracefully if upstream isn't wired perfectly in test: %v", err)
+		t.Fatalf("failed to ping MySQL through proxy: %v", err)
+	}
+
+	// Verify executing a basic query through proxy
+	var one int
+	err = db.QueryRow("SELECT 1").Scan(&one)
+	if err != nil {
+		t.Fatalf("failed to execute SELECT 1 through proxy: %v", err)
+	}
+	if one != 1 {
+		t.Fatalf("expected 1 from SELECT 1, got %d", one)
 	}
 }

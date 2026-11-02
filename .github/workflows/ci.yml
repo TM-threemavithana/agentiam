@@ -9,20 +9,7 @@ on:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
-    
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: testdb
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 5432:5432
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v4
@@ -44,10 +31,15 @@ jobs:
       - name: Build
         run: make build
 
-      - name: Test
+      - name: Unit Tests
         run: make test
-        env:
-          AGENTIAM_TEST_DB_DSN: postgres://postgres:postgres@localhost:5432/testdb?sslmode=disable
+
+      - name: Race Detection
+        run: go test -race -short ./...
+
+      - name: Integration Tests
+        run: make test-integration
+        timeout-minutes: 10
 
       - name: Benchmark
         run: make bench

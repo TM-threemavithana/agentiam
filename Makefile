@@ -1,4 +1,4 @@
-.PHONY: build test bench lint clean run
+.PHONY: build test test-integration bench lint clean run
 
 BINARY_NAME=agentiam
 CMD_PATH=./cmd/agentiam
@@ -14,6 +14,10 @@ build: build-ui
 test:
 	@echo "==> Running tests..."
 	go test -v ./...
+
+test-integration:
+	@echo "==> Running database integration tests..."
+	go test -v -tags integration -count=1 -timeout 10m ./internal/proxy
 
 bench:
 	@echo "==> Running benchmarks..."
