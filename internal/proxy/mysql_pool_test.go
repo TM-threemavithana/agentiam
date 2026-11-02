@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"io"
 	"net"
 	"sync"
@@ -301,5 +303,127 @@ func TestMySQLPool_Concurrency_AcquireReleaseClose(t *testing.T) {
 
 	if ops.Load() == 0 {
 		t.Fatal("expected concurrent acquire/release operations to execute successfully")
+	}
+}
+
+
+func TestMySQLPool_Close_ConcurrentRelease_NoLeak(t *testing.T) {
+	logger := NewLogger(io.Discard)
+	pool := NewMySQLPool("127.0.0.1:3306", "root", "", "testdb", 10, logger)
+
+	var conns []*MySQLUpstreamConn
+	for i := 0; i < 10; i++ {
+		c1, c2 := net.Pipe()
+		u := createMockUpstreamConn(c1, c2)
+		go func(srv net.Conn) {
+			for {
+				header := make([]byte, 4)
+				if _, err := io.ReadFull(srv, header); err != nil {
+					return
+				}
+				length := int(uint32(header[0]) | uint32(header[1])<<8 | uint32(header[2])<<16)
+				payload := make([]byte, length)
+				if _, err := io.ReadFull(srv, payload); err != nil {
+					return
+				}
+				okPacket := []byte{0x07, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00}
+				if _, err := srv.Write(okPacket); err != nil {
+					return
+				}
+			}
+		}(c2)
+		conns = append(conns, u)
+	}
+
+	var wg sync.WaitGroup
+	// Start concurrent release
+	for _, u := range conns {
+		wg.Add(1)
+		go func(conn *MySQLUpstreamConn) {
+			defer wg.Done()
+			pool.Release(conn)
+		}(u)
+	}
+
+	// Close pool concurrently
+	pool.Close()
+	wg.Wait()
+
+	// Verify no sockets were leaked into pool.conns after Close
+	select {
+	case leaked := <-pool.conns:
+		if leaked != nil && leaked.Conn != nil {
+			t.Fatal("socket leaked in pool.conns after pool.Close()")
+		}
+	default:
+		// Expected: channel is empty
+	}
+}
+
+func TestMySQLPool_PlaceholderRecovery_OutageAndCancellation(t *testing.T) {
+	logger := NewLogger(io.Discard)
+	// Point to unreachable port so dialing fails deterministically
+	pool := NewMySQLPool("127.0.0.1:1", "root", "", "testdb", 2, logger)
+
+	// Pre-fill pool with 2 broken placeholders (simulating outage)
+	p1 := &MySQLUpstreamConn{}
+	p1.Broken.Store(true)
+	p2 := &MySQLUpstreamConn{}
+	p2.Broken.Store(true)
+	pool.conns <- p1
+	pool.conns <- p2
+	pool.ready.Store(true)
+
+	// 1. Multiple callers call Acquire with short timeouts
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+			defer cancel()
+			u, err := pool.Acquire(ctx)
+			if err == nil {
+				pool.Release(u)
+				t.Error("expected acquire to fail against unreachable upstream")
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Verify pool channel capacity is preserved (contains 2 placeholders, not starved)
+	if len(pool.conns) != 2 {
+		t.Fatalf("expected 2 placeholder slots in pool.conns, got %d", len(pool.conns))
+	}
+
+	// 2. Caller with canceled context returns immediately without deadlock
+	canceledCtx, cancelNow := context.WithCancel(context.Background())
+	cancelNow()
+	_, err := pool.Acquire(canceledCtx)
+	if err == nil || (!errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "canceled")) {
+		t.Fatalf("expected context cancellation error, got %v", err)
+	}
+	if len(pool.conns) != 2 {
+		t.Fatalf("expected 2 placeholder slots in pool.conns after canceled acquire, got %d", len(pool.conns))
+	}
+}
+
+func TestMySQLUpstreamConn_Execute_Mutex_Protection(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	u := createMockUpstreamConn(c1, c2)
+
+	// Sever connection on server side
+	c2.Close()
+
+	// Execute should detect bad connection and mark Broken
+	_, err := u.Execute("SELECT 1")
+	if err == nil {
+		t.Fatal("expected error on severed connection, got nil")
+	}
+	if !u.Broken.Load() {
+		t.Fatal("connection must be marked broken on network error")
 	}
 }

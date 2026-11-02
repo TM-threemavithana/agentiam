@@ -34,6 +34,39 @@ func (u *MySQLUpstreamConn) Close() {
 	}
 }
 
+// Execute executes a command over the connection with mutex protection against concurrent reset or close.
+// Network errors automatically mark the connection broken so it will be discarded upon release.
+func (u *MySQLUpstreamConn) Execute(command string, args ...any) (*mysql.Result, error) {
+	if u == nil {
+		return nil, fmt.Errorf("cannot execute query on nil connection")
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	if u.Broken.Load() || u.Conn == nil {
+		return nil, fmt.Errorf("connection is broken or closed")
+	}
+
+	res, err := u.Conn.Execute(command, args...)
+	if err != nil && isBadConn(err) {
+		u.Broken.Store(true)
+	}
+	return res, err
+}
+
+func isBadConn(err error) bool {
+	if err == nil {
+		return false
+	}
+	// If the server responded with a valid MySQL application error packet (*mysql.MyError),
+	// the wire protocol is synchronized and healthy.
+	if _, ok := err.(*mysql.MyError); ok {
+		return false
+	}
+	// Any non-MyError (I/O error, closed pipe, timeout, EOF) indicates a compromised socket.
+	return true
+}
+
 // ResetConnection sends a COM_RESET_CONNECTION (0x1f) packet over the wire to
 // sanitize the upstream MySQL session state before the connection can be returned
 // to the idle pool. It sets an explicit I/O deadline, handles packet sequencing,
@@ -88,12 +121,14 @@ type MySQLPool struct {
 	user                 string
 	pass                 string
 	dbName               string
+	initSQL              string
 	size                 int
 	logger               *Logger
 	conns                chan *MySQLUpstreamConn
 	ready                atomic.Bool
 	closed               atomic.Bool
 	closeOnce            sync.Once
+	closeMu              sync.RWMutex
 	avgAcquireDurationNs atomic.Int64
 }
 
@@ -109,9 +144,15 @@ func NewMySQLPool(addr, user, pass, dbName string, size int, logger *Logger) *My
 	}
 }
 
+// SetInitSQL configures a session initialization SQL statement (e.g. custom timezone, sql_mode, or charset)
+// to be executed on new connections and re-applied after each COM_RESET_CONNECTION.
+func (p *MySQLPool) SetInitSQL(sql string) {
+	p.initSQL = sql
+}
+
 func (p *MySQLPool) Init(ctx context.Context) error {
 	for i := 0; i < p.size; i++ {
-		u, err := p.dial()
+		u, err := p.dial(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to dial upstream during pool init: %w", err)
 		}
@@ -126,15 +167,27 @@ func (p *MySQLPool) Init(ctx context.Context) error {
 	return nil
 }
 
-func (p *MySQLPool) dial() (*MySQLUpstreamConn, error) {
-	conn, err := client.Connect(p.addr, p.user, p.pass, p.dbName)
+func (p *MySQLPool) dial(ctx context.Context) (*MySQLUpstreamConn, error) {
+	if p.closed.Load() {
+		return nil, fmt.Errorf("pool is closed")
+	}
+	conn, err := client.ConnectWithContext(ctx, p.addr, p.user, p.pass, p.dbName, 10*time.Second)
 	if err != nil {
 		return nil, err
 	}
 
-	return &MySQLUpstreamConn{
+	u := &MySQLUpstreamConn{
 		Conn: conn,
-	}, nil
+	}
+
+	if p.initSQL != "" {
+		if _, err := u.Execute(p.initSQL); err != nil {
+			u.Close()
+			return nil, fmt.Errorf("failed to execute pool initSQL on dial: %w", err)
+		}
+	}
+
+	return u, nil
 }
 
 func (p *MySQLPool) updateAvgAcquireDuration(d time.Duration) {
@@ -154,6 +207,10 @@ func (p *MySQLPool) updateAvgAcquireDuration(d time.Duration) {
 }
 
 func (p *MySQLPool) Acquire(ctx context.Context) (*MySQLUpstreamConn, error) {
+	if p.closed.Load() {
+		return nil, fmt.Errorf("pool is closed")
+	}
+
 	start := time.Now()
 	select {
 	case <-ctx.Done():
@@ -163,19 +220,36 @@ func (p *MySQLPool) Acquire(ctx context.Context) (*MySQLUpstreamConn, error) {
 		p.updateAvgAcquireDuration(duration)
 		PoolIdleConnections.Dec()
 
-		if u.Broken.Load() {
+		if p.closed.Load() {
+			if u != nil {
+				u.Close()
+			}
+			return nil, fmt.Errorf("pool is closed")
+		}
+
+		if u.Broken.Load() || u.Conn == nil {
 			u.Close()
-			newU, err := p.dial()
+			newU, err := p.dial(ctx)
 			if err != nil {
-				broken := &MySQLUpstreamConn{}
-				broken.Broken.Store(true)
-				p.conns <- broken
-				PoolIdleConnections.Inc()
+				// Reconnection failed. Return a broken placeholder so pool slot invariant is maintained
+				p.closeMu.RLock()
+				defer p.closeMu.RUnlock()
+				if !p.closed.Load() {
+					placeholder := &MySQLUpstreamConn{}
+					placeholder.Broken.Store(true)
+					select {
+					case p.conns <- placeholder:
+						PoolIdleConnections.Inc()
+					default:
+						PoolTotalConnections.Dec()
+					}
+				}
 				return nil, err
 			}
 			newU.InUse.Store(true)
 			return newU, nil
 		}
+
 		u.InUse.Store(true)
 		return u, nil
 	}
@@ -188,11 +262,16 @@ func (p *MySQLPool) Release(u *MySQLUpstreamConn) {
 	if u == nil {
 		return
 	}
+	u.InUse.Store(false)
+
+	p.closeMu.RLock()
+	defer p.closeMu.RUnlock()
+
+	// If pool is closed, close connection immediately and return
 	if p.closed.Load() {
 		u.Close()
 		return
 	}
-	u.InUse.Store(false)
 
 	// If connection was marked broken during query execution, discard and replace
 	if u.Broken.Load() || u.Conn == nil {
@@ -204,6 +283,21 @@ func (p *MySQLPool) Release(u *MySQLUpstreamConn) {
 	if err := u.ResetConnection(); err != nil {
 		p.logger.Warn("Failed to reset MySQL connection on release, discarding", "error", err)
 		p.discardAndReplace(u)
+		return
+	}
+
+	// If pool has nondefault session initialization, re-apply it after COM_RESET_CONNECTION
+	if p.initSQL != "" {
+		if _, err := u.Conn.Execute(p.initSQL); err != nil {
+			p.logger.Warn("Failed to re-apply pool initSQL after reset, discarding", "error", err)
+			p.discardAndReplace(u)
+			return
+		}
+	}
+
+	// Re-check pool closed under RLock before enqueuing
+	if p.closed.Load() {
+		u.Close()
 		return
 	}
 
@@ -227,9 +321,15 @@ func (p *MySQLPool) discardAndReplace(u *MySQLUpstreamConn) {
 		return
 	}
 
-	newU, err := p.dial()
+	dialCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	newU, err := p.dial(dialCtx)
 	if err != nil {
 		p.logger.Error("Failed to dial replacement MySQL connection", "error", err)
+		if p.closed.Load() {
+			return
+		}
 		// Insert an explicitly broken placeholder so pool capacity slot is preserved
 		// for future Acquire() calls when upstream database recovers
 		placeholder := &MySQLUpstreamConn{}
@@ -240,6 +340,11 @@ func (p *MySQLPool) discardAndReplace(u *MySQLUpstreamConn) {
 		default:
 			PoolTotalConnections.Dec()
 		}
+		return
+	}
+
+	if p.closed.Load() {
+		newU.Close()
 		return
 	}
 
@@ -256,6 +361,9 @@ func (p *MySQLPool) Close() {
 	p.closeOnce.Do(func() {
 		p.closed.Store(true)
 		p.ready.Store(false)
+
+		p.closeMu.Lock()
+		defer p.closeMu.Unlock()
 
 		for {
 			select {

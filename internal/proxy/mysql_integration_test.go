@@ -823,6 +823,56 @@ func TestMySQLAdapterIntegration(t *testing.T) {
 			}
 		})
 
+		// 8b. Nondefault session configuration restored after reset
+		t.Run("8b_Nondefault_Session_Configuration_Restored", func(t *testing.T) {
+			customPool := proxy.NewMySQLPool(cfg.Addr, cfg.User, cfg.Passwd, cfg.DBName, 1, logger)
+			customPool.SetInitSQL("SET @@session.time_zone = '+04:00', @@session.sql_mode = 'ANSI'")
+			if err := customPool.Init(ctx); err != nil {
+				t.Fatalf("failed to init custom pool: %v", err)
+			}
+			defer customPool.Close()
+
+			// 1. Verify nondefault setting on initial checkout
+			c1, err := customPool.Acquire(ctx)
+			if err != nil {
+				t.Fatalf("Acquire failed: %v", err)
+			}
+			res, err := c1.Execute("SELECT @@session.time_zone")
+			if err != nil {
+				customPool.Release(c1)
+				t.Fatalf("Execute failed: %v", err)
+			}
+			tz, _ := res.GetString(0, 0)
+			if tz != "+04:00" {
+				customPool.Release(c1)
+				t.Fatalf("expected initial timezone '+04:00', got %q", tz)
+			}
+
+			// 2. Client modifies session state to a different value
+			if _, err := c1.Execute("SET @@session.time_zone = '-05:00'"); err != nil {
+				customPool.Release(c1)
+				t.Fatalf("client state modification failed: %v", err)
+			}
+			customPool.Release(c1) // ResetConnection wipes '-05:00', customPool re-applies initSQL '+04:00'
+
+			// 3. Client 2 acquires connection: verifies '+04:00' restored, '-05:00' wiped
+			c2, err := customPool.Acquire(ctx)
+			if err != nil {
+				t.Fatalf("second Acquire failed: %v", err)
+			}
+			defer customPool.Release(c2)
+
+			res2, err := c2.Execute("SELECT @@session.time_zone")
+			if err != nil {
+				t.Fatalf("second query failed: %v", err)
+			}
+			tz2, _ := res2.GetString(0, 0)
+			if tz2 != "+04:00" {
+				t.Fatalf("expected restored timezone '+04:00', got %q", tz2)
+			}
+			t.Logf("PASS: Nondefault session configuration safely re-applied post-reset (tz=%q)", tz2)
+		})
+
 		// 9. Connection loss during reset results in discard & replacement
 		t.Run("9_Connection_Loss_Discards_And_Replaces", func(t *testing.T) {
 			conn, err := auditPool.Acquire(ctx)

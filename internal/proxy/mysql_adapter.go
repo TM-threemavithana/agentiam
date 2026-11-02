@@ -311,7 +311,7 @@ func (h *AgentIAMMySQLHandler) HandleQuery(query string) (*mysql.Result, error) 
 	}
 	defer h.pool.Release(conn)
 
-	res, err := conn.Conn.Execute(rewritten)
+	res, err := conn.Execute(rewritten)
 	if err != nil {
 		return nil, err
 	}
