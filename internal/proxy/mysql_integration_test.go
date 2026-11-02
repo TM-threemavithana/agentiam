@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -49,14 +50,44 @@ func TestMySQLAdapterIntegration(t *testing.T) {
 		t.Fatalf("failed to get connection string: %s", err)
 	}
 
+	// 2. Pre-seed database directly upstream
+	upstreamDB, err := sql.Open("mysql", upstreamDSN)
+	if err != nil {
+		t.Fatalf("failed to connect directly to upstream MySQL: %v", err)
+	}
+	defer upstreamDB.Close()
+
+	_, err = upstreamDB.Exec(`CREATE TABLE IF NOT EXISTS allowed_tbl (id INT AUTO_INCREMENT PRIMARY KEY, val VARCHAR(50))`)
+	if err != nil {
+		t.Fatalf("failed to create allowed_tbl: %v", err)
+	}
+	_, err = upstreamDB.Exec(`CREATE TABLE IF NOT EXISTS secret_tbl (id INT AUTO_INCREMENT PRIMARY KEY, secret VARCHAR(50))`)
+	if err != nil {
+		t.Fatalf("failed to create secret_tbl: %v", err)
+	}
+
+	for i := 1; i <= 20; i++ {
+		_, err = upstreamDB.Exec(fmt.Sprintf("INSERT INTO allowed_tbl (val) VALUES ('item-%d')", i))
+		if err != nil {
+			t.Fatalf("failed to seed allowed_tbl: %v", err)
+		}
+	}
+
 	logger := proxy.NewLogger(io.Discard)
 
-	// 2. Setup AgentIAM Proxy with MySQL Dialect and policy allowing root client
+	// 3. Setup AgentIAM Proxy with MySQL Dialect and policy allowing root client
 	store, _ := policy.NewStore("", "", logger.Logger)
 	store.SetAgentPolicy("root", policy.AgentConfig{
 		Name:              "root",
 		AllowedStatements: []string{"SELECT", "SHOW", "SET"},
-		AllowedTables:     []string{"*"},
+		AllowedTables:     []string{"allowed_tbl"},
+		SelectLimit:       10,
+		Dialect:           "mysql",
+	})
+	store.SetAgentPolicy("restricted_agent", policy.AgentConfig{
+		Name:              "restricted_agent",
+		AllowedStatements: []string{"SELECT"},
+		AllowedTables:     []string{"other_tbl"},
 		Dialect:           "mysql",
 	})
 
@@ -81,26 +112,152 @@ func TestMySQLAdapterIntegration(t *testing.T) {
 		t.Fatalf("timed out waiting for proxy server to start listening")
 	}
 
-	// 3. Connect to Proxy with go-sql-driver/mysql
-	db, err := sql.Open("mysql", fmt.Sprintf("root@tcp(%s)/", proxyAddr))
-	if err != nil {
-		t.Fatalf("failed to connect to proxy: %v", err)
-	}
-	defer db.Close()
+	// Subtest 1: Valid Agent Credentials & Clean SELECT
+	t.Run("Valid_Credentials_Clean_Select", func(t *testing.T) {
+		db, err := sql.Open("mysql", fmt.Sprintf("root@tcp(%s)/testdb", proxyAddr))
+		if err != nil {
+			t.Fatalf("failed to connect to proxy: %v", err)
+		}
+		defer db.Close()
 
-	// Assert ping succeeds against upstream through proxy
-	err = db.Ping()
-	if err != nil {
-		t.Fatalf("failed to ping MySQL through proxy: %v", err)
-	}
+		var one int
+		if err := db.QueryRow("SELECT 1").Scan(&one); err != nil {
+			t.Fatalf("failed to execute SELECT 1 through proxy: %v", err)
+		}
+		if one != 1 {
+			t.Fatalf("expected 1, got %d", one)
+		}
+	})
 
-	// Verify executing a basic query through proxy
-	var one int
-	err = db.QueryRow("SELECT 1").Scan(&one)
-	if err != nil {
-		t.Fatalf("failed to execute SELECT 1 through proxy: %v", err)
-	}
-	if one != 1 {
-		t.Fatalf("expected 1 from SELECT 1, got %d", one)
-	}
+	// Subtest 2: Invalid Password Rejected
+	t.Run("Invalid_Password_Rejected", func(t *testing.T) {
+		badDB, err := sql.Open("mysql", fmt.Sprintf("root:wrongpass@tcp(%s)/testdb", proxyAddr))
+		if err != nil {
+			t.Fatalf("failed to open mysql with bad pass: %v", err)
+		}
+		defer badDB.Close()
+
+		err = badDB.Ping()
+		if err == nil {
+			t.Fatal("expected authentication error with wrong password, got nil")
+		}
+	})
+
+	// Subtest 3: Unknown Agent Identity Rejected
+	t.Run("Unknown_Agent_Identity_Rejected", func(t *testing.T) {
+		unknownDB, err := sql.Open("mysql", fmt.Sprintf("unknown_agent@tcp(%s)/testdb", proxyAddr))
+		if err != nil {
+			t.Fatalf("failed to open mysql with unknown agent: %v", err)
+		}
+		defer unknownDB.Close()
+
+		err = unknownDB.Ping()
+		if err == nil {
+			t.Fatal("expected authentication error with unknown agent, got nil")
+		}
+	})
+
+	// Subtest 4: Missing or Unconfigured Policy Rejected
+	t.Run("Missing_Policy_Configuration_Rejected", func(t *testing.T) {
+		// Server with empty store (root unconfigured)
+		emptyStore, _ := policy.NewStore("", "", logger.Logger)
+		emptyHandlers := make(map[proxy.ProtocolType]proxy.ProtocolHandler)
+		emptySrv := proxy.NewServer("127.0.0.1:0", upstreamDSN, emptyStore, nil, logger, nil, emptyHandlers, true, ":0", 5, nil, nil)
+		emptyMySQLHandler := proxy.NewMySQLProtocolHandler(emptyStore, logger, emptySrv, true)
+		emptySrv.SetHandler(proxy.ProtocolMySQL, emptyMySQLHandler)
+		go emptySrv.Start()
+		defer emptySrv.Shutdown(context.Background())
+
+		var emptyAddr string
+		for i := 0; i < 50; i++ {
+			if addr := emptySrv.Addr(); addr != nil {
+				emptyAddr = addr.String()
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		if emptyAddr == "" {
+			t.Fatalf("timed out waiting for empty proxy server to start")
+		}
+
+		db, err := sql.Open("mysql", fmt.Sprintf("root@tcp(%s)/testdb", emptyAddr))
+		if err != nil {
+			t.Fatalf("failed to open mysql: %v", err)
+		}
+		defer db.Close()
+
+		err = db.Ping()
+		if err == nil {
+			t.Fatal("expected handshake rejection for agent missing policy configuration, got nil")
+		}
+	})
+
+	// Subtest 5: Prohibited SQL Statement Blocked
+	t.Run("Prohibited_Statement_Blocked", func(t *testing.T) {
+		db, err := sql.Open("mysql", fmt.Sprintf("root@tcp(%s)/testdb", proxyAddr))
+		if err != nil {
+			t.Fatalf("failed to connect: %v", err)
+		}
+		defer db.Close()
+
+		_, err = db.Exec("DELETE FROM allowed_tbl WHERE id = 1")
+		if err == nil {
+			t.Fatal("expected policy error for DELETE statement, got nil")
+		}
+		if !strings.Contains(err.Error(), "statement DELETE not allowed") {
+			t.Fatalf("unexpected error message: %v", err)
+		}
+
+		_, err = db.Exec("DROP TABLE allowed_tbl")
+		if err == nil {
+			t.Fatal("expected policy error for DROP statement, got nil")
+		}
+		if !strings.Contains(err.Error(), "statement DROP not allowed") {
+			t.Fatalf("unexpected error message: %v", err)
+		}
+	})
+
+	// Subtest 6: Disallowed Table Blocked
+	t.Run("Disallowed_Table_Blocked", func(t *testing.T) {
+		db, err := sql.Open("mysql", fmt.Sprintf("root@tcp(%s)/testdb", proxyAddr))
+		if err != nil {
+			t.Fatalf("failed to connect: %v", err)
+		}
+		defer db.Close()
+
+		_, err = db.Query("SELECT * FROM secret_tbl")
+		if err == nil {
+			t.Fatal("expected policy error for querying disallowed table secret_tbl, got nil")
+		}
+		if !strings.Contains(err.Error(), "access to table secret_tbl denied") {
+			t.Fatalf("unexpected error message: %v", err)
+		}
+	})
+
+	// Subtest 7: Excessive LIMIT Clamped through Proxy
+	t.Run("Excessive_Limit_Clamped", func(t *testing.T) {
+		db, err := sql.Open("mysql", fmt.Sprintf("root@tcp(%s)/testdb", proxyAddr))
+		if err != nil {
+			t.Fatalf("failed to connect: %v", err)
+		}
+		defer db.Close()
+
+		// Policy enforces SelectLimit = 10; query requests 100 rows from a table with 20 rows
+		rows, err := db.Query("SELECT id FROM allowed_tbl LIMIT 100")
+		if err != nil {
+			t.Fatalf("SELECT with excessive LIMIT failed: %v", err)
+		}
+		defer rows.Close()
+
+		count := 0
+		for rows.Next() {
+			count++
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("error iterating rows: %v", err)
+		}
+		if count != 10 {
+			t.Fatalf("expected LIMIT 100 to be clamped to 10 rows, got %d rows", count)
+		}
+	})
 }

@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"strings"
 
 	"github.com/tm-threemavithana/agentiam/internal/ast"
 	"github.com/tm-threemavithana/agentiam/internal/policy"
@@ -32,28 +33,23 @@ func NewMySQLProtocolHandler(store *policy.Store, logger *Logger, server *Server
 
 // InitPool initializes the upstream *sql.DB connection pool.
 func (h *MySQLProtocolHandler) InitPool() error {
-	addr := "127.0.0.1:3306"
-	user := "root"
-	pass := ""
-	dbName := ""
-
 	dsn := h.upstreamDSN
 	if h.server != nil && h.server.upstreamDSN != "" {
 		dsn = h.server.upstreamDSN
 	}
 
-	if cfg, err := driver.ParseDSN(dsn); err == nil {
-		if cfg.Addr != "" {
-			addr = cfg.Addr
-		}
-		if cfg.User != "" {
-			user = cfg.User
-		}
-		pass = cfg.Passwd
-		dbName = cfg.DBName
+	start := strings.Index(dsn, "(")
+	end := strings.Index(dsn, ")")
+	if start == -1 || end <= start+1 || strings.TrimSpace(dsn[start+1:end]) == "" {
+		return fmt.Errorf("invalid upstream MySQL DSN: missing explicit network address")
 	}
 
-	p := NewMySQLPool(addr, user, pass, dbName, 50, h.logger)
+	cfg, err := driver.ParseDSN(dsn)
+	if err != nil {
+		return fmt.Errorf("failed to parse upstream MySQL DSN: %w", err)
+	}
+
+	p := NewMySQLPool(cfg.Addr, cfg.User, cfg.Passwd, cfg.DBName, 50, h.logger)
 	if err := p.Init(context.Background()); err != nil {
 		return err
 	}

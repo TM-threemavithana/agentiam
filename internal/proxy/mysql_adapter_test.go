@@ -97,3 +97,31 @@ func TestMySQLAuthHandler_Authenticate(t *testing.T) {
 		t.Errorf("expected mysql_native_password, got %s", cred.AuthPluginName)
 	}
 }
+
+
+func TestMySQLProtocolHandler_InitPool_DSNValidation(t *testing.T) {
+	logger := NewLogger(io.Discard)
+	store, _ := policy.NewStore("", "", logger.Logger)
+
+	// 1. Invalid/malformed DSN must fail closed without fallback
+	handler := &MySQLProtocolHandler{
+		store:       store,
+		logger:      logger,
+		upstreamDSN: "invalid-dsn-without-slash",
+	}
+	err := handler.InitPool()
+	if err == nil {
+		t.Fatal("expected error for malformed DSN, got nil")
+	}
+
+	// 2. Missing network address must fail closed
+	handlerNoAddr := &MySQLProtocolHandler{
+		store:       store,
+		logger:      logger,
+		upstreamDSN: "user:pass@/",
+	}
+	err = handlerNoAddr.InitPool()
+	if err == nil {
+		t.Fatal("expected error for missing network address, got nil")
+	}
+}
