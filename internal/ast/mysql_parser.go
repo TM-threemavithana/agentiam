@@ -18,12 +18,10 @@ import (
 type MySQLParser struct{}
 
 func (p *MySQLParser) ApplyRules(sql string, rules Rules, astCache cache.ASTCache) (string, []int, error) {
-	cacheKey := sql + fmt.Sprintf("%v", rules)
-	if astCache != nil {
-		if cached, ok := astCache.Get(cacheKey); ok {
-			return cached.SQL, cached.LimitParams, nil
-		}
-	}
+	// Note on astCache: MySQLParser is intentionally stateless and executes fresh AST transformations
+	// per query rather than caching deparsed ASTs. This avoids cross-tenant cache contamination,
+	// policy-drift desynchronization, and cache poisoning risks across multi-tenant agent sessions.
+	// The astCache parameter is retained to satisfy the ASTParser interface.
 
 	// For production, the parser instance should be pooled, but this works for POC
 	pr := parser.New()
@@ -80,15 +78,7 @@ func (p *MySQLParser) ApplyRules(sql string, rules Rules, astCache cache.ASTCach
 		return "", nil, fmt.Errorf("failed to restore AST: %w", err)
 	}
 
-	deparsed := sb.String()
-	if astCache != nil && isCacheable(sql) {
-		astCache.Add(cacheKey, cache.CachedAST{
-			SQL:         deparsed,
-			LimitParams: v.limitParams,
-		})
-	}
-
-	return deparsed, v.limitParams, nil
+	return sb.String(), v.limitParams, nil
 }
 
 type mysqlVisitor struct {
