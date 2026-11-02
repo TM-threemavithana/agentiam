@@ -161,7 +161,7 @@ func (a *AgentIAMAuthHandler) Authenticate(c *server.Conn, authPluginName string
 		if authPluginName == "mysql_clear_password" {
 			suppliedPassword = string(bytes.TrimRight(clientAuthData, "\x00"))
 		} else if authPluginName == "mysql_native_password" {
-			if a.insecureAuth && clientID == "root" {
+			if a.insecureAuth {
 				if len(clientAuthData) == 0 || (len(clientAuthData) == 1 && clientAuthData[0] == 0) {
 					suppliedPassword = ""
 					mtlsVerified = true
