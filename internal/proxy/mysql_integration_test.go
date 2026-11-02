@@ -15,6 +15,7 @@ import (
 	"github.com/tm-threemavithana/agentiam/internal/policy"
 	"github.com/tm-threemavithana/agentiam/internal/proxy"
 
+	driver "github.com/go-sql-driver/mysql"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/mysql"
@@ -75,7 +76,7 @@ func TestMySQLAdapterIntegration(t *testing.T) {
 
 	logger := proxy.NewLogger(io.Discard)
 
-	// 3. Setup AgentIAM Proxy with MySQL Dialect and policy allowing root client
+	// 3. Setup AgentIAM Proxy with MySQL Dialect and policy configurations
 	store, _ := policy.NewStore("", "", logger.Logger)
 	store.SetAgentPolicy("root", policy.AgentConfig{
 		Name:              "root",
@@ -88,6 +89,27 @@ func TestMySQLAdapterIntegration(t *testing.T) {
 		Name:              "restricted_agent",
 		AllowedStatements: []string{"SELECT"},
 		AllowedTables:     []string{"other_tbl"},
+		Dialect:           "mysql",
+	})
+	store.SetAgentPolicy("permissive_agent", policy.AgentConfig{
+		Name:              "permissive_agent",
+		AllowedStatements: []string{"SELECT", "BEGIN", "COMMIT", "ROLLBACK", "SET", "CREATE", "LOCK", "*"},
+		AllowedTables:     []string{"*"},
+		SelectLimit:       10,
+		Dialect:           "mysql",
+	})
+	store.SetAgentPolicy("agent_alpha", policy.AgentConfig{
+		Name:              "agent_alpha",
+		AllowedStatements: []string{"SELECT"},
+		AllowedTables:     []string{"allowed_tbl"},
+		SelectLimit:       10,
+		Dialect:           "mysql",
+	})
+	store.SetAgentPolicy("agent_beta", policy.AgentConfig{
+		Name:              "agent_beta",
+		AllowedStatements: []string{"SELECT"},
+		AllowedTables:     []string{"allowed_tbl"},
+		SelectLimit:       10,
 		Dialect:           "mysql",
 	})
 
@@ -159,7 +181,6 @@ func TestMySQLAdapterIntegration(t *testing.T) {
 
 	// Subtest 4: Missing or Unconfigured Policy Rejected
 	t.Run("Missing_Policy_Configuration_Rejected", func(t *testing.T) {
-		// Server with empty store (root unconfigured)
 		emptyStore, _ := policy.NewStore("", "", logger.Logger)
 		emptyHandlers := make(map[proxy.ProtocolType]proxy.ProtocolHandler)
 		emptySrv := proxy.NewServer("127.0.0.1:0", upstreamDSN, emptyStore, nil, logger, nil, emptyHandlers, true, ":0", 5, nil, nil)
@@ -242,7 +263,6 @@ func TestMySQLAdapterIntegration(t *testing.T) {
 		}
 		defer db.Close()
 
-		// Policy enforces SelectLimit = 10; query requests 100 rows from a table with 20 rows
 		rows, err := db.Query("SELECT id FROM allowed_tbl LIMIT 100")
 		if err != nil {
 			t.Fatalf("SELECT with excessive LIMIT failed: %v", err)
@@ -262,21 +282,28 @@ func TestMySQLAdapterIntegration(t *testing.T) {
 	})
 
 	// Subtest 8: Unsupported Transaction & Session Operations Fail-Closed
+	// Validates fail-closed behavior under BOTH standard policy AND overly permissive policy
 	t.Run("Unsupported_Transaction_And_Session_Operations", func(t *testing.T) {
-		db, err := sql.Open("mysql", fmt.Sprintf("root@tcp(%s)/testdb", proxyAddr))
+		dbStandard, err := sql.Open("mysql", fmt.Sprintf("root@tcp(%s)/testdb", proxyAddr))
 		if err != nil {
-			t.Fatalf("failed to connect: %v", err)
+			t.Fatalf("failed to connect as root: %v", err)
 		}
-		defer db.Close()
+		defer dbStandard.Close()
+
+		dbPermissive, err := sql.Open("mysql", fmt.Sprintf("permissive_agent@tcp(%s)/testdb", proxyAddr))
+		if err != nil {
+			t.Fatalf("failed to connect as permissive_agent: %v", err)
+		}
+		defer dbPermissive.Close()
 
 		ops := []struct {
 			name        string
-			fn          func() error
+			fn          func(db *sql.DB) error
 			expectedErr string
 		}{
 			{
 				name: "1. START TRANSACTION blocked",
-				fn: func() error {
+				fn: func(db *sql.DB) error {
 					_, err := db.Exec("START TRANSACTION")
 					return err
 				},
@@ -284,7 +311,7 @@ func TestMySQLAdapterIntegration(t *testing.T) {
 			},
 			{
 				name: "2. BEGIN blocked",
-				fn: func() error {
+				fn: func(db *sql.DB) error {
 					_, err := db.Exec("BEGIN")
 					return err
 				},
@@ -292,7 +319,7 @@ func TestMySQLAdapterIntegration(t *testing.T) {
 			},
 			{
 				name: "3. COMMIT blocked",
-				fn: func() error {
+				fn: func(db *sql.DB) error {
 					_, err := db.Exec("COMMIT")
 					return err
 				},
@@ -300,7 +327,7 @@ func TestMySQLAdapterIntegration(t *testing.T) {
 			},
 			{
 				name: "4. ROLLBACK blocked",
-				fn: func() error {
+				fn: func(db *sql.DB) error {
 					_, err := db.Exec("ROLLBACK")
 					return err
 				},
@@ -308,7 +335,7 @@ func TestMySQLAdapterIntegration(t *testing.T) {
 			},
 			{
 				name: "5. SET autocommit = 0 blocked",
-				fn: func() error {
+				fn: func(db *sql.DB) error {
 					_, err := db.Exec("SET autocommit = 0")
 					return err
 				},
@@ -316,7 +343,7 @@ func TestMySQLAdapterIntegration(t *testing.T) {
 			},
 			{
 				name: "6. SET session variable blocked",
-				fn: func() error {
+				fn: func(db *sql.DB) error {
 					_, err := db.Exec("SET @session_variable = 'value'")
 					return err
 				},
@@ -324,15 +351,15 @@ func TestMySQLAdapterIntegration(t *testing.T) {
 			},
 			{
 				name: "7. CREATE TEMPORARY TABLE blocked",
-				fn: func() error {
+				fn: func(db *sql.DB) error {
 					_, err := db.Exec("CREATE TEMPORARY TABLE temp_tbl (id INT)")
 					return err
 				},
-				expectedErr: "statement CREATE not allowed",
+				expectedErr: "statement CREATE TEMPORARY TABLE not allowed",
 			},
 			{
 				name: "8. LOCK TABLES blocked",
-				fn: func() error {
+				fn: func(db *sql.DB) error {
 					_, err := db.Exec("LOCK TABLES allowed_tbl WRITE")
 					return err
 				},
@@ -340,7 +367,7 @@ func TestMySQLAdapterIntegration(t *testing.T) {
 			},
 			{
 				name: "9. Binary prepared statements (db.Prepare) unsupported",
-				fn: func() error {
+				fn: func(db *sql.DB) error {
 					stmt, err := db.Prepare("SELECT id FROM allowed_tbl WHERE id = ?")
 					if err == nil {
 						stmt.Close()
@@ -351,7 +378,7 @@ func TestMySQLAdapterIntegration(t *testing.T) {
 			},
 			{
 				name: "10. Multiple SQL statements in one request blocked",
-				fn: func() error {
+				fn: func(db *sql.DB) error {
 					_, err := db.Exec("SELECT 1; SELECT 2")
 					return err
 				},
@@ -360,10 +387,21 @@ func TestMySQLAdapterIntegration(t *testing.T) {
 		}
 
 		for _, op := range ops {
-			t.Run(op.name, func(t *testing.T) {
-				err := op.fn()
+			t.Run("StandardPolicy_"+op.name, func(t *testing.T) {
+				err := op.fn(dbStandard)
 				if err == nil {
-					t.Fatalf("expected operation %s to fail, but it succeeded", op.name)
+					t.Fatalf("expected operation %s to fail under standard policy, but it succeeded", op.name)
+				}
+				if !strings.Contains(err.Error(), op.expectedErr) {
+					t.Fatalf("expected error containing %q, got: %v", op.expectedErr, err)
+				}
+			})
+
+			// Regression check: verify fail-closed enforcement even under permissive policy
+			t.Run("PermissivePolicy_"+op.name, func(t *testing.T) {
+				err := op.fn(dbPermissive)
+				if err == nil {
+					t.Fatalf("CRITICAL SECURITY REGRESSION: operation %s succeeded under permissive policy", op.name)
 				}
 				if !strings.Contains(err.Error(), op.expectedErr) {
 					t.Fatalf("expected error containing %q, got: %v", op.expectedErr, err)
@@ -372,51 +410,196 @@ func TestMySQLAdapterIntegration(t *testing.T) {
 		}
 	})
 
-	// Subtest 9: Permitted SELECT Side Effects and Session Isolation Investigation
-	t.Run("Permitted_SELECT_Side_Effects", func(t *testing.T) {
+	// Subtest 9: Unsafe Session-Mutating Expressions Blocked at AST Level (Part 3 & Part 5)
+	t.Run("Unsafe_Session_Mutating_Expressions_Blocked", func(t *testing.T) {
 		db, err := sql.Open("mysql", fmt.Sprintf("root@tcp(%s)/testdb", proxyAddr))
 		if err != nil {
 			t.Fatalf("failed to connect: %v", err)
 		}
 		defer db.Close()
 
-		// 1. SELECT @var := 'value' executes upstream because it is parsed as SELECT
-		var setVal string
-		err = db.QueryRow("SELECT @var := 'leak_test'").Scan(&setVal)
-		if err != nil {
-			t.Fatalf("SELECT @var := 'leak_test' failed: %v", err)
+		// 1. SELECT @var := 'value' must be rejected
+		_, err = db.Exec("SELECT @var := 'leak_test'")
+		if err == nil {
+			t.Fatal("expected SELECT with variable assignment to be blocked, but it succeeded")
 		}
-		if setVal != "leak_test" {
-			t.Errorf("expected @var to be 'leak_test', got %s", setVal)
-		}
-
-		// 2. SELECT CONNECTION_ID() reveals connection hopping across pooled connections
-		var connID1, connID2 int64
-		if err := db.QueryRow("SELECT CONNECTION_ID()").Scan(&connID1); err != nil {
-			t.Fatalf("SELECT CONNECTION_ID() #1 failed: %v", err)
-		}
-		if err := db.QueryRow("SELECT CONNECTION_ID()").Scan(&connID2); err != nil {
-			t.Fatalf("SELECT CONNECTION_ID() #2 failed: %v", err)
-		}
-		t.Logf("Observed MySQL connection IDs: #1=%d, #2=%d", connID1, connID2)
-
-		// 3. User advisory locks (GET_LOCK / RELEASE_LOCK)
-		var getLockRes sql.NullInt64
-		err = db.QueryRow("SELECT GET_LOCK('agentiam_audit_lock', 5)").Scan(&getLockRes)
-		if err != nil {
-			t.Fatalf("GET_LOCK failed: %v", err)
-		}
-		if !getLockRes.Valid || getLockRes.Int64 != 1 {
-			t.Fatalf("expected GET_LOCK to return 1, got %v", getLockRes)
+		if !strings.Contains(err.Error(), "variable assignment not allowed") {
+			t.Fatalf("expected variable assignment error, got: %v", err)
 		}
 
-		// Try releasing the lock; because of connection hopping across pooled connections,
-		// RELEASE_LOCK will return 0 (not owner of lock) if it lands on a different pooled connection.
-		var relLockRes sql.NullInt64
-		err = db.QueryRow("SELECT RELEASE_LOCK('agentiam_audit_lock')").Scan(&relLockRes)
-		if err != nil {
-			t.Fatalf("RELEASE_LOCK failed: %v", err)
+		// 2. WHERE clause with variable assignment must be rejected
+		_, err = db.Exec("SELECT * FROM allowed_tbl WHERE (@leak := 1) = 1")
+		if err == nil {
+			t.Fatal("expected WHERE clause variable assignment to be blocked, but it succeeded")
 		}
-		t.Logf("RELEASE_LOCK returned: %v (1 = released on same conn, 0 = lock not held by this connection)", relLockRes)
+		if !strings.Contains(err.Error(), "variable assignment not allowed") {
+			t.Fatalf("expected variable assignment error, got: %v", err)
+		}
+
+		// 3. User advisory locks (GET_LOCK, RELEASE_LOCK, RELEASE_ALL_LOCKS) must be rejected
+		_, err = db.Exec("SELECT GET_LOCK('agentiam_audit_lock', 5)")
+		if err == nil {
+			t.Fatal("expected GET_LOCK to be blocked, but it succeeded")
+		}
+		if !strings.Contains(err.Error(), "advisory locking unsupported") && !strings.Contains(err.Error(), "function GET_LOCK is blocked") {
+			t.Fatalf("expected advisory locking error, got: %v", err)
+		}
+
+		_, err = db.Exec("SELECT RELEASE_LOCK('agentiam_audit_lock')")
+		if err == nil {
+			t.Fatal("expected RELEASE_LOCK to be blocked, but it succeeded")
+		}
+		if !strings.Contains(err.Error(), "advisory locking unsupported") && !strings.Contains(err.Error(), "function RELEASE_LOCK is blocked") {
+			t.Fatalf("expected advisory locking error, got: %v", err)
+		}
+
+		_, err = db.Exec("SELECT RELEASE_ALL_LOCKS()")
+		if err == nil {
+			t.Fatal("expected RELEASE_ALL_LOCKS to be blocked, but it succeeded")
+		}
+		if !strings.Contains(err.Error(), "advisory locking unsupported") && !strings.Contains(err.Error(), "function RELEASE_ALL_LOCKS is blocked") {
+			t.Fatalf("expected advisory locking error, got: %v", err)
+		}
+
+		// 4. Safe expressions must be preserved
+		var connID int64
+		if err := db.QueryRow("SELECT CONNECTION_ID()").Scan(&connID); err != nil {
+			t.Fatalf("SELECT CONNECTION_ID() failed: %v", err)
+		}
+		if connID <= 0 {
+			t.Fatalf("expected valid CONNECTION_ID, got %d", connID)
+		}
+
+		var nullVar sql.NullString
+		if err := db.QueryRow("SELECT @unassigned_var").Scan(&nullVar); err != nil {
+			t.Fatalf("SELECT read-only user variable failed: %v", err)
+		}
+		if nullVar.Valid {
+			t.Fatalf("expected NULL for unassigned user variable, got %s", nullVar.String)
+		}
+	})
+
+	// Subtest 10: Deterministic Cross-Client Session Isolation and Leakage Audit (Part 2)
+	t.Run("Cross_Client_Session_Isolation_Deterministic_Audit", func(t *testing.T) {
+		// Parse upstream DSN to configure a dedicated pool of size 1
+		cfg, err := driver.ParseDSN(upstreamDSN)
+		if err != nil {
+			t.Fatalf("failed to parse upstream DSN: %v", err)
+		}
+
+		poolSizeOne := proxy.NewMySQLPool(cfg.Addr, cfg.User, cfg.Passwd, cfg.DBName, 1, logger)
+		if err := poolSizeOne.Init(ctx); err != nil {
+			t.Fatalf("failed to initialize pool of size 1: %v", err)
+		}
+		defer poolSizeOne.Close()
+
+		// Dedicated proxy server sharing the pool of size 1
+		p1Handlers := make(map[proxy.ProtocolType]proxy.ProtocolHandler)
+		p1Srv := proxy.NewServer("127.0.0.1:0", upstreamDSN, store, nil, logger, nil, p1Handlers, true, ":0", 5, nil, nil)
+		p1MySQLHandler := proxy.NewMySQLProtocolHandler(store, logger, p1Srv, true)
+		p1MySQLHandler.SetPool(poolSizeOne)
+		p1Srv.SetHandler(proxy.ProtocolMySQL, p1MySQLHandler)
+		go p1Srv.Start()
+		defer p1Srv.Shutdown(context.Background())
+
+		var p1Addr string
+		for i := 0; i < 50; i++ {
+			if addr := p1Srv.Addr(); addr != nil {
+				p1Addr = addr.String()
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		if p1Addr == "" {
+			t.Fatalf("timed out waiting for 1-pool proxy server to start")
+		}
+
+		// Connect Client A (agent_alpha) and Client B (agent_beta)
+		dbAlpha, err := sql.Open("mysql", fmt.Sprintf("agent_alpha@tcp(%s)/testdb", p1Addr))
+		if err != nil {
+			t.Fatalf("failed to connect as agent_alpha: %v", err)
+		}
+		defer dbAlpha.Close()
+
+		dbBeta, err := sql.Open("mysql", fmt.Sprintf("agent_beta@tcp(%s)/testdb", p1Addr))
+		if err != nil {
+			t.Fatalf("failed to connect as agent_beta: %v", err)
+		}
+		defer dbBeta.Close()
+
+		// Step 1: Verify Client A is PREVENTED by proxy AST from injecting session variables
+		_, err = dbAlpha.Exec("SELECT @cross_token := 'synthetic_alpha_secret'")
+		if err == nil {
+			t.Fatal("expected Client A variable assignment to be rejected by proxy AST, got nil")
+		}
+		if !strings.Contains(err.Error(), "variable assignment not allowed") {
+			t.Fatalf("expected variable assignment error, got: %v", err)
+		}
+
+		// Step 2: Verify Client A is PREVENTED by proxy AST from acquiring advisory locks
+		_, err = dbAlpha.Exec("SELECT GET_LOCK('synthetic_cross_lock', 5)")
+		if err == nil {
+			t.Fatal("expected Client A GET_LOCK to be rejected by proxy AST, got nil")
+		}
+		if !strings.Contains(err.Error(), "advisory locking unsupported") && !strings.Contains(err.Error(), "function GET_LOCK is blocked") {
+			t.Fatalf("expected advisory locking error, got: %v", err)
+		}
+
+		// Step 3: Empirically demonstrate the underlying pool vulnerability when state is present:
+		// Directly dirty the single pooled connection to test whether MySQLPool.Release cleanses state.
+		uConn, err := poolSizeOne.Acquire(ctx)
+		if err != nil {
+			t.Fatalf("failed to acquire raw pooled connection: %v", err)
+		}
+
+		// Set a synthetic session variable and acquire an advisory lock on the connection
+		_, err = uConn.Conn.Execute("SELECT @simulated_leak := 'synthetic_alpha_secret'")
+		if err != nil {
+			poolSizeOne.Release(uConn)
+			t.Fatalf("failed to execute variable assignment on raw connection: %v", err)
+		}
+		_, err = uConn.Conn.Execute("SELECT GET_LOCK('synthetic_cross_lock', 5)")
+		if err != nil {
+			poolSizeOne.Release(uConn)
+			t.Fatalf("failed to execute GET_LOCK on raw connection: %v", err)
+		}
+
+		// Release back to the pool: MySQLPool.Release only calls Ping(), not COM_RESET_CONNECTION
+		poolSizeOne.Release(uConn)
+
+		// Client B (agent_beta) now queries through the proxy on the same single-connection pool
+		var leakedVal sql.NullString
+		err = dbBeta.QueryRow("SELECT @simulated_leak").Scan(&leakedVal)
+		if err != nil {
+			t.Fatalf("Client B failed to query user variable: %v", err)
+		}
+
+		// Confirmation of reproduced cross-client leakage on unsanitized pool connection
+		if leakedVal.Valid && leakedVal.String == "synthetic_alpha_secret" {
+			t.Logf("CONFIRMED REPRODUCED LEAKAGE: Client B read Client A's session variable: %q", leakedVal.String)
+		} else {
+			t.Fatalf("expected reproduced leakage of 'synthetic_alpha_secret', got %v", leakedVal)
+		}
+
+		// Verify advisory lock is still held by the pooled connection:
+		// An independent client on upstreamDB cannot acquire the lock (returns 0)
+		var lockAcquired int
+		err = upstreamDB.QueryRow("SELECT GET_LOCK('synthetic_cross_lock', 0)").Scan(&lockAcquired)
+		if err != nil {
+			t.Fatalf("upstream GET_LOCK check failed: %v", err)
+		}
+		if lockAcquired != 0 {
+			t.Fatalf("expected lock 'synthetic_cross_lock' to remain held by pooled connection (returned %d)", lockAcquired)
+		}
+		t.Logf("CONFIRMED REPRODUCED LOCK RETENTION: 'synthetic_cross_lock' remains held by idle pooled connection")
+
+		// Reliable cleanup after test
+		uClean, err := poolSizeOne.Acquire(ctx)
+		if err == nil {
+			_, _ = uClean.Conn.Execute("SELECT RELEASE_LOCK('synthetic_cross_lock')")
+			_, _ = uClean.Conn.Execute("SET @simulated_leak = NULL")
+			poolSizeOne.Release(uClean)
+		}
+		_, _ = upstreamDB.Exec("SELECT RELEASE_ALL_LOCKS()")
 	})
 }

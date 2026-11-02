@@ -340,6 +340,100 @@ func TestMySQLVisitor(t *testing.T) {
 }
 
 func TestMySQLParser_UnsupportedStatements_Diagnostics(t *testing.T) {
+	p := &MySQLParser{}
+
+	tests := []struct {
+		name        string
+		sql         string
+		expectedErr string
+	}{
+		{
+			name:        "START TRANSACTION blocked with clear diagnostic",
+			sql:         "START TRANSACTION",
+			expectedErr: "statement BEGIN not allowed",
+		},
+		{
+			name:        "BEGIN blocked with clear diagnostic",
+			sql:         "BEGIN",
+			expectedErr: "statement BEGIN not allowed",
+		},
+		{
+			name:        "COMMIT blocked with clear diagnostic",
+			sql:         "COMMIT",
+			expectedErr: "statement COMMIT not allowed",
+		},
+		{
+			name:        "ROLLBACK blocked with clear diagnostic",
+			sql:         "ROLLBACK",
+			expectedErr: "statement ROLLBACK not allowed",
+		},
+		{
+			name:        "SET autocommit = 0 blocked with clear diagnostic",
+			sql:         "SET autocommit = 0",
+			expectedErr: "statement SET not allowed",
+		},
+		{
+			name:        "SET @session_variable = 'value' blocked with clear diagnostic",
+			sql:         "SET @session_variable = 'value'",
+			expectedErr: "statement SET not allowed",
+		},
+		{
+			name:        "CREATE TEMPORARY TABLE blocked with clear diagnostic",
+			sql:         "CREATE TEMPORARY TABLE temp_tbl (id INT)",
+			expectedErr: "statement CREATE TEMPORARY TABLE not allowed",
+		},
+		{
+			name:        "LOCK TABLES blocked with clear diagnostic",
+			sql:         "LOCK TABLES users WRITE",
+			expectedErr: "statement LOCK not allowed",
+		},
+		{
+			name:        "Multiple SQL statements blocked with clear diagnostic",
+			sql:         "SELECT 1; SELECT 2",
+			expectedErr: "policy violation: multiple statements not allowed",
+		},
+	}
+
+	// 1. Verify fail-closed behavior under standard read-only policy
+	standardRules := Rules{
+		AllowedStatements: []string{"SELECT", "INSERT", "UPDATE"},
+		AllowedTables:     []string{"users", "orders"},
+	}
+
+	for _, tt := range tests {
+		t.Run("StandardPolicy_"+tt.name, func(t *testing.T) {
+			_, _, err := p.ApplyRules(tt.sql, standardRules, nil)
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tt.expectedErr)
+			}
+			if !strings.Contains(err.Error(), tt.expectedErr) {
+				t.Fatalf("expected error containing %q, got %q", tt.expectedErr, err.Error())
+			}
+		})
+	}
+
+	// 2. CRITICAL REGRESSION AUDIT (Part 1):
+	// Verify fail-closed behavior EVEN WHEN policy explicitly attempts to authorize
+	// transaction and session statements (e.g. BEGIN, COMMIT, ROLLBACK, SET, CREATE, LOCK, *)
+	overlyPermissiveRules := Rules{
+		AllowedStatements: []string{"SELECT", "INSERT", "UPDATE", "BEGIN", "COMMIT", "ROLLBACK", "SET", "CREATE", "LOCK", "*"},
+		AllowedTables:     []string{"*"},
+	}
+
+	for _, tt := range tests {
+		t.Run("PermissivePolicy_RegressionAudit_"+tt.name, func(t *testing.T) {
+			_, _, err := p.ApplyRules(tt.sql, overlyPermissiveRules, nil)
+			if err == nil {
+				t.Fatalf("CRITICAL SECURITY REGRESSION: statement was allowed under permissive AllowedStatements: %s", tt.sql)
+			}
+			if !strings.Contains(err.Error(), tt.expectedErr) {
+				t.Fatalf("expected error containing %q, got %q", tt.expectedErr, err.Error())
+			}
+		})
+	}
+}
+
+func TestMySQLParser_RejectSessionMutatingExpressions(t *testing.T) {
 	rules := Rules{
 		AllowedStatements: []string{"SELECT", "INSERT", "UPDATE"},
 		AllowedTables:     []string{"users", "orders"},
@@ -352,49 +446,54 @@ func TestMySQLParser_UnsupportedStatements_Diagnostics(t *testing.T) {
 		expectedErr string
 	}{
 		{
-			name:        "START TRANSACTION blocked with clear diagnostic",
-			sql:         "START TRANSACTION",
-			expectedErr: "policy violation: statement BEGIN not allowed",
+			name:        "Direct user-variable assignment := in SELECT projection",
+			sql:         "SELECT @var := 'value'",
+			expectedErr: "policy violation: variable assignment not allowed: session variables unsupported in stateless proxy",
 		},
 		{
-			name:        "BEGIN blocked with clear diagnostic",
-			sql:         "BEGIN",
-			expectedErr: "policy violation: statement BEGIN not allowed",
+			name:        "Nested variable assignment in WHERE clause expression",
+			sql:         "SELECT * FROM users WHERE (@leak := 1) = 1",
+			expectedErr: "policy violation: variable assignment not allowed: session variables unsupported in stateless proxy",
 		},
 		{
-			name:        "COMMIT blocked with clear diagnostic",
-			sql:         "COMMIT",
-			expectedErr: "policy violation: statement COMMIT not allowed",
+			name:        "Nested variable assignment inside scalar subquery",
+			sql:         "SELECT id, (SELECT @sub := 42) FROM users",
+			expectedErr: "policy violation: variable assignment not allowed: session variables unsupported in stateless proxy",
 		},
 		{
-			name:        "ROLLBACK blocked with clear diagnostic",
-			sql:         "ROLLBACK",
-			expectedErr: "policy violation: statement ROLLBACK not allowed",
+			name:        "Chained variable assignment",
+			sql:         "SELECT @a := @b := 10",
+			expectedErr: "policy violation: variable assignment not allowed: session variables unsupported in stateless proxy",
 		},
 		{
-			name:        "SET autocommit = 0 blocked with clear diagnostic",
-			sql:         "SET autocommit = 0",
-			expectedErr: "policy violation: statement SET not allowed",
+			name:        "Advisory lock GET_LOCK function call",
+			sql:         "SELECT GET_LOCK('my_lock', 10)",
+			expectedErr: "policy violation: function GET_LOCK is blocked: advisory locking unsupported in stateless proxy",
 		},
 		{
-			name:        "SET @session_variable = 'value' blocked with clear diagnostic",
-			sql:         "SET @session_variable = 'value'",
-			expectedErr: "policy violation: statement SET not allowed",
+			name:        "Advisory lock RELEASE_LOCK function call",
+			sql:         "SELECT RELEASE_LOCK('my_lock')",
+			expectedErr: "policy violation: function RELEASE_LOCK is blocked: advisory locking unsupported in stateless proxy",
 		},
 		{
-			name:        "CREATE TEMPORARY TABLE blocked with clear diagnostic",
-			sql:         "CREATE TEMPORARY TABLE temp_tbl (id INT)",
-			expectedErr: "policy violation: statement CREATE not allowed",
+			name:        "Advisory lock RELEASE_ALL_LOCKS function call",
+			sql:         "SELECT RELEASE_ALL_LOCKS()",
+			expectedErr: "policy violation: function RELEASE_ALL_LOCKS is blocked: advisory locking unsupported in stateless proxy",
 		},
 		{
-			name:        "LOCK TABLES blocked with clear diagnostic",
-			sql:         "LOCK TABLES users WRITE",
-			expectedErr: "policy violation: statement LOCK not allowed",
+			name:        "Advisory lock nested in subquery FROM clause",
+			sql:         "SELECT * FROM (SELECT GET_LOCK('l', 1) AS lk) sub",
+			expectedErr: "policy violation: function GET_LOCK is blocked: advisory locking unsupported in stateless proxy",
 		},
 		{
-			name:        "Multiple SQL statements blocked with clear diagnostic",
-			sql:         "SELECT 1; SELECT 2",
-			expectedErr: "policy violation: multiple statements not allowed",
+			name:        "Advisory lock in WHERE predicate",
+			sql:         "SELECT * FROM users WHERE GET_LOCK('predicate_lock', 1) = 1",
+			expectedErr: "policy violation: function GET_LOCK is blocked: advisory locking unsupported in stateless proxy",
+		},
+		{
+			name:        "Session-mutating LAST_INSERT_ID with argument",
+			sql:         "SELECT LAST_INSERT_ID(12345)",
+			expectedErr: "policy violation: function LAST_INSERT_ID with argument not allowed: session mutation unsupported in stateless proxy",
 		},
 	}
 
@@ -402,7 +501,7 @@ func TestMySQLParser_UnsupportedStatements_Diagnostics(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			_, _, err := p.ApplyRules(tt.sql, rules, nil)
 			if err == nil {
-				t.Fatalf("expected error containing %q, got nil", tt.expectedErr)
+				t.Fatalf("expected expression %q to be blocked, but it was allowed", tt.sql)
 			}
 			if !strings.Contains(err.Error(), tt.expectedErr) {
 				t.Fatalf("expected error containing %q, got %q", tt.expectedErr, err.Error())
@@ -411,7 +510,7 @@ func TestMySQLParser_UnsupportedStatements_Diagnostics(t *testing.T) {
 	}
 }
 
-func TestMySQLParser_SideEffectingSelect(t *testing.T) {
+func TestMySQLParser_PreserveSafeExpressions(t *testing.T) {
 	rules := Rules{
 		AllowedStatements:  []string{"SELECT"},
 		AllowedTables:      []string{"users"},
@@ -419,43 +518,42 @@ func TestMySQLParser_SideEffectingSelect(t *testing.T) {
 	}
 	p := &MySQLParser{}
 
-	// Verify parser treats SELECT with user variable assignment as SELECT
-	out, _, err := p.ApplyRules("SELECT @var := 'value'", rules, nil)
-	if err != nil {
-		t.Fatalf("unexpected error parsing SELECT @var := 'value': %v", err)
-	}
-	if !strings.Contains(out, ":=") || !strings.Contains(out, "var") {
-		t.Errorf("expected rewritten query to contain variable assignment, got %s", out)
+	safeQueries := []struct {
+		name         string
+		sql          string
+		wantContains string
+	}{
+		{
+			name:         "Read-only user variable evaluation",
+			sql:          "SELECT @unassigned_var",
+			wantContains: "@`unassigned_var`",
+		},
+		{
+			name:         "Safe CONNECTION_ID() execution",
+			sql:          "SELECT CONNECTION_ID()",
+			wantContains: "CONNECTION_ID()",
+		},
+		{
+			name:         "Safe LAST_INSERT_ID() read without arguments",
+			sql:          "SELECT LAST_INSERT_ID()",
+			wantContains: "LAST_INSERT_ID()",
+		},
+		{
+			name:         "Safe standard column projection and aggregates",
+			sql:          "SELECT COUNT(*), MAX(id) FROM users",
+			wantContains: "COUNT(1)",
+		},
 	}
 
-	// Verify parser treats SELECT CONNECTION_ID() as SELECT
-	out, _, err = p.ApplyRules("SELECT CONNECTION_ID()", rules, nil)
-	if err != nil {
-		t.Fatalf("unexpected error parsing SELECT CONNECTION_ID(): %v", err)
-	}
-	if !strings.Contains(out, "CONNECTION_ID()") {
-		t.Errorf("expected rewritten query to contain CONNECTION_ID(), got %s", out)
-	}
-
-	// Verify parser treats SELECT GET_LOCK and RELEASE_LOCK as SELECT when not blocked
-	out, _, err = p.ApplyRules("SELECT GET_LOCK('my_lock', 10)", rules, nil)
-	if err != nil {
-		t.Fatalf("unexpected error parsing SELECT GET_LOCK: %v", err)
-	}
-	if !strings.Contains(out, "GET_LOCK") {
-		t.Errorf("expected rewritten query to contain GET_LOCK, got %s", out)
-	}
-
-	// Verify when GET_LOCK is in BlockedFunctions, it fails closed
-	rulesBlocked := Rules{
-		AllowedStatements: []string{"SELECT"},
-		BlockedFunctions:  []string{"get_lock"},
-	}
-	_, _, err = p.ApplyRules("SELECT GET_LOCK('my_lock', 10)", rulesBlocked, nil)
-	if err == nil {
-		t.Fatal("expected GET_LOCK to be blocked when listed in BlockedFunctions, got nil")
-	}
-	if !strings.Contains(err.Error(), "function GET_LOCK is blocked") {
-		t.Fatalf("expected function blocked error, got %v", err)
+	for _, sq := range safeQueries {
+		t.Run(sq.name, func(t *testing.T) {
+			out, _, err := p.ApplyRules(sq.sql, rules, nil)
+			if err != nil {
+				t.Fatalf("expected query %q to be permitted, got error: %v", sq.sql, err)
+			}
+			if !strings.Contains(out, sq.wantContains) {
+				t.Errorf("expected rewritten query to contain %q, got: %s", sq.wantContains, out)
+			}
+		})
 	}
 }

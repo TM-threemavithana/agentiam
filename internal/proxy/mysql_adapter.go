@@ -57,6 +57,11 @@ func (h *MySQLProtocolHandler) InitPool() error {
 	return nil
 }
 
+// SetPool sets a custom upstream connection pool on the handler (useful for testing pool isolation).
+func (h *MySQLProtocolHandler) SetPool(p *MySQLPool) {
+	h.pool = p
+}
+
 // Close releases the MySQL connection pool resources.
 func (h *MySQLProtocolHandler) Close() error {
 	if h.pool != nil {
