@@ -471,6 +471,8 @@ func (s *Session) getOrAcquireUpstream(ctx context.Context, clientWriteCh chan p
 			} else if cc, ok := msg.(*pgproto3.CommandComplete); ok {
 				newTag := append([]byte(nil), cc.CommandTag...)
 				msg = &pgproto3.CommandComplete{CommandTag: newTag}
+			} else if rfq, ok := msg.(*pgproto3.ReadyForQuery); ok {
+				msg = &pgproto3.ReadyForQuery{TxStatus: rfq.TxStatus}
 			}
 
 			if _, ok := msg.(*pgproto3.ParseComplete); ok {
