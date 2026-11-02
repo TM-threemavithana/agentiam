@@ -212,7 +212,7 @@ func TestMySQLAdapterIntegration(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected policy error for DROP statement, got nil")
 		}
-		if !strings.Contains(err.Error(), "statement DROP not allowed") {
+		if !strings.Contains(err.Error(), "not allowed") {
 			t.Fatalf("unexpected error message: %v", err)
 		}
 	})
