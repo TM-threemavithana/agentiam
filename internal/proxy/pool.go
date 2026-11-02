@@ -20,6 +20,7 @@ type UpstreamConn struct {
 	SecretKey            uint32
 	InUse                atomic.Bool
 	Broken               atomic.Bool
+	replaced             atomic.Bool
 	SwallowParseComplete atomic.Int32
 	SwallowSetTimeout    atomic.Int32
 	TxStatus             byte
@@ -196,7 +197,9 @@ func (p *Pool) Release(u *UpstreamConn) {
 	if u == nil {
 		return
 	}
-	u.InUse.Store(false)
+	if !u.InUse.CompareAndSwap(true, false) {
+		return
+	}
 	u.SwallowParseComplete.Store(0)
 	u.SwallowSetTimeout.Store(0)
 
@@ -266,6 +269,10 @@ func (p *Pool) discardAndReplace(u *UpstreamConn) {
 	u.Close()
 
 	if p.closed.Load() {
+		return
+	}
+
+	if !u.replaced.CompareAndSwap(false, true) {
 		return
 	}
 
