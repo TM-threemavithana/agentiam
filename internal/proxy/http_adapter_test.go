@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -54,7 +55,7 @@ func TestHTTPInterceptor_Authentication(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamReceivedAuth = r.Header.Get("Authorization")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"ok"}`))
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	}))
 	defer upstream.Close()
 
@@ -68,36 +69,41 @@ func TestHTTPInterceptor_Authentication(t *testing.T) {
 	server := httptest.NewServer(interceptor)
 	defer server.Close()
 
+	ctx := context.Background()
+
 	// 1. Missing Basic Auth -> 401
-	req, _ := http.NewRequest("GET", server.URL+"/api/v2/status", nil)
-	resp, err := http.DefaultClient.Do(req)
+	req1, _ := http.NewRequestWithContext(ctx, "GET", server.URL+"/api/v2/status", nil)
+	resp1, err := http.DefaultClient.Do(req1)
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("Expected 401 Unauthorized for missing auth, got: %d", resp.StatusCode)
+	_ = resp1.Body.Close()
+	if resp1.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("Expected 401 Unauthorized for missing auth, got: %d", resp1.StatusCode)
 	}
 
 	// 2. Invalid Password -> 401
-	req, _ = http.NewRequest("GET", server.URL+"/api/v2/status", nil)
-	req.SetBasicAuth("test-agent", "wrong-password")
-	resp, err = http.DefaultClient.Do(req)
+	req2, _ := http.NewRequestWithContext(ctx, "GET", server.URL+"/api/v2/status", nil)
+	req2.SetBasicAuth("test-agent", "wrong-password")
+	resp2, err := http.DefaultClient.Do(req2)
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("Expected 401 Unauthorized for wrong password, got: %d", resp.StatusCode)
+	_ = resp2.Body.Close()
+	if resp2.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("Expected 401 Unauthorized for wrong password, got: %d", resp2.StatusCode)
 	}
 
 	// 3. Valid Credentials on non-statement endpoint -> 200 and upstream auth injected
-	req, _ = http.NewRequest("GET", server.URL+"/api/v2/status", nil)
-	req.SetBasicAuth("test-agent", "correct-password")
-	resp, err = http.DefaultClient.Do(req)
+	req3, _ := http.NewRequestWithContext(ctx, "GET", server.URL+"/api/v2/status", nil)
+	req3.SetBasicAuth("test-agent", "correct-password")
+	resp3, err := http.DefaultClient.Do(req3)
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("Expected 200 OK for valid auth, got: %d", resp.StatusCode)
+	_ = resp3.Body.Close()
+	if resp3.StatusCode != http.StatusOK {
+		t.Fatalf("Expected 200 OK for valid auth, got: %d", resp3.StatusCode)
 	}
 	if upstreamReceivedAuth != "Bearer UPSTREAM_SECRET" {
 		t.Fatalf("Expected upstream Authorization 'Bearer UPSTREAM_SECRET', got: %s", upstreamReceivedAuth)
@@ -114,7 +120,7 @@ func TestHTTPInterceptor_StatementInterceptionAndPolicyEnforcement(t *testing.T)
 			return
 		}
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"statementHandle":"stmt-123","status":"SUCCEEDED"}`))
+		_, _ = w.Write([]byte(`{"statementHandle":"stmt-123","status":"SUCCEEDED"}`))
 	}))
 	defer upstream.Close()
 
@@ -129,6 +135,8 @@ func TestHTTPInterceptor_StatementInterceptionAndPolicyEnforcement(t *testing.T)
 	server := httptest.NewServer(interceptor)
 	defer server.Close()
 
+	ctx := context.Background()
+
 	// 1. Allowed statement -> rewritten with LIMIT 50
 	sqlPayload := map[string]interface{}{
 		"statement": "SELECT id, name FROM users",
@@ -136,17 +144,18 @@ func TestHTTPInterceptor_StatementInterceptionAndPolicyEnforcement(t *testing.T)
 	}
 	payloadBytes, _ := json.Marshal(sqlPayload)
 
-	req, _ := http.NewRequest("POST", server.URL+"/api/v2/statements", bytes.NewReader(payloadBytes))
-	req.SetBasicAuth("test-agent", "agent-secret")
-	req.Header.Set("Content-Type", "application/json")
+	req1, _ := http.NewRequestWithContext(ctx, "POST", server.URL+"/api/v2/statements", bytes.NewReader(payloadBytes))
+	req1.SetBasicAuth("test-agent", "agent-secret")
+	req1.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp1, err := http.DefaultClient.Do(req1)
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("Expected 200 OK for allowed statement, got: %d: %s", resp.StatusCode, string(body))
+	body1, _ := io.ReadAll(resp1.Body)
+	_ = resp1.Body.Close()
+	if resp1.StatusCode != http.StatusOK {
+		t.Fatalf("Expected 200 OK for allowed statement, got: %d: %s", resp1.StatusCode, string(body1))
 	}
 
 	var upstreamMap map[string]interface{}
@@ -164,15 +173,16 @@ func TestHTTPInterceptor_StatementInterceptionAndPolicyEnforcement(t *testing.T)
 	}
 	blockedBytes, _ := json.Marshal(blockedPayload)
 
-	req, _ = http.NewRequest("POST", server.URL+"/api/v2/statements", bytes.NewReader(blockedBytes))
-	req.SetBasicAuth("test-agent", "agent-secret")
-	req.Header.Set("Content-Type", "application/json")
+	req2, _ := http.NewRequestWithContext(ctx, "POST", server.URL+"/api/v2/statements", bytes.NewReader(blockedBytes))
+	req2.SetBasicAuth("test-agent", "agent-secret")
+	req2.Header.Set("Content-Type", "application/json")
 
-	resp, err = http.DefaultClient.Do(req)
+	resp2, err := http.DefaultClient.Do(req2)
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
-	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("Expected 403 Forbidden for disallowed statement, got: %d", resp.StatusCode)
+	_ = resp2.Body.Close()
+	if resp2.StatusCode != http.StatusForbidden {
+		t.Fatalf("Expected 403 Forbidden for disallowed statement, got: %d", resp2.StatusCode)
 	}
 }
