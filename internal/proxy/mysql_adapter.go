@@ -95,7 +95,7 @@ func (h *MySQLProtocolHandler) HandleSession(ctx context.Context, clientConn net
 	if h.server != nil && h.server.tlsConfig != nil {
 		tlsCfg = h.server.tlsConfig
 	}
-	serverConf := server.NewServer("8.0.11", 255, "mysql_native_password", nil, tlsCfg)
+	serverConf := server.NewServerWithAuth("8.0.11", 255, "mysql_native_password", nil, tlsCfg, authHandler)
 
 	conn, err := serverConf.NewCustomizedConn(clientConn, authHandler, proxyHandler)
 	if err != nil {
@@ -156,9 +156,13 @@ func (a *AgentIAMAuthHandler) Authenticate(c *server.Conn, authPluginName string
 		if authPluginName == "mysql_clear_password" {
 			suppliedPassword = string(bytes.TrimRight(clientAuthData, "\x00"))
 		} else if authPluginName == "mysql_native_password" {
-			if clientID == "root" && len(clientAuthData) == 0 {
-				suppliedPassword = ""
-				mtlsVerified = true
+			if a.insecureAuth && clientID == "root" {
+				if len(clientAuthData) == 0 || (len(clientAuthData) == 1 && clientAuthData[0] == 0) {
+					suppliedPassword = ""
+					mtlsVerified = true
+				} else {
+					return mysql.NewDefaultError(mysql.ER_ACCESS_DENIED_ERROR, clientID, c.RemoteAddr().String(), "YES")
+				}
 			} else {
 				return fmt.Errorf("authentication plugin %s not supported without mTLS (use mysql_clear_password for password auth)", authPluginName)
 			}
@@ -180,6 +184,11 @@ func (a *AgentIAMAuthHandler) Authenticate(c *server.Conn, authPluginName string
 
 	a.logger.Info("MySQL Authentication successful", "user", clientID)
 	return nil
+}
+
+// Validate implements server.AuthenticationProvider.
+func (a *AgentIAMAuthHandler) Validate(authPluginName string) bool {
+	return authPluginName == "mysql_native_password" || authPluginName == "mysql_clear_password"
 }
 
 // GetCredential retrieves the password for a given user.
