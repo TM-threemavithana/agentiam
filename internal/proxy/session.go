@@ -87,6 +87,8 @@ type Session struct {
 	clientBackend *pgproto3.Backend
 
 	errorDiscard atomic.Bool
+	canceled     atomic.Bool
+	closed       atomic.Bool
 	rules        ast.Rules
 	tlsConfig    *tls.Config
 	closeOnce    sync.Once
@@ -120,6 +122,7 @@ func NewSession(clientConn net.Conn, upstreamDSN string, store *policy.Store, tl
 }
 
 func (s *Session) CancelQuery() {
+	s.canceled.Store(true)
 	s.uconnMu.Lock()
 	u := s.uconn
 	s.uconn = nil
@@ -389,6 +392,9 @@ func (s *Session) Run() error {
 func (s *Session) getOrAcquireUpstream(ctx context.Context, clientWriteCh chan pgproto3.BackendMessage) (*UpstreamConn, error) {
 	s.uconnMu.Lock()
 	defer s.uconnMu.Unlock()
+	if s.canceled.Load() || s.closed.Load() {
+		return nil, fmt.Errorf("session is canceled or closed")
+	}
 	if s.uconn != nil {
 		return s.uconn, nil
 	}
@@ -441,8 +447,13 @@ func (s *Session) getOrAcquireUpstream(ctx context.Context, clientWriteCh chan p
 			if r := recover(); r != nil {
 				s.logger.Error("Uncaught panic in upstream reader goroutine; terminating session", "panic", r, "client", s.clientID)
 				u.Broken.Store(true)
-				s.releaseUpstream()
-				s.Close()
+				s.uconnMu.Lock()
+				isActive := (s.uconn == u)
+				s.uconnMu.Unlock()
+				s.releaseUpstream(u)
+				if isActive {
+					s.Close()
+				}
 			}
 		}()
 
@@ -451,8 +462,13 @@ func (s *Session) getOrAcquireUpstream(ctx context.Context, clientWriteCh chan p
 			if err != nil {
 				s.logger.Error("Upstream read error; terminating session", "error", err, "client", s.clientID)
 				u.Broken.Store(true)
-				s.releaseUpstream()
-				s.Close()
+				s.uconnMu.Lock()
+				isActive := (s.uconn == u)
+				s.uconnMu.Unlock()
+				s.releaseUpstream(u)
+				if isActive {
+					s.Close()
+				}
 				return
 			}
 
@@ -528,7 +544,7 @@ func (s *Session) getOrAcquireUpstream(ctx context.Context, clientWriteCh chan p
 							return
 						case clientWriteCh <- msg:
 						}
-						s.releaseUpstream()
+						s.releaseUpstream(u)
 						return
 					}
 				}
@@ -545,18 +561,22 @@ func (s *Session) getOrAcquireUpstream(ctx context.Context, clientWriteCh chan p
 	return u, nil
 }
 
-func (s *Session) releaseUpstream() {
+func (s *Session) releaseUpstream(target *UpstreamConn) {
+	if target == nil {
+		return
+	}
 	s.uconnMu.Lock()
-	u := s.uconn
+	if s.uconn != target {
+		s.uconnMu.Unlock()
+		return
+	}
 	s.uconn = nil
 	s.uconnMu.Unlock()
 
-	if u != nil {
-		if s.server != nil && s.server.pool != nil {
-			s.server.pool.Release(u)
-		} else {
-			u.Close()
-		}
+	if s.server != nil && s.server.pool != nil {
+		s.server.pool.Release(target)
+	} else {
+		target.Close()
 	}
 }
 
@@ -945,6 +965,7 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 
 func (s *Session) Close() {
 	s.closeOnce.Do(func() {
+		s.closed.Store(true)
 		if s.clientConn != nil {
 			s.clientConn.Close()
 		}

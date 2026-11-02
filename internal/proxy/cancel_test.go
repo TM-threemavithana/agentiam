@@ -11,7 +11,19 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
+	dto "github.com/prometheus/client_model/go"
 )
+
+func getGaugeValue(g interface{ Write(*dto.Metric) error }) float64 {
+	var m dto.Metric
+	if err := g.Write(&m); err != nil {
+		return 0
+	}
+	if m.Gauge != nil {
+		return m.Gauge.GetValue()
+	}
+	return 0
+}
 
 // mockUpstreamWithDialCount starts a mock PostgreSQL server that counts connection handshakes.
 func mockUpstreamWithDialCount(t *testing.T, listenAddr string, dialCount *atomic.Int64) net.Listener {
@@ -277,7 +289,7 @@ func TestCancelQuery_ConcurrentWithUpstreamEOF(t *testing.T) {
 			defer raceWg.Done()
 			// Simulate reader goroutine encountering read error: marks broken and calls releaseUpstream
 			u.Broken.Store(true)
-			session.releaseUpstream()
+			session.releaseUpstream(u)
 		}()
 
 		go func() {
@@ -715,10 +727,402 @@ func TestPoolMetrics_AccurateAfterCancellation(t *testing.T) {
 		if active := pool.GetActiveCount(); active != 0 {
 			t.Fatalf("iter %d: expected 0 active connections, got %d", i, active)
 		}
+		if idleGauge := getGaugeValue(PoolIdleConnections); idleGauge != float64(poolSize) {
+			t.Fatalf("iter %d: expected idle gauge %d, got %v", i, poolSize, idleGauge)
+		}
+		if totalGauge := getGaugeValue(PoolTotalConnections); totalGauge != float64(poolSize) {
+			t.Fatalf("iter %d: expected total gauge %d, got %v", i, poolSize, totalGauge)
+		}
 	}
 
-	// Final verification of pool channel capacity
+	// Final verification of pool channel capacity and Prometheus gauge metrics
 	if len(pool.conns) != poolSize {
 		t.Fatalf("expected pool.conns channel len %d, got %d", poolSize, len(pool.conns))
+	}
+	if idleGauge := getGaugeValue(PoolIdleConnections); idleGauge != float64(poolSize) {
+		t.Fatalf("final: expected idle gauge %d, got %v", poolSize, idleGauge)
+	}
+	if totalGauge := getGaugeValue(PoolTotalConnections); totalGauge != float64(poolSize) {
+		t.Fatalf("final: expected total gauge %d, got %v", poolSize, totalGauge)
+	}
+}
+
+// TestCancelQuery_CancelU1_AcquireU2_DeliverR1EOF verifies that when u1 is canceled, u2 is acquired,
+// and then the stale reader R1 receives EOF from u1, R1 does NOT release or corrupt u2.
+func TestCancelQuery_CancelU1_AcquireU2_DeliverR1EOF(t *testing.T) {
+	var dialCount atomic.Int64
+	l := mockUpstreamWithDialCount(t, "127.0.0.1:0", &dialCount)
+	defer l.Close()
+
+	dsn := "postgres://user:pass@" + l.Addr().String() + "/db?sslmode=disable"
+	logger := NewLogger(io.Discard)
+	poolSize := 3
+	pool := NewPool(dsn, poolSize, logger)
+	ctx := context.Background()
+
+	if err := pool.Init(ctx); err != nil {
+		t.Fatalf("failed to init pool: %v", err)
+	}
+	defer pool.Close()
+
+	server := &Server{
+		pool:   pool,
+		logger: logger,
+	}
+
+	c1, c2 := net.Pipe()
+	defer c2.Close()
+	session := &Session{
+		server:      server,
+		clientConn:  c1,
+		logger:      logger,
+		sessionVars: make(map[string]string),
+	}
+
+	// 1. Session owns upstream connection u1
+	u1, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("failed to acquire u1: %v", err)
+	}
+	session.uconnMu.Lock()
+	session.uconn = u1
+	session.uconnMu.Unlock()
+
+	r1Reading := make(chan struct{})
+	r1CanHandleEOF := make(chan struct{})
+	r1Finished := make(chan struct{})
+
+	// 2. Reader goroutine R1 is blocked reading from u1
+	go func() {
+		close(r1Reading)
+		_, err := u1.Frontend.Receive()
+		if err != nil {
+			// Deterministic barrier: wait until u2 has been acquired and assigned
+			<-r1CanHandleEOF
+			u1.Broken.Store(true)
+			// R1 attempts cleanup with its connection identity u1
+			session.releaseUpstream(u1)
+			close(r1Finished)
+			return
+		}
+	}()
+
+	<-r1Reading
+
+	// 3. CancelQuery detaches and releases u1
+	session.CancelQuery()
+
+	// Verify u1 was cleanly detached
+	session.uconnMu.Lock()
+	if session.uconn != nil {
+		session.uconnMu.Unlock()
+		t.Fatalf("expected s.uconn to be nil after CancelQuery")
+	}
+	session.uconnMu.Unlock()
+
+	// 4. A subsequent connection u2 is acquired from the pool
+	u2, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("failed to acquire u2: %v", err)
+	}
+	if !u2.InUse.Load() {
+		t.Fatalf("expected u2.InUse to be true")
+	}
+
+	// 5. Session assigns s.uconn = u2
+	session.uconnMu.Lock()
+	session.uconn = u2
+	session.uconnMu.Unlock()
+
+	// 6. R1 handles EOF from u1's closed socket and runs releaseUpstream(u1)
+	close(r1CanHandleEOF)
+	<-r1Finished
+
+	// 7. Verify u2 ownership was NOT hijacked by R1
+	if !u2.InUse.Load() {
+		t.Fatalf("STALE-READER REGRESSION: u2.InUse was set to false by R1!")
+	}
+	session.uconnMu.Lock()
+	currentUconn := session.uconn
+	session.uconnMu.Unlock()
+	if currentUconn != u2 {
+		t.Fatalf("STALE-READER REGRESSION: session.uconn was detached or modified by R1!")
+	}
+
+	// Verify query on u2 executes successfully
+	if err := u2.SendAndFlush(&pgproto3.Query{String: "SELECT 1;"}); err != nil {
+		t.Fatalf("query on u2 failed: %v", err)
+	}
+	msg, err := u2.Frontend.Receive()
+	if err != nil {
+		t.Fatalf("receive on u2 failed: %v", err)
+	}
+	if _, ok := msg.(*pgproto3.RowDescription); !ok {
+		t.Fatalf("expected RowDescription on u2, got %T", msg)
+	}
+
+	// 8. Normal release of u2 by its proper owner
+	session.releaseUpstream(u2)
+	if u2.InUse.Load() {
+		t.Fatalf("expected u2.InUse to be false after proper release")
+	}
+	if u2.Broken.Load() {
+		t.Fatalf("u2 was unexpectedly marked broken")
+	}
+}
+
+// TestCancelQuery_SecondQueryQueued_ReacquisitionPrevented verifies that once a session
+// has been canceled, subsequent/queued queries cannot unsafely reacquire pooled connections.
+func TestCancelQuery_SecondQueryQueued_ReacquisitionPrevented(t *testing.T) {
+	var dialCount atomic.Int64
+	l := mockUpstreamWithDialCount(t, "127.0.0.1:0", &dialCount)
+	defer l.Close()
+
+	dsn := "postgres://user:pass@" + l.Addr().String() + "/db?sslmode=disable"
+	logger := NewLogger(io.Discard)
+	poolSize := 3
+	pool := NewPool(dsn, poolSize, logger)
+	ctx := context.Background()
+
+	if err := pool.Init(ctx); err != nil {
+		t.Fatalf("failed to init pool: %v", err)
+	}
+	defer pool.Close()
+
+	server := &Server{
+		pool:   pool,
+		logger: logger,
+	}
+
+	c1, c2 := net.Pipe()
+	defer c2.Close()
+	session := &Session{
+		server:      server,
+		clientConn:  c1,
+		logger:      logger,
+		sessionVars: make(map[string]string),
+	}
+
+	// Session acquires initial connection u1
+	u1, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("failed to acquire u1: %v", err)
+	}
+	session.uconnMu.Lock()
+	session.uconn = u1
+	session.uconnMu.Unlock()
+
+	// Cancel the query
+	session.CancelQuery()
+
+	// Verify canceled flag is set
+	if !session.canceled.Load() {
+		t.Fatalf("expected session.canceled to be true")
+	}
+
+	// Attempt to acquire an upstream connection for a second/queued query
+	writeCh := make(chan pgproto3.BackendMessage, 10)
+	u2, err := session.getOrAcquireUpstream(ctx, writeCh)
+	if err == nil {
+		session.releaseUpstream(u2)
+		t.Fatalf("expected getOrAcquireUpstream to reject reacquisition after cancellation, got success: %v", u2)
+	}
+
+	// Verify s.uconn remains nil
+	session.uconnMu.Lock()
+	uconn := session.uconn
+	session.uconnMu.Unlock()
+	if uconn != nil {
+		t.Fatalf("expected s.uconn to remain nil, got %v", uconn)
+	}
+}
+
+// TestCancelQuery_OldReaderRacingWithNewReader verifies that when an old reader cleans up
+// concurrently with a new reader's query execution, no data races, deadlocks, or state corruption occur.
+func TestCancelQuery_OldReaderRacingWithNewReader(t *testing.T) {
+	var dialCount atomic.Int64
+	l := mockUpstreamWithDialCount(t, "127.0.0.1:0", &dialCount)
+	defer l.Close()
+
+	dsn := "postgres://user:pass@" + l.Addr().String() + "/db?sslmode=disable"
+	logger := NewLogger(io.Discard)
+	poolSize := 5
+	pool := NewPool(dsn, poolSize, logger)
+	ctx := context.Background()
+
+	if err := pool.Init(ctx); err != nil {
+		t.Fatalf("failed to init pool: %v", err)
+	}
+	defer pool.Close()
+
+	server := &Server{
+		pool:   pool,
+		logger: logger,
+	}
+
+	for iter := 0; iter < 20; iter++ {
+		c1, c2 := net.Pipe()
+		session1 := &Session{
+			server:      server,
+			clientConn:  c1,
+			logger:      logger,
+			sessionVars: make(map[string]string),
+		}
+
+		u1, err := pool.Acquire(ctx)
+		if err != nil {
+			t.Fatalf("iter %d: acquire u1: %v", iter, err)
+		}
+		session1.uconnMu.Lock()
+		session1.uconn = u1
+		session1.uconnMu.Unlock()
+
+		// Cancel session1
+		session1.CancelQuery()
+
+		// Session2 acquires u2
+		c3, c4 := net.Pipe()
+		session2 := &Session{
+			server:      server,
+			clientConn:  c3,
+			logger:      logger,
+			sessionVars: make(map[string]string),
+		}
+		u2, err := pool.Acquire(ctx)
+		if err != nil {
+			t.Fatalf("iter %d: acquire u2: %v", iter, err)
+		}
+		session2.uconnMu.Lock()
+		session2.uconn = u2
+		session2.uconnMu.Unlock()
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		// Goroutine 1: Old reader R1 cleanup racing
+		go func() {
+			defer wg.Done()
+			u1.Broken.Store(true)
+			session1.releaseUpstream(u1)
+		}()
+
+		// Goroutine 2: New reader activity on u2
+		go func() {
+			defer wg.Done()
+			_ = u2.SendAndFlush(&pgproto3.Query{String: "SELECT 1;"})
+			msg, err := u2.Frontend.Receive()
+			if err == nil && msg != nil {
+				// Read until ReadyForQuery
+				for {
+					m, err := u2.Frontend.Receive()
+					if err != nil {
+						break
+					}
+					if _, ok := m.(*pgproto3.ReadyForQuery); ok {
+						break
+					}
+				}
+			}
+			session2.releaseUpstream(u2)
+		}()
+
+		wg.Wait()
+		c2.Close()
+		c4.Close()
+	}
+}
+
+// TestCancelQuery_SubsequentHealthySessionExecutesQueries verifies that after multiple
+// cancellations and recoveries, a new session successfully acquires connections and executes queries.
+func TestCancelQuery_SubsequentHealthySessionExecutesQueries(t *testing.T) {
+	var dialCount atomic.Int64
+	l := mockUpstreamWithDialCount(t, "127.0.0.1:0", &dialCount)
+	defer l.Close()
+
+	dsn := "postgres://user:pass@" + l.Addr().String() + "/db?sslmode=disable"
+	logger := NewLogger(io.Discard)
+	poolSize := 3
+	pool := NewPool(dsn, poolSize, logger)
+	ctx := context.Background()
+
+	if err := pool.Init(ctx); err != nil {
+		t.Fatalf("failed to init pool: %v", err)
+	}
+	defer pool.Close()
+
+	server := &Server{
+		pool:   pool,
+		logger: logger,
+	}
+
+	// Perform 3 cancel cycles
+	for i := 0; i < 3; i++ {
+		c1, c2 := net.Pipe()
+		s := &Session{
+			server:      server,
+			clientConn:  c1,
+			logger:      logger,
+			sessionVars: make(map[string]string),
+		}
+		u, err := pool.Acquire(ctx)
+		if err != nil {
+			t.Fatalf("cancel iter %d: acquire: %v", i, err)
+		}
+		s.uconnMu.Lock()
+		s.uconn = u
+		s.uconnMu.Unlock()
+		s.CancelQuery()
+		c2.Close()
+	}
+
+	// Wait for pool replacement connections to settle
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(pool.conns) == poolSize {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// New healthy session
+	cClient, cProxy := net.Pipe()
+	defer cClient.Close()
+	defer cProxy.Close()
+
+	healthySession := &Session{
+		server:        server,
+		clientConn:    cProxy,
+		clientBackend: pgproto3.NewBackend(cProxy, cProxy),
+		logger:        logger,
+		sessionVars:   make(map[string]string),
+	}
+
+	writeCh := make(chan pgproto3.BackendMessage, 10)
+	u, err := healthySession.getOrAcquireUpstream(ctx, writeCh)
+	if err != nil {
+		t.Fatalf("failed to acquire upstream for healthy session: %v", err)
+	}
+	defer healthySession.releaseUpstream(u)
+
+	if u.Broken.Load() {
+		t.Fatalf("acquired connection is marked broken")
+	}
+
+	// Execute a real query
+	if err := u.SendAndFlush(&pgproto3.Query{String: "SELECT 42;"}); err != nil {
+		t.Fatalf("query failed on healthy session: %v", err)
+	}
+	select {
+	case msg := <-writeCh:
+		if _, ok := msg.(*pgproto3.RowDescription); !ok {
+			t.Fatalf("expected RowDescription on writeCh, got %T", msg)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for query response on writeCh")
+	}
+
+	// Verify Prometheus metrics directly
+	if total := getGaugeValue(PoolTotalConnections); total != float64(poolSize) {
+		t.Fatalf("expected PoolTotalConnections to be %d, got %v", poolSize, total)
 	}
 }
