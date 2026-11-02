@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/jackc/pgproto3/v2"
+	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
@@ -97,7 +97,7 @@ func (p *Pool) dial(ctx context.Context) (*UpstreamConn, error) {
 
 	return &UpstreamConn{
 		Conn:      hijacked.Conn,
-		Frontend:  pgproto3.NewFrontend(pgproto3.NewChunkReader(hijacked.Conn), hijacked.Conn),
+		Frontend:  pgproto3.NewFrontend(hijacked.Conn, hijacked.Conn),
 		PID:       hijacked.PID,
 		SecretKey: secretKeyUint,
 	}, nil
@@ -184,7 +184,29 @@ func (p *Pool) Release(u *UpstreamConn) {
 
 	// Proactively clean the connection state before putting it back in the pool
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				p.logger.Error("Uncaught panic in pool release reader; discarding connection", "panic", r)
+				u.Broken.Store(true)
+				u.Close()
+				broken := &UpstreamConn{}
+				broken.Broken.Store(true)
+				p.conns <- broken
+				PoolIdleConnections.Inc()
+			}
+		}()
+
 		u.Frontend.Send(&pgproto3.Query{String: "DISCARD ALL"})
+		if err := u.Frontend.Flush(); err != nil {
+			p.logger.Error("Failed to flush DISCARD ALL on release", "error", err)
+			u.Broken.Store(true)
+			u.Close()
+			broken := &UpstreamConn{}
+			broken.Broken.Store(true)
+			p.conns <- broken
+			PoolIdleConnections.Inc()
+			return
+		}
 		for {
 			msg, err := u.Frontend.Receive()
 			if err != nil {

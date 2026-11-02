@@ -18,7 +18,7 @@ import (
 	"github.com/tm-threemavithana/agentiam/internal/ast"
 	"github.com/tm-threemavithana/agentiam/internal/policy"
 
-	"github.com/jackc/pgproto3/v2"
+	"github.com/jackc/pgx/v5/pgproto3"
 )
 
 var setCmdRegex = regexp.MustCompile(`(?i)^\s*SET\s+([a-zA-Z0-9_]+)\s*(?:TO|=)\s*(.+)$`)
@@ -50,7 +50,7 @@ func NewPostgresProtocolHandler(upstreamDSN string, store *policy.Store, tlsConf
 }
 
 func (h *PostgresProtocolHandler) HandleSession(ctx context.Context, clientConn net.Conn) error {
-	clientBackend := pgproto3.NewBackend(pgproto3.NewChunkReader(clientConn), clientConn)
+	clientBackend := pgproto3.NewBackend(clientConn, clientConn)
 	clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	startupMsg, err := clientBackend.ReceiveStartupMessage()
 	clientConn.SetReadDeadline(time.Time{})
@@ -113,7 +113,7 @@ func NewSession(clientConn net.Conn, upstreamDSN string, store *policy.Store, tl
 		logger:             logger,
 		server:             server,
 		insecureAuth:       insecureAuth,
-		clientBackend:      pgproto3.NewBackend(pgproto3.NewChunkReader(clientConn), clientConn),
+		clientBackend:      pgproto3.NewBackend(clientConn, clientConn),
 		preparedStatements: make(map[string]PreparedStatement),
 		sessionVars:        make(map[string]string),
 	}
@@ -178,6 +178,7 @@ func (s *Session) Run() error {
 			_, isTLS := s.clientConn.(*tls.Conn)
 			if s.tlsConfig != nil && !isTLS {
 				s.clientBackend.Send(&pgproto3.ErrorResponse{Severity: "FATAL", Message: "SSL connection is required"})
+				_ = s.clientBackend.Flush()
 				return fmt.Errorf("client attempted plaintext connection when TLS is enforced")
 			}
 			clientID = msg.Parameters["user"]
@@ -199,7 +200,7 @@ func (s *Session) Run() error {
 			}
 
 			s.clientConn = tlsConn
-			s.clientBackend = pgproto3.NewBackend(pgproto3.NewChunkReader(s.clientConn), s.clientConn)
+			s.clientBackend = pgproto3.NewBackend(s.clientConn, s.clientConn)
 			s.startupMsg = nil
 			continue
 
@@ -220,6 +221,7 @@ func (s *Session) Run() error {
 	if err != nil {
 		s.logger.Error("Auth failed: invalid client ID", "client", clientID, "error", err)
 		s.clientBackend.Send(&pgproto3.ErrorResponse{Severity: "FATAL", Message: "Invalid Agent Credentials"})
+		_ = s.clientBackend.Flush()
 		return fmt.Errorf("invalid client ID")
 	}
 
@@ -241,12 +243,16 @@ func (s *Session) Run() error {
 	if !mtlsVerified && !s.insecureAuth {
 		s.logger.Error("Client attempted cleartext authentication without --insecure-cleartext-auth flag")
 		s.clientBackend.Send(&pgproto3.ErrorResponse{Severity: "FATAL", Message: "mTLS is required. Cleartext auth is disabled."})
+		_ = s.clientBackend.Flush()
 		return fmt.Errorf("insecure auth rejected")
 	}
 
 	if !mtlsVerified {
 		if strings.HasPrefix(agentKey, "SCRAM-SHA-256$") {
 			s.clientBackend.Send(&pgproto3.AuthenticationSASL{AuthMechanisms: []string{"SCRAM-SHA-256"}})
+			if err := s.clientBackend.Flush(); err != nil {
+				return err
+			}
 			s.clientBackend.SetAuthType(pgproto3.AuthTypeSASL)
 
 			s.clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -287,6 +293,9 @@ func (s *Session) Run() error {
 			saltStr := base64.StdEncoding.EncodeToString(salt)
 			serverFirst := fmt.Sprintf("r=%s,s=%s,i=%d", serverNonce, saltStr, iters)
 			s.clientBackend.Send(&pgproto3.AuthenticationSASLContinue{Data: []byte(serverFirst)})
+			if err := s.clientBackend.Flush(); err != nil {
+				return err
+			}
 
 			s.clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
 			authMsg, err = s.clientBackend.Receive()
@@ -311,13 +320,18 @@ func (s *Session) Run() error {
 			serverSignature, err := VerifySCRAM(clientFirstBare, serverFirst, clientFinalWithoutProof, clientProofStr, storedKey, serverKey)
 			if err != nil {
 				s.clientBackend.Send(&pgproto3.ErrorResponse{Severity: "FATAL", Message: "Password authentication failed"})
+				_ = s.clientBackend.Flush()
 				return fmt.Errorf("SCRAM auth failed")
 			}
 
 			s.clientBackend.Send(&pgproto3.AuthenticationSASLFinal{Data: []byte("v=" + serverSignature)})
+			_ = s.clientBackend.Flush()
 			mtlsVerified = true // Re-use mtlsVerified to signify pre-verified auth (SCRAM)
 		} else {
 			s.clientBackend.Send(&pgproto3.AuthenticationCleartextPassword{})
+			if err := s.clientBackend.Flush(); err != nil {
+				return err
+			}
 			s.clientBackend.SetAuthType(pgproto3.AuthTypeCleartextPassword)
 
 			s.clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -338,6 +352,7 @@ func (s *Session) Run() error {
 	rules, authVersion, err := s.store.GetRulesForAgent(clientID, suppliedPassword, mtlsVerified)
 	if err != nil {
 		s.clientBackend.Send(&pgproto3.ErrorResponse{Severity: "FATAL", Message: "Password authentication failed"})
+		_ = s.clientBackend.Flush()
 		return fmt.Errorf("password auth failed")
 	}
 	s.rules = rules
@@ -355,8 +370,13 @@ func (s *Session) Run() error {
 	s.clientBackend.Send(&pgproto3.ParameterStatus{Name: "client_encoding", Value: "UTF8"})
 	s.clientBackend.Send(&pgproto3.ParameterStatus{Name: "standard_conforming_strings", Value: "on"})
 
-	s.clientBackend.Send(&pgproto3.BackendKeyData{ProcessID: s.virtualPID, SecretKey: s.virtualSec})
+	secBytes := make([]byte, 4)
+	binary.BigEndian.PutUint32(secBytes, s.virtualSec)
+	s.clientBackend.Send(&pgproto3.BackendKeyData{ProcessID: s.virtualPID, SecretKey: secBytes})
 	s.clientBackend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+	if err := s.clientBackend.Flush(); err != nil {
+		return err
+	}
 
 	return s.proxyLoop(ctx, cancel, clientID)
 }
@@ -392,10 +412,26 @@ func (s *Session) getOrAcquireUpstream(ctx context.Context, clientWriteCh chan p
 		u.SwallowSetTimeout.Add(1)
 		u.Frontend.Send(&pgproto3.Query{String: q})
 	}
+	if len(stateQueries) > 0 {
+		if err := u.Frontend.Flush(); err != nil {
+			u.Broken.Store(true)
+			s.releaseUpstream()
+			return nil, err
+		}
+	}
 
 	s.uconn = u
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				s.logger.Error("Uncaught panic in upstream reader goroutine; terminating session", "panic", r, "client", s.clientID)
+				u.Broken.Store(true)
+				s.releaseUpstream()
+				s.Close()
+			}
+		}()
+
 		for {
 			msg, err := u.Frontend.Receive()
 			if err != nil {
@@ -552,6 +588,9 @@ func (s *Session) handleParseMsg(ctx context.Context, v *pgproto3.Parse, clientW
 		return err
 	}
 	u.Frontend.Send(v)
+	if err := u.Frontend.Flush(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -642,6 +681,9 @@ func (s *Session) handleBindMsg(ctx context.Context, v *pgproto3.Bind, clientWri
 	v.PreparedStatement = ""
 	v.DestinationPortal = ""
 	u.Frontend.Send(v)
+	if err := u.Frontend.Flush(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -699,6 +741,9 @@ func (s *Session) handleQueryMsg(ctx context.Context, v *pgproto3.Query, clientW
 		return err
 	}
 	u.Frontend.Send(v)
+	if err := u.Frontend.Flush(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -721,6 +766,9 @@ func (s *Session) handleSyncMsg(ctx context.Context, v *pgproto3.Sync, clientWri
 		return err
 	}
 	u.Frontend.Send(v)
+	if err := u.Frontend.Flush(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -741,6 +789,13 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 					return
 				}
 				s.clientBackend.Send(msg)
+				for len(clientWriteCh) > 0 {
+					next := <-clientWriteCh
+					s.clientBackend.Send(next)
+				}
+				if err := s.clientBackend.Flush(); err != nil {
+					return
+				}
 			}
 		}
 	}()
@@ -800,6 +855,10 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 			}
 			v.Name = ""
 			u.Frontend.Send(v)
+			if err := u.Frontend.Flush(); err != nil {
+				span.End()
+				return err
+			}
 			span.End()
 
 		case *pgproto3.Execute:
@@ -817,6 +876,10 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 			}
 			v.Portal = ""
 			u.Frontend.Send(v)
+			if err := u.Frontend.Flush(); err != nil {
+				span.End()
+				return err
+			}
 			span.End()
 
 		case *pgproto3.Close:
@@ -829,6 +892,7 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 				if err == nil {
 					v.Name = ""
 					u.Frontend.Send(v)
+					_ = u.Frontend.Flush()
 				}
 			}
 			span.End()
@@ -854,6 +918,9 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 					return err
 				}
 				u.Frontend.Send(msg)
+				if err := u.Frontend.Flush(); err != nil {
+					return err
+				}
 			}
 		}
 	}

@@ -19,7 +19,7 @@ import (
 
 	"github.com/tm-threemavithana/agentiam/internal/policy"
 
-	"github.com/jackc/pgproto3/v2"
+	"github.com/jackc/pgx/v5/pgproto3"
 )
 
 func generateTestCA() (tls.Certificate, *x509.Certificate, error) {
@@ -181,16 +181,16 @@ func TestMutualTLSAuthentication(t *testing.T) {
 			t.Fatalf("TLS handshake failed: %v", err)
 		}
 
-		frontend := pgproto3.NewFrontend(pgproto3.NewChunkReader(tlsClientConn), tlsClientConn)
+		frontend := pgproto3.NewFrontend(tlsClientConn, tlsClientConn)
 
-		err = frontend.Send(&pgproto3.StartupMessage{
+		frontend.Send(&pgproto3.StartupMessage{
 			ProtocolVersion: pgproto3.ProtocolVersionNumber,
 			Parameters: map[string]string{
 				"user":     "mtls-agent",
 				"database": "postgres",
 			},
 		})
-		if err != nil {
+		if err := frontend.Flush(); err != nil {
 			t.Fatalf("failed to send startup: %v", err)
 		}
 

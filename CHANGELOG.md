@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+### Security
+- **Migrated to `pgx/v5/pgproto3` (Fixes `GO-2026-4518` / `CVE-2026-32286`)**:
+  - Replaced the deprecated and unmaintained `github.com/jackc/pgproto3/v2` dependency with `github.com/jackc/pgx/v5/pgproto3`.
+  - Resolved `DataRow.Decode` integer bounds handling vulnerability: malformed negative column lengths now return an `invalidMessageFormatErr` cleanly rather than triggering unrecoverable slice-bounds panics.
+  - Added structured panic recovery boundaries to upstream session and connection pool reader goroutines, ensuring any unexpected parser panics fail closed safely and drop the faulty connection rather than crashing the proxy server.
+  - Added deterministic security regression unit tests covering malformed DataRow handling, upstream fail-closed behavior, and connection pool `DISCARD ALL` flush verification.
+
 ## [v0.3.0] - Rate Limiting, Audit Webhooks, and Data Masking
 
 ### Security
