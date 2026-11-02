@@ -61,6 +61,9 @@ func (p *MySQLParser) ApplyRules(sql string, rules Rules, astCache cache.ASTCach
 
 	// Policy enforcement: check if statement type is allowed
 	if !isAllowed(v.stmtType, rules.AllowedStatements) {
+		if v.stmtType == "" {
+			return "", nil, fmt.Errorf("policy violation: statement not allowed")
+		}
 		return "", nil, fmt.Errorf("policy violation: statement %s not allowed", v.stmtType)
 	}
 
@@ -188,6 +191,30 @@ func (v *mysqlVisitor) Enter(in ast.Node) (ast.Node, bool) {
 	case *ast.DeleteStmt:
 		if v.stmtType == "" {
 			v.stmtType = "DELETE"
+		}
+	case *ast.BeginStmt:
+		if v.stmtType == "" {
+			v.stmtType = "BEGIN"
+		}
+	case *ast.CommitStmt:
+		if v.stmtType == "" {
+			v.stmtType = "COMMIT"
+		}
+	case *ast.RollbackStmt:
+		if v.stmtType == "" {
+			v.stmtType = "ROLLBACK"
+		}
+	case *ast.SetStmt:
+		if v.stmtType == "" {
+			v.stmtType = "SET"
+		}
+	case *ast.LockTablesStmt, *ast.UnlockTablesStmt:
+		if v.stmtType == "" {
+			v.stmtType = "LOCK"
+		}
+	case *ast.CreateTableStmt:
+		if v.stmtType == "" {
+			v.stmtType = "CREATE"
 		}
 	case *ast.TableName:
 		// Extract table names

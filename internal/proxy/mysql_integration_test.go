@@ -79,7 +79,7 @@ func TestMySQLAdapterIntegration(t *testing.T) {
 	store, _ := policy.NewStore("", "", logger.Logger)
 	store.SetAgentPolicy("root", policy.AgentConfig{
 		Name:              "root",
-		AllowedStatements: []string{"SELECT", "SHOW", "SET"},
+		AllowedStatements: []string{"SELECT"},
 		AllowedTables:     []string{"allowed_tbl"},
 		SelectLimit:       10,
 		Dialect:           "mysql",
@@ -259,5 +259,164 @@ func TestMySQLAdapterIntegration(t *testing.T) {
 		if count != 10 {
 			t.Fatalf("expected LIMIT 100 to be clamped to 10 rows, got %d rows", count)
 		}
+	})
+
+	// Subtest 8: Unsupported Transaction & Session Operations Fail-Closed
+	t.Run("Unsupported_Transaction_And_Session_Operations", func(t *testing.T) {
+		db, err := sql.Open("mysql", fmt.Sprintf("root@tcp(%s)/testdb", proxyAddr))
+		if err != nil {
+			t.Fatalf("failed to connect: %v", err)
+		}
+		defer db.Close()
+
+		ops := []struct {
+			name        string
+			fn          func() error
+			expectedErr string
+		}{
+			{
+				name: "1. START TRANSACTION blocked",
+				fn: func() error {
+					_, err := db.Exec("START TRANSACTION")
+					return err
+				},
+				expectedErr: "statement BEGIN not allowed",
+			},
+			{
+				name: "2. BEGIN blocked",
+				fn: func() error {
+					_, err := db.Exec("BEGIN")
+					return err
+				},
+				expectedErr: "statement BEGIN not allowed",
+			},
+			{
+				name: "3. COMMIT blocked",
+				fn: func() error {
+					_, err := db.Exec("COMMIT")
+					return err
+				},
+				expectedErr: "statement COMMIT not allowed",
+			},
+			{
+				name: "4. ROLLBACK blocked",
+				fn: func() error {
+					_, err := db.Exec("ROLLBACK")
+					return err
+				},
+				expectedErr: "statement ROLLBACK not allowed",
+			},
+			{
+				name: "5. SET autocommit = 0 blocked",
+				fn: func() error {
+					_, err := db.Exec("SET autocommit = 0")
+					return err
+				},
+				expectedErr: "statement SET not allowed",
+			},
+			{
+				name: "6. SET session variable blocked",
+				fn: func() error {
+					_, err := db.Exec("SET @session_variable = 'value'")
+					return err
+				},
+				expectedErr: "statement SET not allowed",
+			},
+			{
+				name: "7. CREATE TEMPORARY TABLE blocked",
+				fn: func() error {
+					_, err := db.Exec("CREATE TEMPORARY TABLE temp_tbl (id INT)")
+					return err
+				},
+				expectedErr: "statement CREATE not allowed",
+			},
+			{
+				name: "8. LOCK TABLES blocked",
+				fn: func() error {
+					_, err := db.Exec("LOCK TABLES allowed_tbl WRITE")
+					return err
+				},
+				expectedErr: "statement LOCK not allowed",
+			},
+			{
+				name: "9. Binary prepared statements (db.Prepare) unsupported",
+				fn: func() error {
+					stmt, err := db.Prepare("SELECT id FROM allowed_tbl WHERE id = ?")
+					if err == nil {
+						stmt.Close()
+					}
+					return err
+				},
+				expectedErr: "not supported now",
+			},
+			{
+				name: "10. Multiple SQL statements in one request blocked",
+				fn: func() error {
+					_, err := db.Exec("SELECT 1; SELECT 2")
+					return err
+				},
+				expectedErr: "multiple statements not allowed",
+			},
+		}
+
+		for _, op := range ops {
+			t.Run(op.name, func(t *testing.T) {
+				err := op.fn()
+				if err == nil {
+					t.Fatalf("expected operation %s to fail, but it succeeded", op.name)
+				}
+				if !strings.Contains(err.Error(), op.expectedErr) {
+					t.Fatalf("expected error containing %q, got: %v", op.expectedErr, err)
+				}
+			})
+		}
+	})
+
+	// Subtest 9: Permitted SELECT Side Effects and Session Isolation Investigation
+	t.Run("Permitted_SELECT_Side_Effects", func(t *testing.T) {
+		db, err := sql.Open("mysql", fmt.Sprintf("root@tcp(%s)/testdb", proxyAddr))
+		if err != nil {
+			t.Fatalf("failed to connect: %v", err)
+		}
+		defer db.Close()
+
+		// 1. SELECT @var := 'value' executes upstream because it is parsed as SELECT
+		var setVal string
+		err = db.QueryRow("SELECT @var := 'leak_test'").Scan(&setVal)
+		if err != nil {
+			t.Fatalf("SELECT @var := 'leak_test' failed: %v", err)
+		}
+		if setVal != "leak_test" {
+			t.Errorf("expected @var to be 'leak_test', got %s", setVal)
+		}
+
+		// 2. SELECT CONNECTION_ID() reveals connection hopping across pooled connections
+		var connID1, connID2 int64
+		if err := db.QueryRow("SELECT CONNECTION_ID()").Scan(&connID1); err != nil {
+			t.Fatalf("SELECT CONNECTION_ID() #1 failed: %v", err)
+		}
+		if err := db.QueryRow("SELECT CONNECTION_ID()").Scan(&connID2); err != nil {
+			t.Fatalf("SELECT CONNECTION_ID() #2 failed: %v", err)
+		}
+		t.Logf("Observed MySQL connection IDs: #1=%d, #2=%d", connID1, connID2)
+
+		// 3. User advisory locks (GET_LOCK / RELEASE_LOCK)
+		var getLockRes sql.NullInt64
+		err = db.QueryRow("SELECT GET_LOCK('agentiam_audit_lock', 5)").Scan(&getLockRes)
+		if err != nil {
+			t.Fatalf("GET_LOCK failed: %v", err)
+		}
+		if !getLockRes.Valid || getLockRes.Int64 != 1 {
+			t.Fatalf("expected GET_LOCK to return 1, got %v", getLockRes)
+		}
+
+		// Try releasing the lock; because of connection hopping across pooled connections,
+		// RELEASE_LOCK will return 0 (not owner of lock) if it lands on a different pooled connection.
+		var relLockRes sql.NullInt64
+		err = db.QueryRow("SELECT RELEASE_LOCK('agentiam_audit_lock')").Scan(&relLockRes)
+		if err != nil {
+			t.Fatalf("RELEASE_LOCK failed: %v", err)
+		}
+		t.Logf("RELEASE_LOCK returned: %v (1 = released on same conn, 0 = lock not held by this connection)", relLockRes)
 	})
 }
