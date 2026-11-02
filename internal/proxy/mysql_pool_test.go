@@ -2,10 +2,19 @@ package proxy
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
-	"strings"
+	"fmt"
 	"io"
+	"math/big"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -14,6 +23,8 @@ import (
 	"github.com/go-mysql-org/go-mysql/client"
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/packet"
+	"github.com/go-mysql-org/go-mysql/server"
+	driver "github.com/go-sql-driver/mysql"
 )
 
 // Helper to construct a mock MySQLUpstreamConn backed by net.Pipe.
@@ -425,5 +436,398 @@ func TestMySQLUpstreamConn_Execute_Mutex_Protection(t *testing.T) {
 	}
 	if !u.Broken.Load() {
 		t.Fatal("connection must be marked broken on network error")
+	}
+}
+
+func generateTestServerCert(caCert *x509.Certificate, caKey interface{}, host string) (tls.Certificate, error) {
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(3),
+		Subject: pkix.Name{
+			CommonName:   host,
+			Organization: []string{"Test Server"},
+		},
+		NotBefore:             time.Now().Add(-1 * time.Minute),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		template.IPAddresses = []net.IP{ip}
+	} else {
+		template.DNSNames = []string{host}
+	}
+
+	derBytes, err := x509.CreateCertificate(rand.Reader, &template, caCert, &priv.PublicKey, caKey)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+	privBytes, _ := x509.MarshalECPrivateKey(priv)
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: privBytes})
+
+	return tls.X509KeyPair(certPEM, keyPEM)
+}
+
+type mockTLSAuthHandler struct{}
+
+func (m *mockTLSAuthHandler) Authenticate(c *server.Conn, authPluginName string, clientAuthData []byte) error {
+	return nil
+}
+func (m *mockTLSAuthHandler) Validate(authPluginName string) bool {
+	return true
+}
+func (m *mockTLSAuthHandler) GetCredential(username string) (server.Credential, bool, error) {
+	return server.Credential{Passwords: []string{""}, AuthPluginName: "mysql_native_password"}, true, nil
+}
+func (m *mockTLSAuthHandler) OnAuthSuccess(conn *server.Conn) error {
+	return nil
+}
+func (m *mockTLSAuthHandler) OnAuthFailure(conn *server.Conn, err error) {
+}
+
+type mockTLSQueryHandler struct {
+	server.EmptyHandler
+}
+
+func (m *mockTLSQueryHandler) HandleQuery(query string) (*mysql.Result, error) {
+	if strings.Contains(query, "Ssl_cipher") {
+		names := []string{"Variable_name", "Value"}
+		values := [][]any{{"Ssl_cipher", "TLS_AES_128_GCM_SHA256"}}
+		rs, err := mysql.BuildSimpleResultset(names, values, false)
+		if err != nil {
+			return nil, err
+		}
+		return &mysql.Result{Resultset: rs}, nil
+	}
+	return &mysql.Result{Status: 2}, nil
+}
+
+func startMockTLSServer(t *testing.T, serverTLS *tls.Config) (string, func()) {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+
+	authHandler := &mockTLSAuthHandler{}
+	queryHandler := &mockTLSQueryHandler{}
+	serverConf := server.NewServerWithAuth("8.0.32", 255, "mysql_native_password", nil, serverTLS, authHandler)
+
+	done := make(chan struct{})
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				select {
+				case <-done:
+					return
+				default:
+					return
+				}
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				sConn, err := serverConf.NewCustomizedConn(c, authHandler, queryHandler)
+				if err != nil {
+					return
+				}
+				for {
+					if err := sConn.HandleCommand(); err != nil {
+						return
+					}
+				}
+			}(conn)
+		}
+	}()
+
+	cleanup := func() {
+		close(done)
+		_ = l.Close()
+	}
+	return l.Addr().String(), cleanup
+}
+
+func TestMySQLPool_UpstreamTLS_Scenarios(t *testing.T) {
+	logger := NewLogger(io.Discard)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Generate trusted test CA and server certificate
+	caTlsCert, caX509, err := generateTestCA()
+	if err != nil {
+		t.Fatalf("failed to generate test CA: %v", err)
+	}
+	serverCert, err := generateTestServerCert(caX509, caTlsCert.PrivateKey, "127.0.0.1")
+	if err != nil {
+		t.Fatalf("failed to generate server cert: %v", err)
+	}
+
+	serverTLS := &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+	}
+	serverAddr, cleanupServer := startMockTLSServer(t, serverTLS)
+	defer cleanupServer()
+
+	// Client CA pool trusting our test server
+	trustedPool := x509.NewCertPool()
+	trustedPool.AddCert(caX509)
+
+	clientTLS := &tls.Config{
+		RootCAs:            trustedPool,
+		ServerName:         "127.0.0.1",
+		InsecureSkipVerify: false,
+	}
+
+	// 1. Valid TLS Negotiated & Cipher Active
+	t.Run("Valid_TLS_Negotiated_Cipher_Active", func(t *testing.T) {
+		pool := NewMySQLPool(serverAddr, "root", "", "testdb", 2, logger, clientTLS)
+		if err := pool.Init(ctx); err != nil {
+			t.Fatalf("failed to init pool with TLS: %v", err)
+		}
+		defer pool.Close()
+
+		u, err := pool.Acquire(ctx)
+		if err != nil {
+			t.Fatalf("failed to acquire connection: %v", err)
+		}
+		defer pool.Release(u)
+
+		if !u.IsTLS() {
+			t.Fatal("expected u.IsTLS() to be true for TLS connection, got false")
+		}
+
+		state, ok := u.TLSConnectionState()
+		if !ok {
+			t.Fatal("expected TLSConnectionState to return ok=true")
+		}
+		if state.CipherSuite == 0 {
+			t.Fatal("expected valid non-zero CipherSuite in TLSConnectionState")
+		}
+		if state.Version < tls.VersionTLS12 {
+			t.Fatalf("expected TLS version >= TLS 1.2, got 0x%04x", state.Version)
+		}
+
+		res, err := u.Execute("SHOW STATUS LIKE 'Ssl_cipher'")
+		if err != nil {
+			t.Fatalf("failed to execute query over TLS: %v", err)
+		}
+		if res == nil || res.Resultset == nil || len(res.Values) == 0 {
+			t.Fatal("expected non-empty result for Ssl_cipher query")
+		}
+	})
+
+	// 2. COM_RESET_CONNECTION Preserves TLS
+	t.Run("COM_RESET_CONNECTION_PreservesTLS", func(t *testing.T) {
+		pool := NewMySQLPool(serverAddr, "root", "", "testdb", 1, logger, clientTLS)
+		if err := pool.Init(ctx); err != nil {
+			t.Fatalf("failed to init pool: %v", err)
+		}
+		defer pool.Close()
+
+		u, err := pool.Acquire(ctx)
+		if err != nil {
+			t.Fatalf("failed to acquire connection: %v", err)
+		}
+		if !u.IsTLS() {
+			t.Fatal("expected connection to be TLS before release")
+		}
+
+		// Release triggers COM_RESET_CONNECTION
+		pool.Release(u)
+
+		// Re-acquire the same connection and verify TLS is preserved
+		u2, err := pool.Acquire(ctx)
+		if err != nil {
+			t.Fatalf("failed to re-acquire connection: %v", err)
+		}
+		defer pool.Release(u2)
+
+		if !u2.IsTLS() {
+			t.Fatal("expected connection to remain TLS after COM_RESET_CONNECTION release")
+		}
+
+		state, ok := u2.TLSConnectionState()
+		if !ok || state.CipherSuite == 0 {
+			t.Fatal("expected active TLS connection state after reset")
+		}
+
+		if _, err := u2.Execute("SELECT 1"); err != nil {
+			t.Fatalf("failed to execute query on reset TLS connection: %v", err)
+		}
+	})
+
+	// 3. DiscardAndReplace Preserves TLS
+	t.Run("DiscardAndReplace_PreservesTLS", func(t *testing.T) {
+		pool := NewMySQLPool(serverAddr, "root", "", "testdb", 1, logger, clientTLS)
+		if err := pool.Init(ctx); err != nil {
+			t.Fatalf("failed to init pool: %v", err)
+		}
+		defer pool.Close()
+
+		u, err := pool.Acquire(ctx)
+		if err != nil {
+			t.Fatalf("failed to acquire: %v", err)
+		}
+
+		// Mark connection broken to force discardAndReplace
+		u.Broken.Store(true)
+		pool.Release(u)
+
+		// Acquire replacement connection and verify TLS configuration was inherited
+		uRepl, err := pool.Acquire(ctx)
+		if err != nil {
+			t.Fatalf("failed to acquire replacement connection: %v", err)
+		}
+		defer pool.Release(uRepl)
+
+		if !uRepl.IsTLS() {
+			t.Fatal("replacement connection must be TLS-encrypted")
+		}
+		state, ok := uRepl.TLSConnectionState()
+		if !ok || state.CipherSuite == 0 {
+			t.Fatal("replacement connection must have valid TLS state")
+		}
+	})
+
+	// 4. Untrusted Certificate Fails Closed
+	t.Run("Untrusted_Certificate_FailsClosed", func(t *testing.T) {
+		// Empty root CA pool -> does not trust the test CA
+		emptyPool := x509.NewCertPool()
+		untrustedTLS := &tls.Config{
+			RootCAs:            emptyPool,
+			ServerName:         "127.0.0.1",
+			InsecureSkipVerify: false,
+		}
+
+		badPool := NewMySQLPool(serverAddr, "root", "", "testdb", 1, logger, untrustedTLS)
+		err := badPool.Init(ctx)
+		if err == nil {
+			badPool.Close()
+			t.Fatal("expected pool init to fail on untrusted certificate, got nil")
+		}
+		if !strings.Contains(err.Error(), "certificate") && !strings.Contains(err.Error(), "unknown authority") && !strings.Contains(err.Error(), "x509") {
+			t.Fatalf("expected certificate verification error, got: %v", err)
+		}
+	})
+
+	// 5. ServerName Mismatch Fails Closed
+	t.Run("ServerName_Mismatch_FailsClosed", func(t *testing.T) {
+		wrongHostTLS := &tls.Config{
+			RootCAs:            trustedPool,
+			ServerName:         "unmatched.domain.internal",
+			InsecureSkipVerify: false,
+		}
+
+		badPool := NewMySQLPool(serverAddr, "root", "", "testdb", 1, logger, wrongHostTLS)
+		err := badPool.Init(ctx)
+		if err == nil {
+			badPool.Close()
+			t.Fatal("expected pool init to fail on hostname mismatch, got nil")
+		}
+		if !strings.Contains(err.Error(), "certificate") && !strings.Contains(err.Error(), "valid for") && !strings.Contains(err.Error(), "x509") {
+			t.Fatalf("expected hostname verification error, got: %v", err)
+		}
+	})
+
+	// 6. Plaintext Server Rejected When TLS Required (Zero Plaintext Fallback)
+	t.Run("Plaintext_Server_Rejected_When_TLS_Required", func(t *testing.T) {
+		plainServerAddr, cleanupPlain := startMockTLSServer(t, nil) // serverTLS = nil (plaintext server)
+		defer cleanupPlain()
+
+		tlsRequiredPool := NewMySQLPool(plainServerAddr, "root", "", "testdb", 1, logger, clientTLS)
+		err := tlsRequiredPool.Init(ctx)
+		if err == nil {
+			tlsRequiredPool.Close()
+			t.Fatal("expected pool init to fail against plaintext server when TLS is required, got nil")
+		}
+		if !strings.Contains(err.Error(), "does not support TLS required by the client") {
+			t.Fatalf("expected TLS unsupported rejection error, got: %v", err)
+		}
+	})
+}
+
+func TestMySQLProtocolHandler_InitPool_TLSPropagation(t *testing.T) {
+	logger := NewLogger(io.Discard)
+
+	// 1. DSN with ?tls=skip-verify
+	cfg1, err := driver.ParseDSN("root@tcp(127.0.0.1:3306)/testdb?tls=skip-verify")
+	if err != nil {
+		t.Fatalf("failed to parse DSN: %v", err)
+	}
+	p1 := NewMySQLPool(cfg1.Addr, cfg1.User, cfg1.Passwd, cfg1.DBName, 1, logger, cfg1.TLS)
+	tls1 := p1.GetTLSConfig()
+	if tls1 == nil {
+		t.Fatal("expected pool to have TLS config for ?tls=skip-verify")
+	}
+	if !tls1.InsecureSkipVerify {
+		t.Fatal("expected InsecureSkipVerify=true for ?tls=skip-verify")
+	}
+
+	// 2. DSN with ?tls=true (enforces verification & populates ServerName)
+	cfg2, err := driver.ParseDSN("root@tcp(127.0.0.1:3306)/testdb?tls=true")
+	if err != nil {
+		t.Fatalf("failed to parse DSN: %v", err)
+	}
+	p2 := NewMySQLPool(cfg2.Addr, cfg2.User, cfg2.Passwd, cfg2.DBName, 1, logger, cfg2.TLS)
+	tls2 := p2.GetTLSConfig()
+	if tls2 == nil {
+		t.Fatal("expected pool to have TLS config for ?tls=true")
+	}
+	if tls2.InsecureSkipVerify {
+		t.Fatal("expected InsecureSkipVerify=false for ?tls=true")
+	}
+
+	// 3. DSN with ?tls=custom
+	customKey := fmt.Sprintf("custom-pool-test-%d", time.Now().UnixNano())
+	customRootPool := x509.NewCertPool()
+	customCfg := &tls.Config{
+		RootCAs:            customRootPool,
+		ServerName:         "custom.host",
+		InsecureSkipVerify: false,
+	}
+	if err := driver.RegisterTLSConfig(customKey, customCfg); err != nil {
+		t.Fatalf("failed to register TLS config: %v", err)
+	}
+	defer driver.DeregisterTLSConfig(customKey)
+
+	cfg3, err := driver.ParseDSN(fmt.Sprintf("root@tcp(127.0.0.1:3306)/testdb?tls=%s", customKey))
+	if err != nil {
+		t.Fatalf("failed to parse DSN with custom TLS: %v", err)
+	}
+	p3 := NewMySQLPool(cfg3.Addr, cfg3.User, cfg3.Passwd, cfg3.DBName, 1, logger, cfg3.TLS)
+	tls3 := p3.GetTLSConfig()
+	if tls3 == nil {
+		t.Fatal("expected pool to have TLS config for ?tls=custom")
+	}
+	if tls3.ServerName != "custom.host" {
+		t.Fatalf("expected ServerName='custom.host', got '%s'", tls3.ServerName)
+	}
+
+	// 4. DSN without tls parameter (plaintext default)
+	cfg4, err := driver.ParseDSN("root@tcp(127.0.0.1:3306)/testdb")
+	if err != nil {
+		t.Fatalf("failed to parse plaintext DSN: %v", err)
+	}
+	p4 := NewMySQLPool(cfg4.Addr, cfg4.User, cfg4.Passwd, cfg4.DBName, 1, logger, cfg4.TLS)
+	if p4.GetTLSConfig() != nil {
+		t.Fatal("expected pool to have nil TLS config for plaintext DSN")
+	}
+
+	// 5. Unregistered TLS config fails closed during ParseDSN/InitPool
+	handler := &MySQLProtocolHandler{
+		upstreamDSN: "root@tcp(127.0.0.1:3306)/testdb?tls=unknown_nonexistent_config",
+		logger:      logger,
+	}
+	if err := handler.InitPool(); err == nil {
+		t.Fatal("expected InitPool to fail on unregistered TLS config, got nil")
+	} else if !strings.Contains(err.Error(), "unknown config name") {
+		t.Fatalf("expected 'unknown config name' error, got: %v", err)
 	}
 }

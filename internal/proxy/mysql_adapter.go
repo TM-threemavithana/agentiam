@@ -49,7 +49,7 @@ func (h *MySQLProtocolHandler) InitPool() error {
 		return fmt.Errorf("failed to parse upstream MySQL DSN: %w", err)
 	}
 
-	p := NewMySQLPool(cfg.Addr, cfg.User, cfg.Passwd, cfg.DBName, 50, h.logger)
+	p := NewMySQLPool(cfg.Addr, cfg.User, cfg.Passwd, cfg.DBName, 50, h.logger, cfg.TLS)
 	if err := p.Init(context.Background()); err != nil {
 		return err
 	}
