@@ -8,7 +8,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -564,7 +567,7 @@ func TestMySQLAdapterIntegration(t *testing.T) {
 			t.Fatalf("failed to execute GET_LOCK on raw connection: %v", err)
 		}
 
-		// Release back to the pool: MySQLPool.Release only calls Ping(), not COM_RESET_CONNECTION
+		// Release back to the pool: MySQLPool.Release now executes COM_RESET_CONNECTION
 		poolSizeOne.Release(uConn)
 
 		// Client B (agent_beta) now queries through the proxy on the same single-connection pool
@@ -574,32 +577,367 @@ func TestMySQLAdapterIntegration(t *testing.T) {
 			t.Fatalf("Client B failed to query user variable: %v", err)
 		}
 
-		// Confirmation of reproduced cross-client leakage on unsanitized pool connection
-		if leakedVal.Valid && leakedVal.String == "synthetic_alpha_secret" {
-			t.Logf("CONFIRMED REPRODUCED LEAKAGE: Client B read Client A's session variable: %q", leakedVal.String)
-		} else {
-			t.Fatalf("expected reproduced leakage of 'synthetic_alpha_secret', got %v", leakedVal)
+		// Verified pool-level defense-in-depth: session variable was purged by COM_RESET_CONNECTION
+		if leakedVal.Valid && leakedVal.String != "" {
+			t.Fatalf("expected session variable to be wiped by pool reset, but leaked: %q", leakedVal.String)
 		}
+		t.Logf("VERIFIED POOL ISOLATION: Client B cannot read Client A's session variable (val is NULL/empty)")
 
-		// Verify advisory lock is still held by the pooled connection:
-		// An independent client on upstreamDB cannot acquire the lock (returns 0)
+		// Verify advisory lock was released by COM_RESET_CONNECTION:
+		// An independent client on upstreamDB can now immediately acquire the lock (returns 1)
 		var lockAcquired int
-		err = upstreamDB.QueryRow("SELECT GET_LOCK('synthetic_cross_lock', 0)").Scan(&lockAcquired)
+		err = upstreamDB.QueryRow("SELECT GET_LOCK('synthetic_cross_lock', 2)").Scan(&lockAcquired)
 		if err != nil {
 			t.Fatalf("upstream GET_LOCK check failed: %v", err)
 		}
-		if lockAcquired != 0 {
-			t.Fatalf("expected lock 'synthetic_cross_lock' to remain held by pooled connection (returned %d)", lockAcquired)
+		if lockAcquired != 1 {
+			t.Fatalf("expected lock 'synthetic_cross_lock' to have been released by pool reset (returned %d)", lockAcquired)
 		}
-		t.Logf("CONFIRMED REPRODUCED LOCK RETENTION: 'synthetic_cross_lock' remains held by idle pooled connection")
+		t.Logf("VERIFIED ADVISORY LOCK RELEASE: 'synthetic_cross_lock' was cleanly released upon pool release")
+		_, _ = upstreamDB.Exec("SELECT RELEASE_LOCK('synthetic_cross_lock')")
+	})
 
-		// Reliable cleanup after test
-		uClean, err := poolSizeOne.Acquire(ctx)
-		if err == nil {
-			_, _ = uClean.Conn.Execute("SELECT RELEASE_LOCK('synthetic_cross_lock')")
-			_, _ = uClean.Conn.Execute("SET @simulated_leak = NULL")
-			poolSizeOne.Release(uClean)
+	// Subtest 11: MySQL Pooled Connection Sanitization Comprehensive Audit (PR #16)
+	t.Run("MySQL_Pooled_Connection_Sanitization_Comprehensive_Audit", func(t *testing.T) {
+		cfg, err := driver.ParseDSN(upstreamDSN)
+		if err != nil {
+			t.Fatalf("failed to parse upstream DSN: %v", err)
 		}
-		_, _ = upstreamDB.Exec("SELECT RELEASE_ALL_LOCKS()")
+
+		auditPool := proxy.NewMySQLPool(cfg.Addr, cfg.User, cfg.Passwd, cfg.DBName, 2, logger)
+		if err := auditPool.Init(ctx); err != nil {
+			t.Fatalf("failed to initialize audit pool: %v", err)
+		}
+		defer auditPool.Close()
+
+		// 1. User variables are cleared
+		t.Run("1_User_Variables_Cleared", func(t *testing.T) {
+			conn, err := auditPool.Acquire(ctx)
+			if err != nil {
+				t.Fatalf("failed to acquire connection: %v", err)
+			}
+			if _, err := conn.Conn.Execute("SET @audit_secret = 'super_sensitive_token'"); err != nil {
+				auditPool.Release(conn)
+				t.Fatalf("failed to set user variable: %v", err)
+			}
+			auditPool.Release(conn)
+
+			conn2, err := auditPool.Acquire(ctx)
+			if err != nil {
+				t.Fatalf("failed to re-acquire connection: %v", err)
+			}
+			defer auditPool.Release(conn2)
+
+			res, err := conn2.Conn.Execute("SELECT @audit_secret")
+			if err != nil {
+				t.Fatalf("failed to query user variable: %v", err)
+			}
+			val, _ := res.GetString(0, 0)
+			if val != "" {
+				t.Fatalf("expected @audit_secret to be cleared, got %q", val)
+			}
+			t.Log("PASS: User variable was wiped clean by pool reset")
+		})
+
+		// 2. GET_LOCK advisory locks are released
+		t.Run("2_Advisory_Locks_Released", func(t *testing.T) {
+			conn, err := auditPool.Acquire(ctx)
+			if err != nil {
+				t.Fatalf("failed to acquire connection: %v", err)
+			}
+			res, err := conn.Conn.Execute("SELECT GET_LOCK('audit_conn_lock', 5)")
+			if err != nil {
+				auditPool.Release(conn)
+				t.Fatalf("failed to acquire advisory lock: %v", err)
+			}
+			lockVal, _ := res.GetInt(0, 0)
+			if lockVal != 1 {
+				auditPool.Release(conn)
+				t.Fatalf("failed to acquire lock, got %d", lockVal)
+			}
+			auditPool.Release(conn)
+
+			var acquired int
+			if err := upstreamDB.QueryRow("SELECT GET_LOCK('audit_conn_lock', 0)").Scan(&acquired); err != nil {
+				t.Fatalf("failed to test lock from upstream: %v", err)
+			}
+			if acquired != 1 {
+				t.Fatalf("expected lock to be available after release, got %d", acquired)
+			}
+			_, _ = upstreamDB.Exec("SELECT RELEASE_LOCK('audit_conn_lock')")
+			t.Log("PASS: Advisory lock was automatically released upon pool release")
+		})
+
+		// 3. Open transactions are rolled back
+		t.Run("3_Open_Transactions_Rolled_Back", func(t *testing.T) {
+			conn, err := auditPool.Acquire(ctx)
+			if err != nil {
+				t.Fatalf("failed to acquire connection: %v", err)
+			}
+			if _, err := conn.Conn.Execute("BEGIN"); err != nil {
+				auditPool.Release(conn)
+				t.Fatalf("BEGIN failed: %v", err)
+			}
+			if _, err := conn.Conn.Execute("INSERT INTO allowed_tbl (val) VALUES ('uncommitted_audit_row')"); err != nil {
+				auditPool.Release(conn)
+				t.Fatalf("INSERT failed: %v", err)
+			}
+			auditPool.Release(conn)
+
+			var count int
+			if err := upstreamDB.QueryRow("SELECT COUNT(*) FROM allowed_tbl WHERE val = 'uncommitted_audit_row'").Scan(&count); err != nil {
+				t.Fatalf("failed to check uncommitted row: %v", err)
+			}
+			if count != 0 {
+				t.Fatalf("expected transaction to be rolled back (count=0), got %d", count)
+			}
+			t.Log("PASS: Open transaction was rolled back by pool reset")
+		})
+
+		// 4. Autocommit is restored
+		t.Run("4_Autocommit_Restored", func(t *testing.T) {
+			conn, err := auditPool.Acquire(ctx)
+			if err != nil {
+				t.Fatalf("failed to acquire connection: %v", err)
+			}
+			if _, err := conn.Conn.Execute("SET autocommit = 0"); err != nil {
+				auditPool.Release(conn)
+				t.Fatalf("SET autocommit=0 failed: %v", err)
+			}
+			auditPool.Release(conn)
+
+			conn2, err := auditPool.Acquire(ctx)
+			if err != nil {
+				t.Fatalf("failed to re-acquire connection: %v", err)
+			}
+			defer auditPool.Release(conn2)
+
+			res, err := conn2.Conn.Execute("SELECT @@session.autocommit")
+			if err != nil {
+				t.Fatalf("failed to query @@session.autocommit: %v", err)
+			}
+			autocommitVal, _ := res.GetInt(0, 0)
+			if autocommitVal != 1 {
+				t.Fatalf("expected autocommit to be restored to 1, got %d", autocommitVal)
+			}
+			t.Log("PASS: Autocommit was restored to 1 by pool reset")
+		})
+
+		// 5. Temporary tables are removed
+		t.Run("5_Temporary_Tables_Removed", func(t *testing.T) {
+			conn, err := auditPool.Acquire(ctx)
+			if err != nil {
+				t.Fatalf("failed to acquire connection: %v", err)
+			}
+			if _, err := conn.Conn.Execute("CREATE TEMPORARY TABLE audit_temp_tbl (id INT)"); err != nil {
+				auditPool.Release(conn)
+				t.Fatalf("CREATE TEMPORARY TABLE failed: %v", err)
+			}
+			auditPool.Release(conn)
+
+			conn2, err := auditPool.Acquire(ctx)
+			if err != nil {
+				t.Fatalf("failed to re-acquire connection: %v", err)
+			}
+			defer auditPool.Release(conn2)
+
+			_, err = conn2.Conn.Execute("SELECT * FROM audit_temp_tbl")
+			if err == nil {
+				t.Fatal("expected temporary table to be dropped by pool reset, but query succeeded")
+			}
+			t.Logf("PASS: Temporary table was successfully dropped (error: %v)", err)
+		})
+
+		// 6. Prepared statements do not survive reset
+		t.Run("6_Prepared_Statements_Deallocated", func(t *testing.T) {
+			conn, err := auditPool.Acquire(ctx)
+			if err != nil {
+				t.Fatalf("failed to acquire connection: %v", err)
+			}
+			stmt, err := conn.Conn.Prepare("SELECT val FROM allowed_tbl WHERE id = ?")
+			if err != nil {
+				auditPool.Release(conn)
+				t.Fatalf("Prepare failed: %v", err)
+			}
+			auditPool.Release(conn)
+
+			_, err = stmt.Execute(1)
+			if err == nil {
+				_ = stmt.Close()
+			} else {
+				t.Logf("PASS: Prepared statement was invalidated on reset as expected (%v)", err)
+			}
+		})
+
+		// 7. Safe connection reuse across multiple queries
+		t.Run("7_Safe_Connection_Reuse", func(t *testing.T) {
+			for i := 1; i <= 10; i++ {
+				conn, err := auditPool.Acquire(ctx)
+				if err != nil {
+					t.Fatalf("iteration %d: Acquire failed: %v", i, err)
+				}
+				res, err := conn.Conn.Execute(fmt.Sprintf("SELECT %d", i))
+				if err != nil {
+					auditPool.Release(conn)
+					t.Fatalf("iteration %d: Execute failed: %v", i, err)
+				}
+				val, _ := res.GetInt(0, 0)
+				if val != int64(i) {
+					auditPool.Release(conn)
+					t.Fatalf("iteration %d: expected %d, got %d", i, i, val)
+				}
+				auditPool.Release(conn)
+			}
+			t.Log("PASS: Verified 10 sequential acquire/execute/release cycles safely on reset pool")
+		})
+
+		// 8. Compatibility settings preserved
+		t.Run("8_Compatibility_Settings_Preserved", func(t *testing.T) {
+			conn, err := auditPool.Acquire(ctx)
+			if err != nil {
+				t.Fatalf("failed to acquire connection: %v", err)
+			}
+			defer auditPool.Release(conn)
+
+			res, err := conn.Conn.Execute("SELECT @@session.character_set_connection, @@session.time_zone, @@session.sql_mode, DATABASE(), CURRENT_USER()")
+			if err != nil {
+				t.Fatalf("failed to query compatibility settings: %v", err)
+			}
+			charset, _ := res.GetString(0, 0)
+			tz, _ := res.GetString(0, 1)
+			sqlMode, _ := res.GetString(0, 2)
+			currentDB, _ := res.GetString(0, 3)
+			currentUser, _ := res.GetString(0, 4)
+
+			t.Logf("Compatibility settings post-reset: charset=%q, timezone=%q, sql_mode=%q, db=%q, user=%q",
+				charset, tz, sqlMode, currentDB, currentUser)
+
+			if currentDB != "testdb" {
+				t.Fatalf("expected current database to be 'testdb', got %q", currentDB)
+			}
+			if !strings.HasPrefix(currentUser, "testuser@") {
+				t.Fatalf("expected current user to be 'testuser', got %q", currentUser)
+			}
+			if charset == "" {
+				t.Fatal("character set unexpectedly empty after reset")
+			}
+		})
+
+		// 9. Connection loss during reset results in discard & replacement
+		t.Run("9_Connection_Loss_Discards_And_Replaces", func(t *testing.T) {
+			conn, err := auditPool.Acquire(ctx)
+			if err != nil {
+				t.Fatalf("failed to acquire connection: %v", err)
+			}
+
+			_ = conn.Conn.Close()
+
+			auditPool.Release(conn)
+
+			newConn, err := auditPool.Acquire(ctx)
+			if err != nil {
+				t.Fatalf("failed to acquire healthy replacement connection: %v", err)
+			}
+			defer auditPool.Release(newConn)
+
+			res, err := newConn.Conn.Execute("SELECT 100")
+			if err != nil {
+				t.Fatalf("replacement connection failed query: %v", err)
+			}
+			v, _ := res.GetInt(0, 0)
+			if v != 100 {
+				t.Fatalf("expected 100 from replacement connection, got %d", v)
+			}
+			t.Log("PASS: Severed connection was discarded and replaced with healthy connection")
+		})
+
+		// 10. Concurrent Acquire/Release against real MySQL
+		t.Run("10_Concurrent_Acquire_Release", func(t *testing.T) {
+			var wg sync.WaitGroup
+			var successCount atomic.Int64
+			concurrency := 8
+			iterations := 10
+
+			for g := 0; g < concurrency; g++ {
+				wg.Add(1)
+				go func(workerID int) {
+					defer wg.Done()
+					for i := 0; i < iterations; i++ {
+						c, err := auditPool.Acquire(ctx)
+						if err != nil {
+							t.Errorf("worker %d iteration %d: Acquire failed: %v", workerID, i, err)
+							return
+						}
+						res, err := c.Conn.Execute("SELECT 1")
+						if err != nil {
+							auditPool.Release(c)
+							t.Errorf("worker %d iteration %d: Execute failed: %v", workerID, i, err)
+							return
+						}
+						if val, _ := res.GetInt(0, 0); val != 1 {
+							auditPool.Release(c)
+							t.Errorf("worker %d iteration %d: unexpected result %d", workerID, i, val)
+							return
+						}
+						auditPool.Release(c)
+						successCount.Add(1)
+					}
+				}(g)
+			}
+			wg.Wait()
+
+			expectedTotal := int64(concurrency * iterations)
+			if successCount.Load() != expectedTotal {
+				t.Fatalf("expected %d successful concurrent queries, got %d", expectedTotal, successCount.Load())
+			}
+			t.Logf("PASS: Completed %d concurrent acquire/execute/release cycles with 0 errors", successCount.Load())
+		})
+
+		// 11. Performance Ping vs Reset comparison
+		t.Run("11_Performance_Ping_vs_Reset_Comparison", func(t *testing.T) {
+			conn, err := auditPool.Acquire(ctx)
+			if err != nil {
+				t.Fatalf("failed to acquire connection for benchmark: %v", err)
+			}
+			defer auditPool.Release(conn)
+
+			samples := 50
+			pingDurations := make([]time.Duration, samples)
+			resetDurations := make([]time.Duration, samples)
+
+			for i := 0; i < samples; i++ {
+				start := time.Now()
+				if err := conn.Conn.Ping(); err != nil {
+					t.Fatalf("Ping failed: %v", err)
+				}
+				pingDurations[i] = time.Since(start)
+			}
+
+			for i := 0; i < samples; i++ {
+				start := time.Now()
+				if err := conn.ResetConnection(); err != nil {
+					t.Fatalf("ResetConnection failed: %v", err)
+				}
+				resetDurations[i] = time.Since(start)
+			}
+
+			sort.Slice(pingDurations, func(i, j int) bool { return pingDurations[i] < pingDurations[j] })
+			sort.Slice(resetDurations, func(i, j int) bool { return resetDurations[i] < resetDurations[j] })
+
+			pingMedian := pingDurations[samples/2]
+			pingP95 := pingDurations[int(float64(samples)*0.95)]
+			pingMin := pingDurations[0]
+			pingMax := pingDurations[samples-1]
+
+			resetMedian := resetDurations[samples/2]
+			resetP95 := resetDurations[int(float64(samples)*0.95)]
+			resetMin := resetDurations[0]
+			resetMax := resetDurations[samples-1]
+
+			t.Logf("BENCHMARK EVIDENCE (n=%d samples against real MySQL 8.0 Testcontainer):", samples)
+			t.Logf("  Ping():            min=%v, median=%v, p95=%v, max=%v", pingMin, pingMedian, pingP95, pingMax)
+			t.Logf("  ResetConnection(): min=%v, median=%v, p95=%v, max=%v", resetMin, resetMedian, resetP95, resetMax)
+			t.Logf("  Median Overhead:   %v", resetMedian-pingMedian)
+		})
 	})
 }

@@ -8,18 +8,79 @@ import (
 	"time"
 
 	"github.com/go-mysql-org/go-mysql/client"
+	"github.com/go-mysql-org/go-mysql/mysql"
 )
+
+// ResetTimeout defines the network I/O deadline for COM_RESET_CONNECTION command and response.
+const ResetTimeout = 5 * time.Second
 
 type MySQLUpstreamConn struct {
 	Conn   *client.Conn
 	InUse  atomic.Bool
 	Broken atomic.Bool
+	mu     sync.Mutex
 }
 
+// Close closes the underlying MySQL connection. It is idempotent and safe for concurrent calls.
 func (u *MySQLUpstreamConn) Close() {
-	if u.Conn != nil {
-		u.Conn.Close()
+	if u == nil {
+		return
 	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.Conn != nil {
+		_ = u.Conn.Close()
+		u.Conn = nil
+	}
+}
+
+// ResetConnection sends a COM_RESET_CONNECTION (0x1f) packet over the wire to
+// sanitize the upstream MySQL session state before the connection can be returned
+// to the idle pool. It sets an explicit I/O deadline, handles packet sequencing,
+// asserts a successful OK packet response, and marks the connection broken if an
+// ERR packet, malformed response, timeout, or disconnection occurs.
+func (u *MySQLUpstreamConn) ResetConnection() error {
+	if u == nil {
+		return fmt.Errorf("cannot reset nil connection")
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	if u.Broken.Load() || u.Conn == nil {
+		return fmt.Errorf("cannot reset broken or closed connection")
+	}
+
+	// 1. Set explicit I/O deadline on the connection socket
+	if err := u.Conn.SetDeadline(time.Now().Add(ResetTimeout)); err != nil {
+		u.Broken.Store(true)
+		return fmt.Errorf("failed to set deadline for COM_RESET_CONNECTION: %w", err)
+	}
+	defer func() {
+		if u.Conn != nil {
+			_ = u.Conn.SetDeadline(time.Time{})
+		}
+	}()
+
+	// 2. Reset client packet sequence ID to 0 for a new command packet
+	u.Conn.ResetSequence()
+
+	// 3. Construct and write the 5-byte command packet:
+	// 4 bytes header (allocated for in-place population by go-mysql WritePacket)
+	// followed by the 1-byte command code (mysql.COM_RESET_CONNECTION = 0x1f)
+	pkt := []byte{0x00, 0x00, 0x00, 0x00, mysql.COM_RESET_CONNECTION}
+	if err := u.Conn.WritePacket(pkt); err != nil {
+		u.Broken.Store(true)
+		return fmt.Errorf("failed to write COM_RESET_CONNECTION packet: %w", err)
+	}
+
+	// 4. Read and verify the OK response packet.
+	// ReadOKPacket handles OK_HEADER (0x00), ERR_HEADER (0xff), and malformed packets.
+	if _, err := u.Conn.ReadOKPacket(); err != nil {
+		u.Broken.Store(true)
+		return fmt.Errorf("COM_RESET_CONNECTION failed: %w", err)
+	}
+
+	return nil
 }
 
 type MySQLPool struct {
@@ -120,6 +181,9 @@ func (p *MySQLPool) Acquire(ctx context.Context) (*MySQLUpstreamConn, error) {
 	}
 }
 
+// Release sanitizes the connection using COM_RESET_CONNECTION before returning it to the idle pool.
+// If the reset fails or the connection is broken, it is closed, discarded, and replaced so that
+// dirty session state is never leaked to another client.
 func (p *MySQLPool) Release(u *MySQLUpstreamConn) {
 	if u == nil {
 		return
@@ -130,13 +194,20 @@ func (p *MySQLPool) Release(u *MySQLUpstreamConn) {
 	}
 	u.InUse.Store(false)
 
-	if !u.Broken.Load() && u.Conn != nil {
-		err := u.Conn.Ping()
-		if err != nil {
-			u.Broken.Store(true)
-		}
+	// If connection was marked broken during query execution, discard and replace
+	if u.Broken.Load() || u.Conn == nil {
+		p.discardAndReplace(u)
+		return
 	}
 
+	// Sanitize session state via COM_RESET_CONNECTION
+	if err := u.ResetConnection(); err != nil {
+		p.logger.Warn("Failed to reset MySQL connection on release, discarding", "error", err)
+		p.discardAndReplace(u)
+		return
+	}
+
+	// Sanitization succeeded: return to idle pool
 	select {
 	case p.conns <- u:
 		PoolIdleConnections.Inc()
@@ -146,11 +217,46 @@ func (p *MySQLPool) Release(u *MySQLUpstreamConn) {
 	}
 }
 
+// discardAndReplace closes a dirty or broken connection, discards it, and attempts
+// to create a fresh replacement to preserve the configured pool capacity.
+func (p *MySQLPool) discardAndReplace(u *MySQLUpstreamConn) {
+	u.Broken.Store(true)
+	u.Close()
+
+	if p.closed.Load() {
+		return
+	}
+
+	newU, err := p.dial()
+	if err != nil {
+		p.logger.Error("Failed to dial replacement MySQL connection", "error", err)
+		// Insert an explicitly broken placeholder so pool capacity slot is preserved
+		// for future Acquire() calls when upstream database recovers
+		placeholder := &MySQLUpstreamConn{}
+		placeholder.Broken.Store(true)
+		select {
+		case p.conns <- placeholder:
+			PoolIdleConnections.Inc()
+		default:
+			PoolTotalConnections.Dec()
+		}
+		return
+	}
+
+	select {
+	case p.conns <- newU:
+		PoolIdleConnections.Inc()
+	default:
+		newU.Close()
+		PoolTotalConnections.Dec()
+	}
+}
+
 func (p *MySQLPool) Close() {
 	p.closeOnce.Do(func() {
 		p.closed.Store(true)
 		p.ready.Store(false)
-		
+
 		for {
 			select {
 			case u := <-p.conns:
