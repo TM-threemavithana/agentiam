@@ -408,14 +408,23 @@ func (s *Session) getOrAcquireUpstream(ctx context.Context, clientWriteCh chan p
 		stateQueries = append(stateQueries, fmt.Sprintf("SET %s = %s", k, v))
 	}
 
-	for _, q := range stateQueries {
+	for range stateQueries {
 		u.SwallowSetTimeout.Add(1)
-		u.Frontend.Send(&pgproto3.Query{String: q})
 	}
 	if len(stateQueries) > 0 {
-		if err := u.Frontend.Flush(); err != nil {
+		u.mu.Lock()
+		for _, q := range stateQueries {
+			u.Frontend.Send(&pgproto3.Query{String: q})
+		}
+		err := u.Frontend.Flush()
+		u.mu.Unlock()
+		if err != nil {
 			u.Broken.Store(true)
-			s.releaseUpstream()
+			if s.server != nil && s.server.pool != nil {
+				s.server.pool.Release(u)
+			} else {
+				u.Close()
+			}
 			return nil, err
 		}
 	}
@@ -435,8 +444,10 @@ func (s *Session) getOrAcquireUpstream(ctx context.Context, clientWriteCh chan p
 		for {
 			msg, err := u.Frontend.Receive()
 			if err != nil {
+				s.logger.Error("Upstream read error; terminating session", "error", err, "client", s.clientID)
 				u.Broken.Store(true)
 				s.releaseUpstream()
+				s.Close()
 				return
 			}
 
@@ -587,11 +598,7 @@ func (s *Session) handleParseMsg(ctx context.Context, v *pgproto3.Parse, clientW
 	if err != nil {
 		return err
 	}
-	u.Frontend.Send(v)
-	if err := u.Frontend.Flush(); err != nil {
-		return err
-	}
-	return nil
+	return u.SendAndFlush(v)
 }
 
 // handleBindMsg processes a Bind message (Extended Query Protocol).
@@ -623,13 +630,14 @@ func (s *Session) handleBindMsg(ctx context.Context, v *pgproto3.Bind, clientWri
 	}
 
 	ps, exists := s.preparedStatements[v.PreparedStatement]
+	var parseMsg *pgproto3.Parse
 	if exists {
 		u.SwallowParseComplete.Add(1)
-		u.Frontend.Send(&pgproto3.Parse{
+		parseMsg = &pgproto3.Parse{
 			Name:          "",
 			Query:         ps.SQL,
 			ParameterOIDs: ps.ParameterOIDs,
-		})
+		}
 
 		if len(ps.LimitParams) > 0 && s.rules.EnforceSelectLimit > 0 {
 			for _, paramIdx := range ps.LimitParams {
@@ -680,11 +688,10 @@ func (s *Session) handleBindMsg(ctx context.Context, v *pgproto3.Bind, clientWri
 
 	v.PreparedStatement = ""
 	v.DestinationPortal = ""
-	u.Frontend.Send(v)
-	if err := u.Frontend.Flush(); err != nil {
-		return err
+	if parseMsg != nil {
+		return u.SendAndFlush(parseMsg, v)
 	}
-	return nil
+	return u.SendAndFlush(v)
 }
 
 // handleQueryMsg processes a simple Query message (Simple Query Protocol).
@@ -740,11 +747,7 @@ func (s *Session) handleQueryMsg(ctx context.Context, v *pgproto3.Query, clientW
 	if err != nil {
 		return err
 	}
-	u.Frontend.Send(v)
-	if err := u.Frontend.Flush(); err != nil {
-		return err
-	}
-	return nil
+	return u.SendAndFlush(v)
 }
 
 // handleSyncMsg processes a Sync message (Extended Query Protocol).
@@ -765,11 +768,7 @@ func (s *Session) handleSyncMsg(ctx context.Context, v *pgproto3.Sync, clientWri
 	if err != nil {
 		return err
 	}
-	u.Frontend.Send(v)
-	if err := u.Frontend.Flush(); err != nil {
-		return err
-	}
-	return nil
+	return u.SendAndFlush(v)
 }
 
 // proxyLoop is the main read loop for a session.
@@ -842,22 +841,28 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 				span.End()
 				return err
 			}
+			var parseMsg *pgproto3.Parse
 			if v.ObjectType == 'S' {
 				ps, exists := s.preparedStatements[v.Name]
 				if exists {
 					u.SwallowParseComplete.Add(1)
-					u.Frontend.Send(&pgproto3.Parse{
+					parseMsg = &pgproto3.Parse{
 						Name:          "",
 						Query:         ps.SQL,
 						ParameterOIDs: ps.ParameterOIDs,
-					})
+					}
 				}
 			}
 			v.Name = ""
-			u.Frontend.Send(v)
-			if err := u.Frontend.Flush(); err != nil {
+			var sendErr error
+			if parseMsg != nil {
+				sendErr = u.SendAndFlush(parseMsg, v)
+			} else {
+				sendErr = u.SendAndFlush(v)
+			}
+			if sendErr != nil {
 				span.End()
-				return err
+				return sendErr
 			}
 			span.End()
 
@@ -875,8 +880,7 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 				return err
 			}
 			v.Portal = ""
-			u.Frontend.Send(v)
-			if err := u.Frontend.Flush(); err != nil {
+			if err := u.SendAndFlush(v); err != nil {
 				span.End()
 				return err
 			}
@@ -891,8 +895,7 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 				u, err := s.getOrAcquireUpstream(ctx, clientWriteCh)
 				if err == nil {
 					v.Name = ""
-					u.Frontend.Send(v)
-					_ = u.Frontend.Flush()
+					_ = u.SendAndFlush(v)
 				}
 			}
 			span.End()
@@ -917,8 +920,7 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 				if err != nil {
 					return err
 				}
-				u.Frontend.Send(msg)
-				if err := u.Frontend.Flush(); err != nil {
+				if err := u.SendAndFlush(msg); err != nil {
 					return err
 				}
 			}
