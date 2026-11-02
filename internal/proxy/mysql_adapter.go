@@ -196,6 +196,11 @@ func (a *AgentIAMAuthHandler) GetCredential(username string) (server.Credential,
 	if a.insecureAuth && username == "root" {
 		return server.Credential{Passwords: []string{""}, AuthPluginName: "mysql_native_password"}, true, nil
 	}
+	if a.store != nil {
+		if _, err := a.store.GetAgentKey(username); err == nil {
+			return server.Credential{Passwords: []string{""}, AuthPluginName: "mysql_native_password"}, true, nil
+		}
+	}
 	return server.Credential{}, false, nil
 }
 
