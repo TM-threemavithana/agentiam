@@ -2,6 +2,7 @@ package ast
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/pingcap/tidb/pkg/parser"
 	"github.com/pingcap/tidb/pkg/parser/ast"
@@ -82,15 +83,67 @@ func (v *mysqlTenantVisitor) Enter(in ast.Node) (ast.Node, bool) {
 
 	case *ast.UpdateStmt:
 		// 2. UPDATEs
-		if node.TableRefs != nil && node.TableRefs.TableRefs != nil {
-			if ts, ok := node.TableRefs.TableRefs.Left.(*ast.TableSource); ok {
-				v.injected[ts] = true // Don't rewrite as subquery
-				if tblName, ok := ts.Source.(*ast.TableName); ok {
-					if !isSharedTable(tblName.Name.O, v.rule.SharedTables) {
-						node.Where = appendTenantConditionMySQL(node.Where, v.rule)
+		if node.TableRefs == nil || node.TableRefs.TableRefs == nil {
+			v.err = fmt.Errorf("policy violation: invalid UPDATE statement without table references")
+			return in, true
+		}
+
+		join := node.TableRefs.TableRefs
+
+		// Multi-table UPDATE check
+		if join.Right != nil {
+			tables := extractMySQLJoinTables(join)
+			hasTenantTable := false
+			for _, t := range tables {
+				if !isSharedTable(t, v.rule.SharedTables) {
+				hasTenantTable = true
+				break
+				}
+			}
+			if hasTenantTable {
+				if v.rule.TenantColumn != "" {
+					for _, a := range node.List {
+						if a != nil && a.Column != nil {
+							if strings.EqualFold(a.Column.Name.O, v.rule.TenantColumn) || strings.EqualFold(a.Column.Name.L, v.rule.TenantColumn) {
+								v.err = fmt.Errorf("policy violation: modifying tenant isolation column '%s' is prohibited", v.rule.TenantColumn)
+								return in, true
+							}
+						}
+					}
+				}
+				v.err = fmt.Errorf("policy violation: multi-table UPDATE statements are not supported while TenantIsolation is enabled")
+				return in, true
+			}
+			return in, true
+		}
+
+		ts, ok := join.Left.(*ast.TableSource)
+		if !ok {
+			v.err = fmt.Errorf("policy violation: unsupported UPDATE table source structure")
+			return in, true
+		}
+
+		v.injected[ts] = true // Don't rewrite as subquery
+
+		tblName, ok := ts.Source.(*ast.TableName)
+		if !ok {
+			v.err = fmt.Errorf("policy violation: unsupported UPDATE target table")
+			return in, true
+		}
+
+		if !isSharedTable(tblName.Name.O, v.rule.SharedTables) {
+			if v.rule.TenantColumn != "" {
+				for _, a := range node.List {
+					if a != nil && a.Column != nil {
+						if strings.EqualFold(a.Column.Name.O, v.rule.TenantColumn) || strings.EqualFold(a.Column.Name.L, v.rule.TenantColumn) {
+							v.err = fmt.Errorf("policy violation: modifying tenant isolation column '%s' is prohibited", v.rule.TenantColumn)
+							return in, true
+						}
 					}
 				}
 			}
+
+			node.Where = appendTenantConditionMySQL(node.Where, v.rule)
 		}
 
 	case *ast.DeleteStmt:
@@ -162,4 +215,26 @@ func appendTenantConditionMySQL(where ast.ExprNode, rule *TenantIsolationRule) a
 		L:  where,
 		R:  newCond,
 	}
+}
+
+
+func extractMySQLJoinTables(node ast.ResultSetNode) []string {
+	if node == nil {
+		return nil
+	}
+	var tables []string
+	switch n := node.(type) {
+	case *ast.Join:
+		if n.Left != nil {
+			tables = append(tables, extractMySQLJoinTables(n.Left)...)
+		}
+		if n.Right != nil {
+			tables = append(tables, extractMySQLJoinTables(n.Right)...)
+		}
+	case *ast.TableSource:
+		if tblName, ok := n.Source.(*ast.TableName); ok && tblName != nil {
+			tables = append(tables, tblName.Name.O)
+		}
+	}
+	return tables
 }

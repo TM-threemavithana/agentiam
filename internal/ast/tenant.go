@@ -30,13 +30,22 @@ func walkTenantNode(node *pg_query.Node, rule *TenantIsolationRule, injected map
 			sel.FromClause[i] = rewriteFromItem(fromItem, rule, injected)
 		}
 	case *pg_query.Node_UpdateStmt:
-		rel := n.UpdateStmt.Relation
-		if rel != nil && !isSharedTable(rel.Relname, rule.SharedTables) {
+		upd := n.UpdateStmt
+		rel := upd.Relation
+		if rel == nil {
+			return fmt.Errorf("policy violation: UPDATE statement without target relation")
+		}
+		if !isSharedTable(rel.Relname, rule.SharedTables) {
+			if rule.TenantColumn != "" {
+				if err := checkPostgresUpdateTargetList(upd.TargetList, rule.TenantColumn); err != nil {
+					return err
+				}
+			}
 			newCond := buildTenantWhereClause(rule)
-			if n.UpdateStmt.WhereClause == nil {
-				n.UpdateStmt.WhereClause = newCond
+			if upd.WhereClause == nil {
+				upd.WhereClause = newCond
 			} else {
-				n.UpdateStmt.WhereClause = wrapWithAnd(n.UpdateStmt.WhereClause, newCond)
+				upd.WhereClause = wrapWithAnd(upd.WhereClause, newCond)
 			}
 		}
 	case *pg_query.Node_DeleteStmt:
@@ -244,4 +253,37 @@ func isSharedTable(relName string, sharedTables []string) bool {
 		}
 	}
 	return false
+}
+
+
+func checkPostgresUpdateTargetList(targetList []*pg_query.Node, tenantCol string) error {
+	for _, target := range targetList {
+		if target == nil {
+			continue
+		}
+		rt, ok := target.Node.(*pg_query.Node_ResTarget)
+		if !ok || rt.ResTarget == nil {
+			continue
+		}
+
+		// Direct column name check (e.g. SET tenant_id = '...', SET "tenant_id" = '...')
+		if strings.EqualFold(rt.ResTarget.Name, tenantCol) {
+			return fmt.Errorf("policy violation: modifying tenant isolation column '%s' is prohibited", tenantCol)
+		}
+
+		// Table-qualified or indirection check (e.g. SET users.tenant_id = '...', SET u.tenant_id = '...')
+		// In Postgres AST, if qualified like `alias.column`, rt.ResTarget.Name is `alias`
+		// and the column name is in rt.ResTarget.Indirection as a Node_String_.
+		for _, ind := range rt.ResTarget.Indirection {
+			if ind == nil {
+				continue
+			}
+			if strNode, ok := ind.Node.(*pg_query.Node_String_); ok && strNode.String_ != nil {
+				if strings.EqualFold(strNode.String_.Sval, tenantCol) {
+					return fmt.Errorf("policy violation: modifying tenant isolation column '%s' is prohibited", tenantCol)
+				}
+			}
+		}
+	}
+	return nil
 }
