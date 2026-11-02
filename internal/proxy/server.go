@@ -255,6 +255,16 @@ func (s *Server) Start() error {
 	}
 }
 
+// Addr returns the server's listener network address, or nil if not listening yet.
+func (s *Server) Addr() net.Addr {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.listener != nil {
+		return s.listener.Addr()
+	}
+	return nil
+}
+
 // Shutdown stops the listener and waits for all active sessions to drain.
 // It respects the provided context deadline as a timeout.
 func (s *Server) Shutdown(ctx context.Context) error {
