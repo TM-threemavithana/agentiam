@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/tm-threemavithana/agentiam/internal/cache"
@@ -111,12 +112,15 @@ func TestHTTPInterceptor_Authentication(t *testing.T) {
 }
 
 func TestHTTPInterceptor_StatementInterceptionAndPolicyEnforcement(t *testing.T) {
+	var upstreamRequestCount int32
 	var receivedUpstreamBody []byte
+
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&upstreamRequestCount, 1)
 		var err error
 		receivedUpstreamBody, err = io.ReadAll(r.Body)
 		if err != nil {
-			http.Error(w, err.Error(), 500)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		w.WriteHeader(http.StatusOK)
@@ -124,7 +128,7 @@ func TestHTTPInterceptor_StatementInterceptionAndPolicyEnforcement(t *testing.T)
 	}))
 	defer upstream.Close()
 
-	// Only SELECT allowed, LIMIT 50
+	// Configure policy store: only SELECT allowed, strict LIMIT 50 enforced
 	store := setupTestStore(t, "agent-secret", []string{"SELECT"}, 50)
 	lc, _ := cache.NewLocalCache(10)
 	interceptor, err := NewHTTPInterceptorProxy(upstream.URL, store, NewLogger(io.Discard), lc, "Bearer UPSTREAM_AUTH")
@@ -137,7 +141,7 @@ func TestHTTPInterceptor_StatementInterceptionAndPolicyEnforcement(t *testing.T)
 
 	ctx := context.Background()
 
-	// 1. Allowed statement -> rewritten with LIMIT 50
+	// 1. Allowed statement -> must be rewritten specifically with LIMIT 50
 	sqlPayload := map[string]interface{}{
 		"statement": "SELECT id, name FROM users",
 		"warehouse": "compute_wh",
@@ -163,11 +167,21 @@ func TestHTTPInterceptor_StatementInterceptionAndPolicyEnforcement(t *testing.T)
 		t.Fatalf("Failed to parse upstream body: %v", err)
 	}
 	rewrittenStmt, ok := upstreamMap["statement"].(string)
-	if !ok || !strings.Contains(strings.ToUpper(rewrittenStmt), "LIMIT") {
-		t.Fatalf("Expected rewritten SQL to enforce LIMIT 50, got: %v", upstreamMap["statement"])
+	if !ok {
+		t.Fatalf("Expected statement field in upstream body, got: %v", upstreamMap)
 	}
 
-	// 2. Blocked statement (DROP TABLE) -> 403 Forbidden
+	// Task 4 Assertion: Confirm the allowed SQL specifically receives configured LIMIT 50
+	if !strings.Contains(strings.ToUpper(rewrittenStmt), "LIMIT 50") {
+		t.Fatalf("Expected rewritten SQL to enforce configured 'LIMIT 50', got: %q", rewrittenStmt)
+	}
+
+	countAfterAllowed := atomic.LoadInt32(&upstreamRequestCount)
+	if countAfterAllowed != 1 {
+		t.Fatalf("Expected upstream to have received exactly 1 request for allowed statement, got: %d", countAfterAllowed)
+	}
+
+	// 2. Blocked statement (DROP TABLE users) -> 403 Forbidden
 	blockedPayload := map[string]interface{}{
 		"statement": "DROP TABLE users",
 	}
@@ -184,5 +198,12 @@ func TestHTTPInterceptor_StatementInterceptionAndPolicyEnforcement(t *testing.T)
 	_ = resp2.Body.Close()
 	if resp2.StatusCode != http.StatusForbidden {
 		t.Fatalf("Expected 403 Forbidden for disallowed statement, got: %d", resp2.StatusCode)
+	}
+
+	// Task 4 Assertion: Confirm denied statements NEVER reach the upstream service
+	countAfterDenied := atomic.LoadInt32(&upstreamRequestCount)
+	if countAfterDenied != countAfterAllowed {
+		t.Fatalf("Security failure: denied statement reached upstream service (request count increased from %d to %d)",
+			countAfterAllowed, countAfterDenied)
 	}
 }
