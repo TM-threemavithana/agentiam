@@ -146,8 +146,13 @@ func TestInitTracer_OTLPExport_CollectorError_500(t *testing.T) {
 		t.Fatal("Expected request to be delivered to collector before failure, got 0")
 	}
 
-	// Process must not terminate; shutdown should succeed
-	_ = tp.Shutdown(ctx)
+	// Process must not terminate; shutdown completes without hanging using fresh bounded cleanup context.
+	// We do not require successful export after an intentional collector failure.
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer shutdownCancel()
+	if err := tp.Shutdown(shutdownCtx); err != nil {
+		t.Logf("Shutdown completed with expected cleanup status after intentional 500 error: %v", err)
+	}
 }
 
 // TestInitTracer_OTLPExport_CollectorError_429 verifies exporter behavior when the collector returns HTTP 429 Too Many Requests.
@@ -190,8 +195,13 @@ func TestInitTracer_OTLPExport_CollectorError_429(t *testing.T) {
 		t.Fatal("Expected request to be delivered to collector before 429 response, got 0")
 	}
 
-	// Shutdown completes predictably
-	_ = tp.Shutdown(ctx)
+	// Process must not terminate; shutdown completes without hanging using fresh bounded cleanup context.
+	// We do not require successful export after an intentional collector failure.
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer shutdownCancel()
+	if err := tp.Shutdown(shutdownCtx); err != nil {
+		t.Logf("Shutdown completed with expected cleanup status after intentional 429 error: %v", err)
+	}
 }
 
 // TestInitTracer_OTLPExport_OversizedResponse verifies bounded response reading on collector error.
@@ -239,16 +249,18 @@ func TestInitTracer_OTLPExport_OversizedResponse(t *testing.T) {
 		t.Fatal("Expected error when collector returns oversized response body, got nil")
 	}
 
-	// Verify the upstream 4MB bounded read limit was triggered
+	// Fatal assertion: The test must fail unless the exporter returns the expected response-body-size-limit error
 	if !strings.Contains(flushErr.Error(), "response body too large") && !strings.Contains(flushErr.Error(), "4194304") {
-		t.Logf("Export error received: %v", flushErr)
+		t.Fatalf("Expected response-body-size-limit error ('response body too large' or '4194304'), got: %v", flushErr)
 	}
 
 	if count := atomic.LoadInt32(&receivedCount); count == 0 {
 		t.Fatal("Expected request to be delivered to collector, got 0")
 	}
 
-	_ = tp.Shutdown(ctx)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer shutdownCancel()
+	_ = tp.Shutdown(shutdownCtx)
 }
 
 func TestApplicationStartup_ToolchainVerification(t *testing.T) {
