@@ -168,8 +168,8 @@ func (s *Session) isPolicyRevoked() bool {
 }
 
 // TerminateWithPolicyRevocation coordinates graceful session termination on policy revocation.
-// It delivers SQLSTATE 57P01 via the designated client writer under clientWriteMu,
-// flushes the response with a bounded write deadline, drains pending pipelined client data,
+// It invalidates the session, curtails in-flight writes to a bounded deadline,
+// acquires exclusive write ownership without raw socket drains, delivers SQLSTATE 57P01,
 // and cleanly tears down the session context and socket.
 func (s *Session) TerminateWithPolicyRevocation() {
 	s.revokeOnce.Do(func() {
@@ -177,34 +177,44 @@ func (s *Session) TerminateWithPolicyRevocation() {
 		s.errorDiscard.Store(true)
 		s.CancelQuery()
 
-		s.clientWriteMu.Lock()
-		if s.clientConn != nil && s.clientBackend != nil {
+		// Curtail any active client write immediately to a bounded 5-second deadline
+		if s.clientConn != nil {
 			_ = s.clientConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			s.clientBackend.Send(&pgproto3.ErrorResponse{
-				Severity: "FATAL",
-				Code:     "57P01",
-				Message:  "AgentIAM Policy Violation: active session policy was revoked or updated",
-			})
-			_ = s.clientBackend.Flush()
-			_ = s.clientConn.SetWriteDeadline(time.Time{})
+		}
 
-			// Bounded drain of unread pipelined client messages (e.g. Bind/Execute/Sync)
-			// to prevent kernel TCP RST on socket close.
-			_ = s.clientConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-			drainBuf := make([]byte, 4096)
-			for {
-				if _, err := s.clientConn.Read(drainBuf); err != nil {
-					break
+		// Bounded acquisition of clientWriteMu (up to 5 seconds) to ensure teardown cannot hang
+		acquireDeadline := time.Now().Add(5 * time.Second)
+		acquired := false
+		for time.Now().Before(acquireDeadline) {
+			if s.clientWriteMu.TryLock() {
+				acquired = true
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+
+		if acquired {
+			if s.clientConn != nil && s.clientBackend != nil {
+				_ = s.clientConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+				s.clientBackend.Send(&pgproto3.ErrorResponse{
+					Severity: "FATAL",
+					Code:     "57P01",
+					Message:  "AgentIAM Policy Violation: active session policy was revoked or updated",
+				})
+				_ = s.clientBackend.Flush()
+				_ = s.clientConn.SetWriteDeadline(time.Time{})
+
+				// Graceful half-close across plain TCP and TLS-wrapped connections
+				if cw, ok := s.clientConn.(interface{ CloseWrite() error }); ok {
+					_ = cw.CloseWrite()
 				}
 			}
-			_ = s.clientConn.SetReadDeadline(time.Time{})
-
-			// Attempt graceful TCP half-close if underlying connection is TCP
-			if tcpConn, ok := s.clientConn.(*net.TCPConn); ok {
-				_ = tcpConn.CloseWrite()
-			}
+			s.clientWriteMu.Unlock()
+		} else if s.logger != nil {
+			s.logger.Warn("Failed to acquire clientWriteMu within 5s deadline on policy revocation, proceeding to forced teardown",
+				"client_id", s.clientID,
+			)
 		}
-		s.clientWriteMu.Unlock()
 
 		if s.cancel != nil {
 			s.cancel()
@@ -757,12 +767,12 @@ func (s *Session) handleParseMsg(ctx context.Context, v *pgproto3.Parse, clientW
 	_, span := Tracer.Start(ctx, "proxy.Parse")
 	defer span.End()
 
-	if s.errorDiscard.Load() {
-		return nil
-	}
 	if s.isPolicyRevoked() {
 		s.TerminateWithPolicyRevocation()
 		return fmt.Errorf("session policy revoked")
+	}
+	if s.errorDiscard.Load() {
+		return nil
 	}
 
 	if s.server != nil && s.server.verifier != nil && len(s.rules.Views) > 0 {
@@ -822,12 +832,12 @@ func (s *Session) handleBindMsg(ctx context.Context, v *pgproto3.Bind, clientWri
 	_, span := Tracer.Start(ctx, "proxy.Bind")
 	defer span.End()
 
-	if s.errorDiscard.Load() {
-		return nil
-	}
 	if s.isPolicyRevoked() {
 		s.TerminateWithPolicyRevocation()
 		return fmt.Errorf("session policy revoked")
+	}
+	if s.errorDiscard.Load() {
+		return nil
 	}
 	if s.server.pool != nil {
 		s.server.store.SetPoolLatency(s.server.pool.GetAvgAcquireDuration())
@@ -1076,12 +1086,14 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 				if !s.errorDiscard.Load() {
 					_ = s.clientConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 					s.clientBackend.Send(msg)
-					if err := s.clientBackend.Flush(); err != nil {
+					flushErr := s.clientBackend.Flush()
+					if !s.errorDiscard.Load() {
 						_ = s.clientConn.SetWriteDeadline(time.Time{})
+					}
+					if flushErr != nil {
 						s.clientWriteMu.Unlock()
 						return
 					}
-					_ = s.clientConn.SetWriteDeadline(time.Time{})
 				}
 				s.clientWriteMu.Unlock()
 			}

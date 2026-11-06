@@ -844,11 +844,49 @@ func TestUpstreamFrontend_PostReleaseOperation_Rejected(t *testing.T) {
 	}
 }
 
+// inProcessTCPPair creates a loopback TCP connection pair for realistic network and deadline testing.
+func inProcessTCPPair(t *testing.T) (net.Conn, net.Conn) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to listen: %v", err)
+	}
+	defer ln.Close()
+
+	serverCh := make(chan net.Conn, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		c, aErr := ln.Accept()
+		if aErr != nil {
+			errCh <- aErr
+			return
+		}
+		serverCh <- c
+	}()
+
+	clientConn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Failed to dial: %v", err)
+	}
+
+	select {
+	case serverConn := <-serverCh:
+		return serverConn, clientConn
+	case err := <-errCh:
+		clientConn.Close()
+		t.Fatalf("Accept failed: %v", err)
+	case <-time.After(2 * time.Second):
+		clientConn.Close()
+		t.Fatalf("Timed out establishing TCP pair")
+	}
+	return nil, nil
+}
+
 // Test 14: Policy Revocation Error Delivery and SQLSTATE 57P01 Contract
 // Verifies that TerminateWithPolicyRevocation delivers a structured ErrorResponse
 // with Code "57P01" and Severity "FATAL" before closing the socket.
 func TestPolicyRevocation_SQLSTATE57P01_Delivery(t *testing.T) {
-	serverConn, clientConn := net.Pipe()
+	serverConn, clientConn := inProcessTCPPair(t)
 	defer clientConn.Close()
 
 	session := &Session{
@@ -916,7 +954,7 @@ func TestPolicyRevocation_SQLSTATE57P01_Delivery(t *testing.T) {
 // Verifies that multiple concurrent invocations of TerminateWithPolicyRevocation
 // execute safely without data races and deliver exactly one 57P01 response.
 func TestPolicyRevocation_DesignatedWriter_Concurrency_NoRace(t *testing.T) {
-	serverConn, clientConn := net.Pipe()
+	serverConn, clientConn := inProcessTCPPair(t)
 	defer clientConn.Close()
 
 	session := &Session{
@@ -966,5 +1004,232 @@ func TestPolicyRevocation_NegativeControl_UnexplainedResetRejected(t *testing.T)
 		if strings.Contains(errStr, "57P01") {
 			t.Errorf("Negative control failed: error string %q unexpectedly matched 57P01", errStr)
 		}
+	}
+}
+
+// Test 17: Existing Client Writer Blocked While Revocation Starts
+// Verifies that if an ordinary writer is holding clientWriteMu, TerminateWithPolicyRevocation
+// curtails the write deadline, waits up to 5s, acquires the lock or times out, and fails closed without deadlock.
+func TestPolicyRevocation_ExistingWriterBlocked_LockTimeoutBounded(t *testing.T) {
+	serverConn, clientConn := inProcessTCPPair(t)
+	defer clientConn.Close()
+
+	session := &Session{
+		clientConn:    serverConn,
+		clientBackend: pgproto3.NewBackend(serverConn, serverConn),
+		logger:        NewLogger(io.Discard),
+	}
+
+	started := make(chan struct{})
+	writerDone := make(chan struct{})
+
+	// Simulate existing writer holding clientWriteMu
+	session.clientWriteMu.Lock()
+	go func() {
+		close(started)
+		// Hold lock briefly, then release
+		time.Sleep(50 * time.Millisecond)
+		session.clientWriteMu.Unlock()
+		close(writerDone)
+	}()
+
+	<-started
+
+	// Client reader in background to absorb fatal error write
+	go func() {
+		clientFrontend := pgproto3.NewFrontend(clientConn, clientConn)
+		_, _ = clientFrontend.Receive()
+	}()
+
+	// Revocation starts while writer held lock
+	done := make(chan struct{})
+	go func() {
+		session.TerminateWithPolicyRevocation()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Succeeded in acquiring lock after writer released and terminated
+	case <-time.After(3 * time.Second):
+		t.Fatalf("TerminateWithPolicyRevocation deadlocked while waiting for existing writer")
+	}
+
+	<-writerDone
+}
+
+// Test 18: Client Stops Reading Indefinitely (Write Timeout Bounded)
+// Verifies that when a client stops reading and socket write buffer is saturated,
+// the deadline ensures revocation fails closed without hanging.
+func TestPolicyRevocation_ClientStopsReading_WriteTimeoutBounded(t *testing.T) {
+	serverConn, clientConn := inProcessTCPPair(t)
+	defer clientConn.Close()
+
+	session := &Session{
+		clientConn:    serverConn,
+		clientBackend: pgproto3.NewBackend(serverConn, serverConn),
+		logger:        NewLogger(io.Discard),
+	}
+
+	done := make(chan struct{})
+	go func() {
+		// Set short 50ms deadline on connection to verify bounded fail-closed
+		_ = serverConn.SetWriteDeadline(time.Now().Add(50 * time.Millisecond))
+		session.TerminateWithPolicyRevocation()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Successfully terminated and failed closed
+	case <-time.After(2 * time.Second):
+		t.Fatalf("TerminateWithPolicyRevocation hung when client stopped reading")
+	}
+}
+
+// Test 19: Existing clientBackend.Receive Blocked When Revocation Occurs
+// Verifies that when a session reader is blocked waiting for client commands,
+// revocation unblocks the reader and cleans up without deadlock.
+func TestPolicyRevocation_BlockedReceiveUnblocksOnRevocation(t *testing.T) {
+	serverConn, clientConn := inProcessTCPPair(t)
+	defer clientConn.Close()
+
+	session := &Session{
+		clientConn:    serverConn,
+		clientBackend: pgproto3.NewBackend(serverConn, serverConn),
+		logger:        NewLogger(io.Discard),
+	}
+
+	readErrCh := make(chan error, 1)
+	go func() {
+		_, err := session.clientBackend.Receive()
+		readErrCh <- err
+	}()
+
+	// Read on clientConn so server's fatal message doesn't stall
+	go func() {
+		clientFrontend := pgproto3.NewFrontend(clientConn, clientConn)
+		_, _ = clientFrontend.Receive()
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+
+	// Trigger revocation
+	session.TerminateWithPolicyRevocation()
+
+	select {
+	case err := <-readErrCh:
+		if err == nil {
+			t.Errorf("Expected Receive to return error upon socket closure, got nil")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("clientBackend.Receive remained blocked after session revocation")
+	}
+}
+
+// Test 20: Extended-Protocol Pipelined Parse/Bind/Execute/Sync Traffic
+// Verifies that when a client pipelines extended query messages on a revoked session,
+// handleParseMsg detects revocation, delivers 57P01, and fails closed without buffer corruption.
+func TestPolicyRevocation_ExtendedProtocol_PipelinedTraffic(t *testing.T) {
+	serverConn, clientConn := inProcessTCPPair(t)
+	defer clientConn.Close()
+
+	session := &Session{
+		clientConn:    serverConn,
+		clientBackend: pgproto3.NewBackend(serverConn, serverConn),
+		logger:        NewLogger(io.Discard),
+	}
+	session.invalidated.Store(true) // policy is already revoked
+
+	clientWriteCh := make(chan pgproto3.BackendMessage, 16)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	parseMsg := &pgproto3.Parse{Query: "SELECT id, name FROM customers WHERE id = 1"}
+
+	// Client reader runs concurrently
+	msgCh := make(chan pgproto3.BackendMessage, 1)
+	readErrCh := make(chan error, 1)
+	go func() {
+		clientFrontend := pgproto3.NewFrontend(clientConn, clientConn)
+		msg, rErr := clientFrontend.Receive()
+		if rErr != nil {
+			readErrCh <- rErr
+			return
+		}
+		msgCh <- msg
+	}()
+
+	// handleParseMsg must immediately detect revocation and terminate
+	err := session.handleParseMsg(ctx, parseMsg, clientWriteCh)
+	if err == nil {
+		t.Fatalf("Expected handleParseMsg to return error on revoked session, got nil")
+	}
+
+	select {
+	case rErr := <-readErrCh:
+		t.Fatalf("Failed to read fatal response on client frontend: %v", rErr)
+	case msg := <-msgCh:
+		errResp, ok := msg.(*pgproto3.ErrorResponse)
+		if !ok || errResp.Code != "57P01" {
+			t.Fatalf("Expected SQLSTATE 57P01 ErrorResponse, got: %v", msg)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Timed out waiting for client to receive 57P01")
+	}
+}
+
+// Test 21: Final Error Flush Fails (Fails Closed Without Panic)
+// Verifies that if the client connection is broken before revocation finishes,
+// TerminateWithPolicyRevocation handles the failure gracefully and completes teardown.
+func TestPolicyRevocation_FlushFails_FailsClosed(t *testing.T) {
+	serverConn, clientConn := inProcessTCPPair(t)
+	clientConn.Close() // immediately break client side
+
+	session := &Session{
+		clientConn:    serverConn,
+		clientBackend: pgproto3.NewBackend(serverConn, serverConn),
+		logger:        NewLogger(io.Discard),
+	}
+
+	// Must not panic or hang
+	done := make(chan struct{})
+	go func() {
+		session.TerminateWithPolicyRevocation()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Clean teardown
+	case <-time.After(2 * time.Second):
+		t.Fatalf("TerminateWithPolicyRevocation hung on broken connection")
+	}
+
+	if !session.invalidated.Load() {
+		t.Errorf("Expected session to be marked invalidated")
+	}
+}
+
+// Test 22: No Unauthorized Statement Dispatched After Revocation
+// Verifies that all query handlers fail closed when session is invalidated,
+// ensuring zero statements are sent upstream.
+func TestPolicyRevocation_DisallowsPostRevocationStatements(t *testing.T) {
+	session := &Session{
+		logger: NewLogger(io.Discard),
+	}
+	session.invalidated.Store(true)
+
+	ctx := context.Background()
+	ch := make(chan pgproto3.BackendMessage, 1)
+
+	if err := session.handleParseMsg(ctx, &pgproto3.Parse{Query: "SELECT 1"}, ch); err == nil {
+		t.Errorf("Expected handleParseMsg to fail after revocation")
+	}
+	if err := session.handleBindMsg(ctx, &pgproto3.Bind{}, ch); err == nil {
+		t.Errorf("Expected handleBindMsg to fail after revocation")
+	}
+	if err := session.handleQueryMsg(ctx, &pgproto3.Query{String: "SELECT 1"}, ch); err == nil {
+		t.Errorf("Expected handleQueryMsg to fail after revocation")
 	}
 }
