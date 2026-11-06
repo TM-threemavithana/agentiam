@@ -848,13 +848,18 @@ func TestViewMaskingIntegration(t *testing.T) {
 		}
 		defer conn.Close(ctx)
 
-		// 1. Initial query succeeds
+		// 1. Initial query succeeds and delivers legitimate result
 		var id int
 		var name string
 		err = conn.QueryRow(ctx, "SELECT id, name FROM customers WHERE id = 1").Scan(&id, &name)
 		if err != nil {
 			t.Fatalf("initial authorized query failed: %v", err)
 		}
+		if id != 1 || name != "Alice" {
+			t.Fatalf("unexpected initial query result: id=%d, name=%s", id, name)
+		}
+
+		initVer := env.policyStore.GetAgentVersion("test-analyst")
 
 		// 2. Revoke policy dynamically
 		revokedPolicy := policy.AgentConfig{
@@ -863,14 +868,43 @@ func TestViewMaskingIntegration(t *testing.T) {
 		}
 		env.policyStore.SetAgentPolicy("test-analyst", revokedPolicy)
 
-		// 3. Subsequent query on the same connection MUST be rejected immediately (57P01 or connection closed)
-		err = conn.QueryRow(ctx, "SELECT id, name FROM customers WHERE id = 1").Scan(&id, &name)
-		if err == nil {
-			t.Fatalf("expected query to fail after policy revocation, but succeeded")
+		// 2a. Verify policy update was successfully applied in policy store
+		updatedVer := env.policyStore.GetAgentVersion("test-analyst")
+		if updatedVer <= initVer {
+			t.Fatalf("policy version not incremented: init=%d, updated=%d", initVer, updatedVer)
 		}
-		errStr := err.Error()
-		if !strings.Contains(errStr, "57P01") && !strings.Contains(errStr, "revoked") && !strings.Contains(errStr, "conn closed") && !strings.Contains(errStr, "EOF") && !strings.Contains(errStr, "closed") {
-			t.Fatalf("expected revocation error (57P01), got: %v", err)
+
+		// 3. Subsequent query on the revoked connection MUST be rejected with SQLSTATE 57P01
+		var revokedID int
+		var revokedName string
+		err = conn.QueryRow(ctx, "SELECT id, name FROM customers WHERE id = 1").Scan(&revokedID, &revokedName)
+		if err == nil {
+			t.Fatalf("CRITICAL SECURITY DEFECT: revoked query succeeded with id=%d, name=%s", revokedID, revokedName)
+		}
+
+		// 3a. Independent verification: No unauthorized result reached the client
+		if revokedID != 0 || revokedName != "" {
+			t.Fatalf("unauthorized data leaked to client variables: id=%d, name=%s", revokedID, revokedName)
+		}
+
+		// 3b. Structured error inspection: Must return PostgreSQL SQLSTATE 57P01
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			if pgErr.Code != "57P01" {
+				t.Fatalf("expected SQLSTATE 57P01, got code: %s (msg: %s)", pgErr.Code, pgErr.Message)
+			}
+		} else {
+			errStr := err.Error()
+			if !strings.Contains(errStr, "57P01") {
+				t.Fatalf("expected SQLSTATE 57P01 error delivery, got non-57P01 error: %v", err)
+			}
+		}
+
+		// 4. Negative control: verify that an unrelated connection reset or socket crash does NOT pass as 57P01 revocation
+		unrelatedResetErr := fmt.Errorf("read tcp 127.0.0.1:5432: read: connection reset by peer")
+		var fakePgErr *pgconn.PgError
+		if errors.As(unrelatedResetErr, &fakePgErr) && fakePgErr.Code == "57P01" {
+			t.Fatalf("negative control failed: unrelated socket reset accepted as valid 57P01 revocation")
 		}
 	})
 

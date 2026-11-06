@@ -120,7 +120,7 @@ func NewServer(listenAddr, upstreamDSN string, store *policy.Store, tlsConfig *t
 	return srv
 }
 
-// RevokeSessionsForClient immediately marks sessions as invalidated and cancels their contexts.
+// RevokeSessionsForClient immediately marks sessions as invalidated and delivers 57P01 error.
 func (s *Server) RevokeSessionsForClient(clientID string) {
 	s.mu.Lock()
 	sessions, exists := s.activeSessions[clientID]
@@ -128,16 +128,15 @@ func (s *Server) RevokeSessionsForClient(clientID string) {
 		s.mu.Unlock()
 		return
 	}
-	var toRevoke []context.CancelFunc
-	for sess, meta := range sessions {
-		sess.invalidated.Store(true)
-		toRevoke = append(toRevoke, meta.cancel)
+	var toRevoke []*Session
+	for sess := range sessions {
+		toRevoke = append(toRevoke, sess)
 	}
 	delete(s.activeSessions, clientID)
 	s.mu.Unlock()
 
-	for _, cancel := range toRevoke {
-		cancel()
+	for _, sess := range toRevoke {
+		sess.TerminateWithPolicyRevocation()
 	}
 }
 
@@ -188,20 +187,19 @@ func (s *Server) pollPolicyUpdates() {
 		}
 
 		s.mu.RLock()
-		var toRevoke []context.CancelFunc
+		var toRevoke []*Session
 		for clientID, sessions := range s.activeSessions {
 			dbVersion, exists := dbVersions[clientID]
 			for sess, meta := range sessions {
 				if !exists || dbVersion != meta.authVersion {
-					sess.invalidated.Store(true)
-					toRevoke = append(toRevoke, meta.cancel)
+					toRevoke = append(toRevoke, sess)
 				}
 			}
 		}
 		s.mu.RUnlock()
 
-		for _, cancel := range toRevoke {
-			cancel()
+		for _, sess := range toRevoke {
+			sess.TerminateWithPolicyRevocation()
 		}
 	}
 }

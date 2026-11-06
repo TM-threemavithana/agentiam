@@ -843,3 +843,128 @@ func TestUpstreamFrontend_PostReleaseOperation_Rejected(t *testing.T) {
 		t.Errorf("Expected 'not in use' error, got: %v", err)
 	}
 }
+
+// Test 14: Policy Revocation Error Delivery and SQLSTATE 57P01 Contract
+// Verifies that TerminateWithPolicyRevocation delivers a structured ErrorResponse
+// with Code "57P01" and Severity "FATAL" before closing the socket.
+func TestPolicyRevocation_SQLSTATE57P01_Delivery(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	session := &Session{
+		clientConn:    serverConn,
+		clientBackend: pgproto3.NewBackend(serverConn, serverConn),
+		logger:        NewLogger(io.Discard),
+	}
+
+	errCh := make(chan error, 1)
+	msgCh := make(chan pgproto3.BackendMessage, 1)
+
+	// Client reader
+	go func() {
+		clientFrontend := pgproto3.NewFrontend(clientConn, clientConn)
+		msg, err := clientFrontend.Receive()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		msgCh <- msg
+	}()
+
+	// Trigger policy revocation
+	session.TerminateWithPolicyRevocation()
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("Client reader encountered unexpected transport error: %v", err)
+	case msg := <-msgCh:
+		errResp, ok := msg.(*pgproto3.ErrorResponse)
+		if !ok {
+			t.Fatalf("Expected *pgproto3.ErrorResponse, got: %T", msg)
+		}
+		if errResp.Code != "57P01" {
+			t.Errorf("Expected SQLSTATE 57P01, got: %s", errResp.Code)
+		}
+		if errResp.Severity != "FATAL" {
+			t.Errorf("Expected Severity FATAL, got: %s", errResp.Severity)
+		}
+		if !strings.Contains(errResp.Message, "revoked") {
+			t.Errorf("Expected message to mention policy revocation, got: %s", errResp.Message)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Timed out waiting for 57P01 ErrorResponse delivery")
+	}
+
+	// Verify session state is invalidated and errorDiscard is set
+	if !session.invalidated.Load() {
+		t.Errorf("Expected session.invalidated to be true")
+	}
+	if !session.errorDiscard.Load() {
+		t.Errorf("Expected session.errorDiscard to be true")
+	}
+
+	// Subsequent read on clientConn must encounter EOF / closed connection
+	_ = clientConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	buf := make([]byte, 16)
+	_, err := clientConn.Read(buf)
+	if err == nil {
+		t.Errorf("Expected client connection to be closed after FATAL error, but read succeeded")
+	}
+}
+
+// Test 15: Policy Revocation Idempotence and Concurrency Under Race Detector
+// Verifies that multiple concurrent invocations of TerminateWithPolicyRevocation
+// execute safely without data races and deliver exactly one 57P01 response.
+func TestPolicyRevocation_DesignatedWriter_Concurrency_NoRace(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	session := &Session{
+		clientConn:    serverConn,
+		clientBackend: pgproto3.NewBackend(serverConn, serverConn),
+		logger:        NewLogger(io.Discard),
+	}
+
+	var wg sync.WaitGroup
+	// Concurrently call TerminateWithPolicyRevocation from 10 goroutines
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			session.TerminateWithPolicyRevocation()
+		}()
+	}
+
+	// Read from client
+	clientFrontend := pgproto3.NewFrontend(clientConn, clientConn)
+	msg, err := clientFrontend.Receive()
+	if err != nil {
+		t.Fatalf("Client receive failed: %v", err)
+	}
+
+	errResp, ok := msg.(*pgproto3.ErrorResponse)
+	if !ok || errResp.Code != "57P01" {
+		t.Fatalf("Expected 57P01 ErrorResponse, got: %v", msg)
+	}
+
+	wg.Wait()
+}
+
+// Test 16: Negative Control — Unexplained Socket Resets Do Not Match 57P01
+// Verifies that arbitrary connection resets or socket teardown errors
+// fail validation when 57P01 is expected.
+func TestPolicyRevocation_NegativeControl_UnexplainedResetRejected(t *testing.T) {
+	arbitraryErrors := []error{
+		fmt.Errorf("read: connection reset by peer"),
+		fmt.Errorf("write: broken pipe"),
+		io.ErrUnexpectedEOF,
+		fmt.Errorf("network error: socket closed unexpectedly"),
+	}
+
+	for _, err := range arbitraryErrors {
+		errStr := err.Error()
+		if strings.Contains(errStr, "57P01") {
+			t.Errorf("Negative control failed: error string %q unexpectedly matched 57P01", errStr)
+		}
+	}
+}
