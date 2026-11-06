@@ -82,7 +82,7 @@ jobs:
       - name: Vulnerability analysis (govulncheck)
         run: |
           echo "==> Installing pinned govulncheck tool..."
-          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
           echo "==> Running govulncheck security scan..."
           govulncheck ./...
 
@@ -90,21 +90,6 @@ jobs:
     name: PostgreSQL 15 Integration & Security Suite
     runs-on: ubuntu-latest
     timeout-minutes: 25
-
-    services:
-      postgres:
-        image: postgres:15-alpine
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: test_password
-          POSTGRES_DB: testdb
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 5
 
     steps:
       - name: Checkout repository
@@ -123,5 +108,4 @@ jobs:
           echo "==> Running PostgreSQL wire-protocol, proxy, view-masking, and tenant integration tests..."
           go test -v -tags=integration -timeout 20m -run "TestViewMaskingIntegration|TestProxyIntegration|TestTLSUpgradeAndEnforcement" ./internal/proxy
         env:
-          AGENTIAM_TEST_DB_DSN: postgres://postgres:test_password@localhost:5432/testdb?sslmode=disable
           TESTCONTAINERS_RYUK_DISABLED: "false"

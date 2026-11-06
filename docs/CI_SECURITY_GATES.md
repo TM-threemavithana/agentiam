@@ -18,7 +18,7 @@ The continuous integration pipeline (`.github/workflows/ci.yml`) enforces ten ma
 | **6. Build Verification** | `go build -v ./cmd/...` / `make build-all` | **Fail-closed:** Compiles all AgentIAM binaries (`agentiam`, `agentiam-cp`, `agentiamctl`). |
 | **7. Unit & Regression Tests** | `go test -count=1 ./...` / `make test` | **Fail-closed:** Executes all package unit and policy regression tests with cache disabled. |
 | **8. Concurrency & Race Detection**| `go test -race -count=1 ./...` / `make race` | **Fail-closed:** Exercises thread-safety across connection pools and catalog cache verifiers. |
-| **9. Vulnerability Analysis** | `govulncheck ./...` / `make vulncheck` | **Fail-closed:** Scans call graphs against the official Go vulnerability database (`vuln.go.dev`). Pinned to `v1.1.4` in CI and `v1.9.0` locally. Any non-zero exit code halts the pipeline with no error swallowing. |
+| **9. Vulnerability Analysis** | `govulncheck ./...` / `make vulncheck` | **Fail-closed:** Scans call graphs against the official Go vulnerability database (`vuln.go.dev`). Pinned uniformly to `v1.9.0` across both CI and local developer environments. Any non-zero exit code halts the pipeline with no error swallowing. |
 | **10. PostgreSQL 15 Integration** | `go test -v -tags=integration ./internal/proxy` | **Fail-closed:** Executes the complete live PostgreSQL 15 integration and view-masking suite with container cleanup safeguards (`TESTCONTAINERS_RYUK_DISABLED: "false"`). |
 
 ---
@@ -39,11 +39,11 @@ The workflow configurations (`.github/workflows/ci.yml` and `.github/workflows/r
   - `goreleaser/goreleaser-action@90a305d81324da521f68220170f3167e60523447` (`# v6.2.1`).
 - **Tool Version Pinning:**
   - `golangci-lint`: pinned to `v1.64.6` (compiled with the Go 1.26 toolchain).
-  - `govulncheck`: pinned to `v1.1.4` in CI and `v1.9.0` in developer environments.
+  - `govulncheck`: pinned to `v1.9.0` uniformly across CI workflows and local developer environments.
 - **Strict Failure Propagation:**
   Security scanners (`govulncheck`, `golangci-lint`, `go vet`, `go mod verify`) execute directly without fallback `||` handlers or `continue-on-error` directives. Non-zero exit codes fail the step immediately.
-- **Ephemeral Integration Isolation:**
-  The PostgreSQL integration job runs against an ephemeral PostgreSQL 15 container (`postgres:15-alpine`) with health checks (`pg_isready -U postgres`) and active container reaper safeguards (`TESTCONTAINERS_RYUK_DISABLED: "false"`).
+- **Ephemeral Integration Isolation via Testcontainers:**
+  The PostgreSQL integration job runs on standard `ubuntu-latest` runners with direct Docker daemon access (`/var/run/docker.sock`), where Testcontainers spins up isolated ephemeral `postgres:15-alpine` instances with active reaper container safeguards (`TESTCONTAINERS_RYUK_DISABLED: "false"`).
 - **Execution Timeouts:**
   Bounded timeouts (`timeout-minutes: 20` for unit/lint, `timeout-minutes: 25` for integration) prevent hung processes from exhausting CI runners.
 
