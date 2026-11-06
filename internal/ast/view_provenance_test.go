@@ -491,4 +491,3 @@ func TestExtractViewDependencies_FailClosedAndEdgeCases(t *testing.T) {
 		t.Fatalf("expected deps %v, got %v", expectedDeps, quotedDeps)
 	}
 }
-

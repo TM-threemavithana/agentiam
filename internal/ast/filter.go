@@ -13,8 +13,8 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 
-	"github.com/tm-threemavithana/agentiam/internal/cache"
 	pg_query "github.com/pganalyze/pg_query_go/v6"
+	"github.com/tm-threemavithana/agentiam/internal/cache"
 	"github.com/wasilibs/go-pgquery/parser"
 	"google.golang.org/protobuf/proto"
 )
@@ -713,8 +713,6 @@ func extractPostgresTables(node *pg_query.Node) []string {
 	return tables
 }
 
-
-
 func enforceRules(node *pg_query.Node, rules Rules, depth int, limitParams *[]int) error {
 	if node == nil || node.Node == nil {
 		return nil
@@ -896,91 +894,201 @@ func walkChildren(v interface{}, rules Rules, depth int, limitParams *[]int) err
 	switch n := v.(type) {
 	case *pg_query.Node_SelectStmt:
 		sel := n.SelectStmt
-		if sel == nil { return nil }
-		if err := filterWalkNodeSlice(sel.TargetList, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNodeSlice(sel.FromClause, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(sel.WhereClause, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNodeSlice(sel.GroupClause, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(sel.HavingClause, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNodeSlice(sel.WindowClause, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNodeSlice(sel.SortClause, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(sel.LimitOffset, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(sel.LimitCount, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNodeSlice(sel.LockingClause, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(sel.WithClause, rules, depth, limitParams); err != nil { return err }
+		if sel == nil {
+			return nil
+		}
+		if err := filterWalkNodeSlice(sel.TargetList, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNodeSlice(sel.FromClause, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(sel.WhereClause, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNodeSlice(sel.GroupClause, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(sel.HavingClause, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNodeSlice(sel.WindowClause, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNodeSlice(sel.SortClause, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(sel.LimitOffset, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(sel.LimitCount, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNodeSlice(sel.LockingClause, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(sel.WithClause, rules, depth, limitParams); err != nil {
+			return err
+		}
 		return nil
 	case *pg_query.Node_InsertStmt:
 		ins := n.InsertStmt
-		if ins == nil { return nil }
-		if err := filterWalkNode(ins.Relation, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNodeSlice(ins.Cols, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(ins.SelectStmt, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(ins.OnConflictClause, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNodeSlice(ins.ReturningList, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(ins.WithClause, rules, depth, limitParams); err != nil { return err }
+		if ins == nil {
+			return nil
+		}
+		if err := filterWalkNode(ins.Relation, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNodeSlice(ins.Cols, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(ins.SelectStmt, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(ins.OnConflictClause, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNodeSlice(ins.ReturningList, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(ins.WithClause, rules, depth, limitParams); err != nil {
+			return err
+		}
 		return nil
 	case *pg_query.Node_UpdateStmt:
 		upd := n.UpdateStmt
-		if upd == nil { return nil }
-		if err := filterWalkNode(upd.Relation, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNodeSlice(upd.TargetList, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(upd.WhereClause, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNodeSlice(upd.FromClause, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNodeSlice(upd.ReturningList, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(upd.WithClause, rules, depth, limitParams); err != nil { return err }
+		if upd == nil {
+			return nil
+		}
+		if err := filterWalkNode(upd.Relation, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNodeSlice(upd.TargetList, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(upd.WhereClause, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNodeSlice(upd.FromClause, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNodeSlice(upd.ReturningList, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(upd.WithClause, rules, depth, limitParams); err != nil {
+			return err
+		}
 		return nil
 	case *pg_query.Node_DeleteStmt:
 		del := n.DeleteStmt
-		if del == nil { return nil }
-		if err := filterWalkNode(del.Relation, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNodeSlice(del.UsingClause, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(del.WhereClause, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNodeSlice(del.ReturningList, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(del.WithClause, rules, depth, limitParams); err != nil { return err }
+		if del == nil {
+			return nil
+		}
+		if err := filterWalkNode(del.Relation, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNodeSlice(del.UsingClause, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(del.WhereClause, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNodeSlice(del.ReturningList, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(del.WithClause, rules, depth, limitParams); err != nil {
+			return err
+		}
 		return nil
 	case *pg_query.Node_JoinExpr:
 		join := n.JoinExpr
-		if join == nil { return nil }
-		if err := filterWalkNode(join.Larg, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(join.Rarg, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(join.Quals, rules, depth, limitParams); err != nil { return err }
+		if join == nil {
+			return nil
+		}
+		if err := filterWalkNode(join.Larg, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(join.Rarg, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(join.Quals, rules, depth, limitParams); err != nil {
+			return err
+		}
 		return nil
 	case *pg_query.Node_FuncCall:
 		fc := n.FuncCall
-		if fc == nil { return nil }
-		if err := filterWalkNodeSlice(fc.Funcname, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNodeSlice(fc.Args, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNodeSlice(fc.AggOrder, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(fc.AggFilter, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(fc.Over, rules, depth, limitParams); err != nil { return err }
+		if fc == nil {
+			return nil
+		}
+		if err := filterWalkNodeSlice(fc.Funcname, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNodeSlice(fc.Args, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNodeSlice(fc.AggOrder, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(fc.AggFilter, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(fc.Over, rules, depth, limitParams); err != nil {
+			return err
+		}
 		return nil
 	case *pg_query.Node_AExpr:
 		aexpr := n.AExpr
-		if aexpr == nil { return nil }
-		if err := filterWalkNodeSlice(aexpr.Name, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(aexpr.Lexpr, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(aexpr.Rexpr, rules, depth, limitParams); err != nil { return err }
+		if aexpr == nil {
+			return nil
+		}
+		if err := filterWalkNodeSlice(aexpr.Name, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(aexpr.Lexpr, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(aexpr.Rexpr, rules, depth, limitParams); err != nil {
+			return err
+		}
 		return nil
 	case *pg_query.Node_BoolExpr:
 		bexpr := n.BoolExpr
-		if bexpr == nil { return nil }
-		if err := filterWalkNodeSlice(bexpr.Args, rules, depth, limitParams); err != nil { return err }
+		if bexpr == nil {
+			return nil
+		}
+		if err := filterWalkNodeSlice(bexpr.Args, rules, depth, limitParams); err != nil {
+			return err
+		}
 		return nil
 	case *pg_query.Node_ResTarget:
 		rt := n.ResTarget
-		if rt == nil { return nil }
-		if err := filterWalkNodeSlice(rt.Indirection, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(rt.Val, rules, depth, limitParams); err != nil { return err }
+		if rt == nil {
+			return nil
+		}
+		if err := filterWalkNodeSlice(rt.Indirection, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(rt.Val, rules, depth, limitParams); err != nil {
+			return err
+		}
 		return nil
 	case *pg_query.Node_TypeCast:
 		tc := n.TypeCast
-		if tc == nil { return nil }
-		if err := filterWalkNode(tc.Arg, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(tc.TypeName, rules, depth, limitParams); err != nil { return err }
+		if tc == nil {
+			return nil
+		}
+		if err := filterWalkNode(tc.Arg, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(tc.TypeName, rules, depth, limitParams); err != nil {
+			return err
+		}
 		return nil
 	case *pg_query.Node_ColumnRef:
 		cr := n.ColumnRef
-		if cr == nil { return nil }
+		if cr == nil {
+			return nil
+		}
 		return filterWalkNodeSlice(cr.Fields, rules, depth, limitParams)
 	case *pg_query.Node_RangeVar, *pg_query.Node_AConst, *pg_query.Node_ParamRef, *pg_query.Node_String_, *pg_query.Node_Integer:
 		return nil // Leaf nodes
@@ -1082,7 +1190,9 @@ func hasAnalyticalNodes(v interface{}) bool {
 	switch n := v.(type) {
 	case *pg_query.Node_FuncCall:
 		fc := n.FuncCall
-		if fc == nil { return false }
+		if fc == nil {
+			return false
+		}
 		if fc.Over != nil || fc.AggStar || fc.AggDistinct {
 			return true
 		}
@@ -1100,32 +1210,48 @@ func hasAnalyticalNodes(v interface{}) bool {
 		return false
 	case *pg_query.Node_SelectStmt:
 		sel := n.SelectStmt
-		if sel == nil { return false }
+		if sel == nil {
+			return false
+		}
 		if hasAnalyticalNodesNodeSlice(sel.TargetList) || hasAnalyticalNodesNodeSlice(sel.FromClause) || hasAnalyticalNodesNode(sel.WhereClause) || hasAnalyticalNodesNodeSlice(sel.GroupClause) || hasAnalyticalNodesNode(sel.HavingClause) || hasAnalyticalNodesNodeSlice(sel.WindowClause) || hasAnalyticalNodesNodeSlice(sel.SortClause) {
 			return true
 		}
 		return false
 	case *pg_query.Node_JoinExpr:
 		join := n.JoinExpr
-		if join == nil { return false }
+		if join == nil {
+			return false
+		}
 		if hasAnalyticalNodesNode(join.Larg) || hasAnalyticalNodesNode(join.Rarg) || hasAnalyticalNodesNode(join.Quals) {
 			return true
 		}
 		return false
 	case *pg_query.Node_AExpr:
 		aexpr := n.AExpr
-		if aexpr == nil { return false }
-		if hasAnalyticalNodesNode(aexpr.Lexpr) || hasAnalyticalNodesNode(aexpr.Rexpr) { return true }
+		if aexpr == nil {
+			return false
+		}
+		if hasAnalyticalNodesNode(aexpr.Lexpr) || hasAnalyticalNodesNode(aexpr.Rexpr) {
+			return true
+		}
 		return false
 	case *pg_query.Node_BoolExpr:
 		bexpr := n.BoolExpr
-		if bexpr == nil { return false }
-		if hasAnalyticalNodesNodeSlice(bexpr.Args) { return true }
+		if bexpr == nil {
+			return false
+		}
+		if hasAnalyticalNodesNodeSlice(bexpr.Args) {
+			return true
+		}
 		return false
 	case *pg_query.Node_ResTarget:
 		rt := n.ResTarget
-		if rt == nil { return false }
-		if hasAnalyticalNodesNode(rt.Val) { return true }
+		if rt == nil {
+			return false
+		}
+		if hasAnalyticalNodesNode(rt.Val) {
+			return true
+		}
 		return false
 	case *pg_query.Node_RangeVar, *pg_query.Node_ColumnRef, *pg_query.Node_AConst, *pg_query.Node_ParamRef, *pg_query.Node_String_, *pg_query.Node_Integer:
 		return false // Leaf nodes
@@ -1288,12 +1414,22 @@ func calculateGenericReflectComplexity(valInterface interface{}) int {
 	switch n := valInterface.(type) {
 	case *pg_query.Node_SelectStmt:
 		sel := n.SelectStmt
-		if sel == nil { return 0 }
+		if sel == nil {
+			return 0
+		}
 		score := 0
-		if len(sel.FromClause) > 1 { score += (len(sel.FromClause) - 1) * 5 }
-		if sel.WhereClause != nil { score += 1 }
-		if len(sel.SortClause) > 0 { score += 2 }
-		if len(sel.GroupClause) > 0 { score += 3 }
+		if len(sel.FromClause) > 1 {
+			score += (len(sel.FromClause) - 1) * 5
+		}
+		if sel.WhereClause != nil {
+			score += 1
+		}
+		if len(sel.SortClause) > 0 {
+			score += 2
+		}
+		if len(sel.GroupClause) > 0 {
+			score += 3
+		}
 		score += calculateGenericReflectComplexityNodeSlice(sel.TargetList)
 		score += calculateGenericReflectComplexityNodeSlice(sel.FromClause)
 		score += calculateGenericReflectComplexityNode(sel.WhereClause)
@@ -1302,38 +1438,56 @@ func calculateGenericReflectComplexity(valInterface interface{}) int {
 		return score
 	case *pg_query.Node_JoinExpr:
 		join := n.JoinExpr
-		if join == nil { return 0 }
+		if join == nil {
+			return 0
+		}
 		return 5 + calculateGenericReflectComplexityNode(join.Larg) + calculateGenericReflectComplexityNode(join.Rarg) + calculateGenericReflectComplexityNode(join.Quals)
 	case *pg_query.Node_FuncCall:
 		fc := n.FuncCall
-		if fc == nil { return 0 }
+		if fc == nil {
+			return 0
+		}
 		score := 0
-		if fc.Over != nil { score += 4 }
+		if fc.Over != nil {
+			score += 4
+		}
 		score += calculateGenericReflectComplexityNodeSlice(fc.Args)
 		return score
 	case *pg_query.Node_InsertStmt:
 		ins := n.InsertStmt
-		if ins == nil { return 0 }
+		if ins == nil {
+			return 0
+		}
 		return calculateGenericReflectComplexityNode(ins.SelectStmt) + calculateGenericReflectComplexityNode(ins.OnConflictClause)
 	case *pg_query.Node_UpdateStmt:
 		upd := n.UpdateStmt
-		if upd == nil { return 0 }
+		if upd == nil {
+			return 0
+		}
 		return calculateGenericReflectComplexityNodeSlice(upd.TargetList) + calculateGenericReflectComplexityNode(upd.WhereClause) + calculateGenericReflectComplexityNodeSlice(upd.FromClause)
 	case *pg_query.Node_DeleteStmt:
 		del := n.DeleteStmt
-		if del == nil { return 0 }
+		if del == nil {
+			return 0
+		}
 		return calculateGenericReflectComplexityNodeSlice(del.UsingClause) + calculateGenericReflectComplexityNode(del.WhereClause)
 	case *pg_query.Node_AExpr:
 		aexpr := n.AExpr
-		if aexpr == nil { return 0 }
+		if aexpr == nil {
+			return 0
+		}
 		return calculateGenericReflectComplexityNode(aexpr.Lexpr) + calculateGenericReflectComplexityNode(aexpr.Rexpr)
 	case *pg_query.Node_BoolExpr:
 		bexpr := n.BoolExpr
-		if bexpr == nil { return 0 }
+		if bexpr == nil {
+			return 0
+		}
 		return calculateGenericReflectComplexityNodeSlice(bexpr.Args)
 	case *pg_query.Node_ResTarget:
 		rt := n.ResTarget
-		if rt == nil { return 0 }
+		if rt == nil {
+			return 0
+		}
 		return calculateGenericReflectComplexityNode(rt.Val)
 	case *pg_query.Node_RangeVar, *pg_query.Node_ColumnRef, *pg_query.Node_AConst, *pg_query.Node_ParamRef, *pg_query.Node_String_, *pg_query.Node_Integer:
 		return 0

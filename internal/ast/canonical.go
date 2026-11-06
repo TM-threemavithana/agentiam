@@ -74,4 +74,3 @@ func QuoteIdentIfNeeded(s string) string {
 	}
 	return s
 }
-
