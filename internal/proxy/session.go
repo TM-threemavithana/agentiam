@@ -505,14 +505,20 @@ func (s *Session) getOrAcquireUpstream(ctx context.Context, clientWriteCh chan p
 		stateQueries = append(stateQueries, fmt.Sprintf("SET %s = %s", k, v))
 	}
 
+	u.frontendMu.Lock()
 	for _, q := range stateQueries {
 		u.SwallowSetTimeout.Add(1)
 		u.Frontend.Send(&pgproto3.Query{String: q})
 	}
-	if err := u.Frontend.Flush(); err != nil {
+	flushErr := u.Frontend.Flush()
+	if flushErr != nil {
 		u.Broken.Store(true)
+	}
+	u.frontendMu.Unlock()
+
+	if flushErr != nil {
 		s.server.pool.Release(u)
-		return nil, fmt.Errorf("failed to flush session state queries: %w", err)
+		return nil, fmt.Errorf("failed to flush session state queries: %w", flushErr)
 	}
 
 	s.uconn = u
@@ -649,6 +655,24 @@ func (s *Session) getOrAcquireUpstream(ctx context.Context, clientWriteCh chan p
 	return u, nil
 }
 
+// sendAndFlushUpstream safely serializes access to the upstream pgproto3.Frontend encoder,
+// flushes the buffered message, and ensures failed flushes mark the connection unusable.
+func (s *Session) sendAndFlushUpstream(u *UpstreamConn, msg pgproto3.FrontendMessage) error {
+	u.frontendMu.Lock()
+	defer u.frontendMu.Unlock()
+
+	if u.State() != ConnStateInUse || u.Broken.Load() {
+		return fmt.Errorf("upstream connection is not in use or broken")
+	}
+
+	u.Frontend.Send(msg)
+	if err := u.Frontend.Flush(); err != nil {
+		u.Broken.Store(true)
+		return fmt.Errorf("failed to flush message to upstream: %w", err)
+	}
+	return nil
+}
+
 func (s *Session) releaseUpstream() {
 	s.uconnMu.Lock()
 	u := s.uconn
@@ -656,6 +680,10 @@ func (s *Session) releaseUpstream() {
 	s.uconnMu.Unlock()
 
 	if u != nil {
+		// Wait for any pending session frontend sends and flushes to complete before ownership transfers to pool
+		u.frontendMu.Lock()
+		_ = u.Broken.Load()
+		u.frontendMu.Unlock()
 		s.server.pool.Release(u)
 	}
 }
@@ -743,11 +771,7 @@ func (s *Session) handleParseMsg(ctx context.Context, v *pgproto3.Parse, clientW
 	if err != nil {
 		return err
 	}
-	u.Frontend.Send(v)
-	if err := u.Frontend.Flush(); err != nil {
-		return err
-	}
-	return nil
+	return s.sendAndFlushUpstream(u, v)
 }
 
 // handleBindMsg processes a Bind message (Extended Query Protocol).
@@ -789,6 +813,13 @@ func (s *Session) handleBindMsg(ctx context.Context, v *pgproto3.Bind, clientWri
 	u, err := s.getOrAcquireUpstream(ctx, clientWriteCh)
 	if err != nil {
 		return err
+	}
+
+	u.frontendMu.Lock()
+	defer u.frontendMu.Unlock()
+
+	if u.State() != ConnStateInUse || u.Broken.Load() {
+		return fmt.Errorf("upstream connection is not in use or broken")
 	}
 
 	ps, exists := s.preparedStatements[v.PreparedStatement]
@@ -868,7 +899,8 @@ func (s *Session) handleBindMsg(ctx context.Context, v *pgproto3.Bind, clientWri
 	v.DestinationPortal = ""
 	u.Frontend.Send(v)
 	if err := u.Frontend.Flush(); err != nil {
-		return err
+		u.Broken.Store(true)
+		return fmt.Errorf("failed to flush bind message: %w", err)
 	}
 	return nil
 }
@@ -965,11 +997,7 @@ func (s *Session) handleQueryMsg(ctx context.Context, v *pgproto3.Query, clientW
 	if err != nil {
 		return err
 	}
-	u.Frontend.Send(v)
-	if err := u.Frontend.Flush(); err != nil {
-		return err
-	}
-	return nil
+	return s.sendAndFlushUpstream(u, v)
 }
 
 // handleSyncMsg processes a Sync message (Extended Query Protocol).
@@ -990,11 +1018,7 @@ func (s *Session) handleSyncMsg(ctx context.Context, v *pgproto3.Sync, clientWri
 	if err != nil {
 		return err
 	}
-	u.Frontend.Send(v)
-	if err := u.Frontend.Flush(); err != nil {
-		return err
-	}
-	return nil
+	return s.sendAndFlushUpstream(u, v)
 }
 
 // proxyLoop is the main read loop for a session.
@@ -1121,6 +1145,12 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 				span.End()
 				return err
 			}
+			u.frontendMu.Lock()
+			if u.State() != ConnStateInUse || u.Broken.Load() {
+				u.frontendMu.Unlock()
+				span.End()
+				return fmt.Errorf("upstream connection not in use or broken")
+			}
 			if v.ObjectType == 'S' {
 				ps, exists := s.preparedStatements[v.Name]
 				if exists {
@@ -1134,7 +1164,13 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 			}
 			v.Name = ""
 			u.Frontend.Send(v)
-			_ = u.Frontend.Flush()
+			if err := u.Frontend.Flush(); err != nil {
+				u.Broken.Store(true)
+				u.frontendMu.Unlock()
+				span.End()
+				return err
+			}
+			u.frontendMu.Unlock()
 			span.End()
 
 		case *pgproto3.Execute:
@@ -1166,8 +1202,10 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 				return err
 			}
 			v.Portal = ""
-			u.Frontend.Send(v)
-			_ = u.Frontend.Flush()
+			if err := s.sendAndFlushUpstream(u, v); err != nil {
+				span.End()
+				return err
+			}
 			span.End()
 
 		case *pgproto3.Close:
@@ -1179,8 +1217,7 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 				u, err := s.getOrAcquireUpstream(ctx, clientWriteCh)
 				if err == nil {
 					v.Name = ""
-					u.Frontend.Send(v)
-					_ = u.Frontend.Flush()
+					_ = s.sendAndFlushUpstream(u, v)
 				}
 			}
 			span.End()
@@ -1205,8 +1242,9 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 				if err != nil {
 					return err
 				}
-				u.Frontend.Send(msg)
-				_ = u.Frontend.Flush()
+				if err := s.sendAndFlushUpstream(u, msg); err != nil {
+					return err
+				}
 			}
 		}
 	}

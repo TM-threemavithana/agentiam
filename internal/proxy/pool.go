@@ -55,6 +55,7 @@ type UpstreamConn struct {
 	SwallowSetTimeout    atomic.Int32
 	TxStatus             byte
 	closeOnce            sync.Once
+	frontendMu           sync.Mutex
 }
 
 func (u *UpstreamConn) Close() {
@@ -63,6 +64,16 @@ func (u *UpstreamConn) Close() {
 			_ = u.Conn.Close()
 		}
 	})
+}
+
+// LockFrontend acquires exclusive access to the upstream Frontend encoder.
+func (u *UpstreamConn) LockFrontend() {
+	u.frontendMu.Lock()
+}
+
+// UnlockFrontend releases exclusive access to the upstream Frontend encoder.
+func (u *UpstreamConn) UnlockFrontend() {
+	u.frontendMu.Unlock()
 }
 
 func (u *UpstreamConn) State() ConnState {
@@ -439,9 +450,19 @@ func (p *Pool) Release(u *UpstreamConn) {
 		cleanCtx, cleanCancel := context.WithTimeout(p.ctx, 5*time.Second)
 		defer cleanCancel()
 
+		u.frontendMu.Lock()
+		if u.Broken.Load() || u.Conn == nil || p.closed.Load() {
+			u.frontendMu.Unlock()
+			p.handleCleaningFailure(u)
+			return
+		}
+
 		u.Frontend.Send(&pgproto3.Query{String: "DISCARD ALL"})
-		if err := u.Frontend.Flush(); err != nil {
-			p.logger.Error("Failed to flush DISCARD ALL on release", "error", err)
+		flushErr := u.Frontend.Flush()
+		u.frontendMu.Unlock()
+
+		if flushErr != nil {
+			p.logger.Error("Failed to flush DISCARD ALL on release", "error", flushErr)
 			p.handleCleaningFailure(u)
 			return
 		}

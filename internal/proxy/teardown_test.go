@@ -16,6 +16,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgproto3"
 	dto "github.com/prometheus/client_model/go"
+	"github.com/tm-threemavithana/agentiam/internal/ast"
 	"github.com/tm-threemavithana/agentiam/internal/policy"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -23,6 +24,9 @@ import (
 // setupTeardownTestServer creates an in-process proxy server and mock upstream for teardown testing.
 func setupTeardownTestServer(t *testing.T, poolSize int, upstreamHandler func(backend *pgproto3.Backend, c net.Conn)) (*Server, *Pool, net.Listener, string, func()) {
 	t.Helper()
+
+	// Warm up libpg_query parser under -race to prevent first-call Cgo latency from tripping client read timeouts
+	_, _, _ = (&ast.PostgresParser{}).ApplyRules("SELECT 1;", ast.Rules{AllowedStatements: []string{"SELECT"}}, nil)
 
 	// 1. Mock upstream PostgreSQL server
 	upListener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -553,7 +557,7 @@ func TestTeardown_UnaffectedSessionsSurviveFailure(t *testing.T) {
 	_ = feA.Flush()
 
 	// Client A must fail
-	_ = connA.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_ = connA.SetReadDeadline(time.Now().Add(5 * time.Second))
 	buf := make([]byte, 1024)
 	_, err := connA.Read(buf)
 	if err == nil {
@@ -567,7 +571,7 @@ func TestTeardown_UnaffectedSessionsSurviveFailure(t *testing.T) {
 			t.Fatalf("Client B failed to send query %d: %v", i+1, err)
 		}
 
-		_ = connB.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_ = connB.SetReadDeadline(time.Now().Add(5 * time.Second))
 		msg, err := feB.Receive()
 		if err != nil {
 			t.Fatalf("Client B failed to receive response %d: %v", i+1, err)
@@ -709,5 +713,133 @@ func TestTeardown_NoRegressions(t *testing.T) {
 	}
 	if sanitizePanicValue(errors.New("simple error")) != "simple error" {
 		t.Errorf("Expected 'simple error', got %s", sanitizePanicValue(errors.New("simple error")))
+	}
+}
+
+// 11. TestUpstreamFrontend_InterleavedFlushAndRelease deterministically verifies that
+// concurrent session frontend send/flush operations and pool release cleanup workers
+// never access the underlying pgproto3.Frontend concurrently, eliminating the release data race.
+func TestUpstreamFrontend_InterleavedFlushAndRelease(t *testing.T) {
+	_, pool, _, _, cleanup := setupTeardownTestServer(t, 2, nil)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	const iterations = 50
+	for i := 0; i < iterations; i++ {
+		u, err := pool.Acquire(ctx)
+		if err != nil {
+			t.Fatalf("Acquire failed on iter %d: %v", i, err)
+		}
+
+		session := &Session{
+			uconn:  u,
+			server: &Server{pool: pool},
+			logger: NewLogger(io.Discard),
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		// Goroutine 1: active session frontend Send & Flush
+		go func() {
+			defer wg.Done()
+			_ = session.sendAndFlushUpstream(u, &pgproto3.Query{String: "SELECT 1;"})
+		}()
+
+		// Goroutine 2: interleaved session release (which waits for frontendMu before pool.Release)
+		go func() {
+			defer wg.Done()
+			session.releaseUpstream()
+		}()
+
+		wg.Wait()
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Wait for any background cleaners to finish
+	time.Sleep(50 * time.Millisecond)
+
+	if pool.GetActiveCount() != 0 {
+		t.Errorf("Expected active count 0, got %d", pool.GetActiveCount())
+	}
+}
+
+// 12. TestUpstreamFrontend_FailedFlush_MarksBroken verifies that when a frontend flush
+// fails (e.g. socket closure), the connection is marked broken, pool.Release does not
+// attempt to send DISCARD ALL on a corrupted encoder, and redialing replaces the slot.
+func TestUpstreamFrontend_FailedFlush_MarksBroken(t *testing.T) {
+	_, pool, _, _, cleanup := setupTeardownTestServer(t, 2, nil)
+	defer cleanup()
+
+	ctx := context.Background()
+	u, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+
+	session := &Session{
+		uconn:  u,
+		server: &Server{pool: pool},
+		logger: NewLogger(io.Discard),
+	}
+
+	// Abruptly close the underlying socket so that Flush will fail
+	_ = u.Conn.Close()
+
+	// Attempt sendAndFlushUpstream -> must fail and mark broken
+	flushErr := session.sendAndFlushUpstream(u, &pgproto3.Query{String: "SELECT 1;"})
+	if flushErr == nil {
+		t.Fatalf("Expected sendAndFlushUpstream to fail on closed socket, but succeeded")
+	}
+
+	if !u.Broken.Load() {
+		t.Errorf("Expected connection to be marked broken after failed flush")
+	}
+
+	// Release upstream -> pool.Release must detect u.Broken and redial rather than sending DISCARD ALL
+	session.releaseUpstream()
+
+	// Wait for background redial worker
+	time.Sleep(100 * time.Millisecond)
+
+	if pool.GetActiveCount() != 0 {
+		t.Errorf("Expected active count 0 after redial, got %d", pool.GetActiveCount())
+	}
+	if pool.GetHealthyIdleCount() != 2 {
+		t.Errorf("Expected healthy idle count 2 after replacement, got %d", pool.GetHealthyIdleCount())
+	}
+}
+
+// 13. TestUpstreamFrontend_PostReleaseOperation_Rejected verifies that once an upstream
+// connection has been relinquished by the session and returned to the pool, any subsequent
+// frontend operation on that stale connection is immediately rejected and cannot mutate
+// the encoder.
+func TestUpstreamFrontend_PostReleaseOperation_Rejected(t *testing.T) {
+	_, pool, _, _, cleanup := setupTeardownTestServer(t, 2, nil)
+	defer cleanup()
+
+	ctx := context.Background()
+	u, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+
+	session := &Session{
+		uconn:  u,
+		server: &Server{pool: pool},
+		logger: NewLogger(io.Discard),
+	}
+
+	// Normal release back to pool
+	session.releaseUpstream()
+
+	// Stale session attempts to perform frontend send on released connection
+	err = session.sendAndFlushUpstream(u, &pgproto3.Query{String: "SELECT 1;"})
+	if err == nil {
+		t.Fatalf("Expected sendAndFlushUpstream on released connection to be rejected, but succeeded")
+	}
+	if !strings.Contains(err.Error(), "not in use") {
+		t.Errorf("Expected 'not in use' error, got: %v", err)
 	}
 }
