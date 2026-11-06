@@ -13,15 +13,15 @@ type ViewPolicy struct {
 
 // Rules defines the AST filtering rules to be applied to an incoming SQL statement.
 type Rules struct {
-	AllowedStatements  []string            `yaml:"allowed_statements"`
-	AllowedTables      []string            `yaml:"allowed_tables"`
-	Views              []ViewPolicy        `yaml:"views"`
-	BlockedFunctions   []string            `yaml:"blocked_functions"`
-	MaskedColumns      map[string][]string `yaml:"masked_columns"`
-	EnforceSelectLimit int                 `yaml:"enforce_select_limit"`
-	MaxExecutionTimeMs int                 `yaml:"max_execution_time_ms"`
-	PoolMode           string              `yaml:"pool_mode"`
-	Dialect            string              `yaml:"dialect"`
+	AllowedStatements          []string             `yaml:"allowed_statements"`
+	AllowedTables              []string             `yaml:"allowed_tables"`
+	Views                      []ViewPolicy         `yaml:"views"`
+	BlockedFunctions           []string             `yaml:"blocked_functions"`
+	MaskedColumns              map[string][]string  `yaml:"masked_columns"`
+	EnforceSelectLimit         int                  `yaml:"enforce_select_limit"`
+	MaxExecutionTimeMs         int                  `yaml:"max_execution_time_ms"`
+	PoolMode                   string               `yaml:"pool_mode"`
+	Dialect                    string               `yaml:"dialect"`
 	MaxComplexity              int                  `yaml:"max_complexity"`
 	TenantIsolation            *TenantIsolationRule `yaml:"tenant_isolation,omitempty"`
 	RequireCatalogVerification bool                 `yaml:"require_catalog_verification,omitempty"`

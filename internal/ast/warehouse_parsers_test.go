@@ -77,8 +77,8 @@ func TestSnowflakeParser_BlockedFunction(t *testing.T) {
 	parser := &SnowflakeParser{}
 	c, _ := cache.NewLocalCache(10)
 	rules := Rules{
-		AllowedStatements: []string{"SELECT"},
-		BlockedFunctions:  []string{"sleep"},
+		AllowedStatements:  []string{"SELECT"},
+		BlockedFunctions:   []string{"sleep"},
 		EnforceSelectLimit: 100,
 	}
 	_, _, err := parser.ApplyRules("SELECT sleep(10) FROM t", rules, c)

@@ -94,8 +94,8 @@ func TestMySQLVisitor(t *testing.T) {
 	}
 
 	v.blocked = false
-	// We can't easily instantiate internal tidb ast nodes directly without pain, 
-	// but the parser loop inherently covers Enter/Leave for normal queries. 
+	// We can't easily instantiate internal tidb ast nodes directly without pain,
+	// but the parser loop inherently covers Enter/Leave for normal queries.
 	// The 76.9% in Enter implies we are missing coverage for some specific statements
 	// we didn't include in TestMySQLParser_ApplyRules.
 }

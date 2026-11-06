@@ -33,5 +33,3 @@ func (l *LocalCache) Get(key string) (CachedAST, bool) {
 func (l *LocalCache) Add(key string, val CachedAST) {
 	l.lru.Add(key, val)
 }
-
-

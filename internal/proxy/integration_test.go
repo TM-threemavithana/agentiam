@@ -335,17 +335,17 @@ func TestProxyIntegration(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected error when preparing statement_timeout set, got none")
 		}
-		
+
 		// 4. Force transaction pool reacquisition to ensure statement_timeout isn't in sessionVars
 		// but TimeZone is.
 		conn.Close(ctx)
-		
+
 		conn2, err := pgx.Connect(ctx, proxyDSN)
 		if err != nil {
 			t.Fatalf("failed to reconnect: %v", err)
 		}
 		defer conn2.Close(ctx)
-		
+
 		_, err = conn2.Exec(ctx, "SELECT 1")
 		if err != nil {
 			t.Fatalf("SELECT failed after reconnect: %v", err)

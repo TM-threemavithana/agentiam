@@ -1,9 +1,9 @@
 package ast
 
 import (
+	"github.com/tm-threemavithana/agentiam/internal/cache"
 	"strings"
 	"testing"
-	"github.com/tm-threemavithana/agentiam/internal/cache"
 )
 
 func TestApplyRules(t *testing.T) {
@@ -239,7 +239,7 @@ func TestApplyRules(t *testing.T) {
 			if !tt.expectLimit && strings.Contains(result, "LIMIT 100") {
 				t.Errorf("expected LIMIT 100 NOT to be injected, got: %s", result)
 			}
-			
+
 			if tt.name == "LIMIT $1 dynamic bypass" {
 				if len(limitParams) != 1 || limitParams[0] != 1 {
 					t.Errorf("expected limitParams to contain [1], got: %v", limitParams)

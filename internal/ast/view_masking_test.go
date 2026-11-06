@@ -205,13 +205,13 @@ func TestViewMasking_CircularView_Fails(t *testing.T) {
 		AllowedTables:     []string{"users"},
 		Views: []ViewPolicy{
 			{
-				Name:      "v1",
-				BaseTable: "v2",
+				Name:           "v1",
+				BaseTable:      "v2",
 				ColumnMappings: map[string]string{"a": "b"},
 			},
 			{
-				Name:      "v2",
-				BaseTable: "v1",
+				Name:           "v2",
+				BaseTable:      "v1",
 				ColumnMappings: map[string]string{"b": "a"},
 			},
 		},
@@ -795,4 +795,3 @@ func TestViewMasking_SubqueriesAndCTEs_StrictEnforcement(t *testing.T) {
 		t.Fatalf("expected CTE with outer filter on sensitive column to fail closed")
 	}
 }
-

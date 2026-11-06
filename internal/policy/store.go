@@ -135,14 +135,14 @@ func agentConfigToRules(config AgentConfig) ast.Rules {
 	}
 
 	rules := ast.Rules{
-		AllowedStatements:  config.AllowedStatements,
-		AllowedTables:      config.AllowedTables,
-		Views:              views,
-		BlockedFunctions:   config.BlockedFunctions,
-		MaskedColumns:      config.MaskedColumns,
-		EnforceSelectLimit: config.SelectLimit,
-		MaxExecutionTimeMs: config.MaxExecutionTimeMs,
-		PoolMode:           config.PoolMode,
+		AllowedStatements:          config.AllowedStatements,
+		AllowedTables:              config.AllowedTables,
+		Views:                      views,
+		BlockedFunctions:           config.BlockedFunctions,
+		MaskedColumns:              config.MaskedColumns,
+		EnforceSelectLimit:         config.SelectLimit,
+		MaxExecutionTimeMs:         config.MaxExecutionTimeMs,
+		PoolMode:                   config.PoolMode,
 		Dialect:                    config.Dialect,
 		MaxComplexity:              config.MaxComplexity,
 		RequireCatalogVerification: true,
@@ -373,7 +373,6 @@ func (s *Store) GetRulesForAgent(clientID string, suppliedPassword string, preVe
 		}
 	}
 
-
 	if isPasswordAuth {
 		elapsed := time.Since(start)
 		if elapsed < 150*time.Millisecond {
@@ -503,11 +502,11 @@ func (s *Store) CheckRateLimit(clientID string) error {
 // AddEphemeralAgent dynamically adds an agent config in memory with a Time-To-Live (TTL).
 func (s *Store) AddEphemeralAgent(agentID, scramSecret string, ttlSeconds int) {
 	s.mu.Lock()
-	
+
 	state := agentState{
 		config: AgentConfig{
-			Name: agentID,
-			Key:  scramSecret,
+			Name:              agentID,
+			Key:               scramSecret,
 			AllowedStatements: []string{"SELECT", "UPDATE", "INSERT", "DELETE"},
 			AllowedTables:     []string{"*"},
 			SelectLimit:       100,

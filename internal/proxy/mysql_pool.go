@@ -150,7 +150,7 @@ func (p *MySQLPool) Close() {
 	p.closeOnce.Do(func() {
 		p.closed.Store(true)
 		p.ready.Store(false)
-		
+
 		for {
 			select {
 			case u := <-p.conns:
