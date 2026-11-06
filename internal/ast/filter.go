@@ -367,6 +367,7 @@ func collectRelationRefs(v interface{}, cteNames map[string]bool, refs *[]Relati
 	}
 }
 
+//nolint:unused // reserved for direct AST relation inspection
 func collectRelationRefsNode(node *pg_query.Node, cteNames map[string]bool, refs *[]RelationRef, seen map[string]bool) {
 	if node != nil {
 		collectRelationRefs(node.Node, cteNames, refs, seen)
@@ -704,6 +705,8 @@ func splitSchemaName(rel string) (string, string) {
 }
 
 // extractPostgresTables walks an AST node and collects all referenced table names (RangeVar).
+//
+//nolint:unused // reserved for direct AST relation inspection
 func extractPostgresTables(node *pg_query.Node) []string {
 	refs := extractPostgresRelationRefs(node)
 	var tables []string

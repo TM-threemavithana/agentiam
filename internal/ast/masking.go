@@ -312,10 +312,14 @@ func walkNode(node *pg_query.Node, scope *Scope) error {
 		sel := n.SelectStmt
 
 		// New scope for this SELECT
+		var maskedCols map[string][]string
+		if scope != nil {
+			maskedCols = scope.MaskedColumns
+		}
 		subScope := &Scope{
 			Tables:        make(map[string]string),
 			Parent:        scope,
-			MaskedColumns: scope.MaskedColumns,
+			MaskedColumns: maskedCols,
 		}
 		if scope != nil {
 			scope.Children = append(scope.Children, subScope)

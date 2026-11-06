@@ -77,5 +77,5 @@ run: build
 	@echo "==> Running AgentIAM Proxy..."
 	./bin/$(BINARY_NAME)
 
-ci-local: fmt-check verify check-pgproto vet test build-all
+ci-local: fmt-check verify check-pgproto vet lint test build-all
 	@echo "==> Local CI quality gates passed successfully."

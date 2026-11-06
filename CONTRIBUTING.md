@@ -6,10 +6,10 @@ Welcome! Thank you for considering contributing to AgentIAM. We welcome bug repo
 
 AgentIAM is written in Go and uses standard Go tooling.
 
-1. Install Go 1.25.11+ (or current toolchain specified in `go.mod`).
+1. Install Go 1.26.10+ (or current toolchain specified in `go.mod`).
 2. Install Docker (required for live PostgreSQL integration tests).
 3. Clone the repository: `git clone https://github.com/TM-threemavithana/agentiam.git`
-4. Run `go mod download` and `make verify` to check module integrity.
+4. Run `go mod download` and `make verify` to check cryptographic module integrity.
 
 ## Testing & Quality Gates
 
