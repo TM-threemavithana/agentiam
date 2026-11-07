@@ -129,7 +129,7 @@ func main() {
 	if edwHttpPort == "" {
 		edwHttpPort = "8080"
 	}
-	
+
 	edwUpstreamAuth := os.Getenv("AGENTIAM_EDW_UPSTREAM_AUTH")
 	if edwUpstreamAuth == "" && strings.Contains(upstreamDSN, "http") {
 		logger.Warn("AGENTIAM_EDW_UPSTREAM_AUTH is not set, EDW proxy will not inject upstream auth")
@@ -141,7 +141,7 @@ func main() {
 			logger.Error("Failed to init HTTP Proxy", "error", err)
 			os.Exit(1)
 		}
-		
+
 		go func() {
 			logger.Info("Starting HTTP EDW Interceptor...", "port", edwHttpPort)
 			if err := http.ListenAndServe(":"+edwHttpPort, httpInterceptor); err != nil {

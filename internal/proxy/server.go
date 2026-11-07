@@ -53,6 +53,7 @@ type Server struct {
 	latencyBuffer  *UILatencyRingBuffer
 	uiFS           http.FileSystem
 	auditSinks     []AuditSink
+	verifier       *CatalogVerifier
 }
 
 // NewServer initializes a new Server instance.
@@ -84,7 +85,7 @@ func NewServer(listenAddr, upstreamDSN string, store *policy.Store, tlsConfig *t
 		}
 	}
 
-	return &Server{
+	srv := &Server{
 		listenAddr:     listenAddr,
 		upstreamDSN:    upstreamDSN,
 		store:          store,
@@ -104,6 +105,38 @@ func NewServer(listenAddr, upstreamDSN string, store *policy.Store, tlsConfig *t
 		latencyBuffer:  NewUILatencyRingBuffer(60), // 60 seconds of history
 		uiFS:           uiFS,
 		auditSinks:     auditSinks,
+		verifier:       NewCatalogVerifier(upstreamDSN, logger),
+	}
+
+	if store != nil {
+		store.SetPolicyUpdateHook(func(clientID string) {
+			if srv.verifier != nil {
+				_ = srv.verifier.VerifyStore(context.Background(), store)
+			}
+			srv.RevokeSessionsForClient(clientID)
+		})
+	}
+
+	return srv
+}
+
+// RevokeSessionsForClient immediately marks sessions as invalidated and delivers 57P01 error.
+func (s *Server) RevokeSessionsForClient(clientID string) {
+	s.mu.Lock()
+	sessions, exists := s.activeSessions[clientID]
+	if !exists {
+		s.mu.Unlock()
+		return
+	}
+	var toRevoke []*Session
+	for sess := range sessions {
+		toRevoke = append(toRevoke, sess)
+	}
+	delete(s.activeSessions, clientID)
+	s.mu.Unlock()
+
+	for _, sess := range toRevoke {
+		sess.TerminateWithPolicyRevocation()
 	}
 }
 
@@ -154,26 +187,42 @@ func (s *Server) pollPolicyUpdates() {
 		}
 
 		s.mu.RLock()
-		var toRevoke []context.CancelFunc
+		var toRevoke []*Session
 		for clientID, sessions := range s.activeSessions {
 			dbVersion, exists := dbVersions[clientID]
-			for _, meta := range sessions {
+			for sess, meta := range sessions {
 				if !exists || dbVersion != meta.authVersion {
-					toRevoke = append(toRevoke, meta.cancel)
+					toRevoke = append(toRevoke, sess)
 				}
 			}
 		}
 		s.mu.RUnlock()
 
-		for _, cancel := range toRevoke {
-			cancel()
+		for _, sess := range toRevoke {
+			sess.TerminateWithPolicyRevocation()
 		}
 	}
 }
 
-// InitPool initializes the upstream connection pool.
+// InitPool initializes the upstream connection pool and verifies views against the PostgreSQL catalog.
 func (s *Server) InitPool(ctx context.Context) error {
-	return s.pool.Init(ctx)
+	if err := s.pool.Init(ctx); err != nil {
+		return err
+	}
+	if s.verifier != nil && s.store != nil {
+		if err := s.verifier.VerifyStore(ctx, s.store); err != nil {
+			s.logger.Warn("Initial catalog view verification encountered errors", "error", err)
+		}
+	}
+	return nil
+}
+
+func (s *Server) GetCatalogVerifier() *CatalogVerifier {
+	return s.verifier
+}
+
+func (s *Server) SetCatalogVerifier(v *CatalogVerifier) {
+	s.verifier = v
 }
 
 // SetHandler resolves the circular dependency when setting up the protocol handler.
@@ -328,6 +377,18 @@ func (s *Server) handleConnection(clientConn net.Conn) {
 	defer func() { <-s.sem }()
 	defer clientConn.Close()
 
+	defer func() {
+		if r := recover(); r != nil {
+			s.logger.Error("Panic recovered in client connection handler",
+				"event", "client_connection_panic",
+				"addr", clientConn.RemoteAddr(),
+				"panic_type", panicType(r),
+				"panic_summary", safePanicSummary(r),
+				"stack", sanitizedStackTrace(),
+			)
+		}
+	}()
+
 	ptype, sniffedConn, err := SniffProtocol(clientConn, 100*time.Millisecond)
 	if err != nil {
 		s.logger.Error("Failed to sniff protocol", "addr", clientConn.RemoteAddr(), "error", err)
@@ -354,7 +415,7 @@ func (s *Server) AllocateVirtualPID(session *Session) (uint32, uint32) {
 	defer s.mu.Unlock()
 	s.nextPID++
 	pid := s.nextPID
-	
+
 	// Generate a cryptographically secure random secret
 	var secret uint32
 	b := make([]byte, 4)

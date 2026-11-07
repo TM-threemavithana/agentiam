@@ -4,9 +4,9 @@ import (
 	"testing"
 
 	pg_query "github.com/pganalyze/pg_query_go/v6"
+	tidb "github.com/pingcap/tidb/pkg/parser"
 	"github.com/wasilibs/go-pgquery/parser"
 	"google.golang.org/protobuf/proto"
-	tidb "github.com/pingcap/tidb/pkg/parser"
 )
 
 func TestPostgresComplexity(t *testing.T) {
@@ -31,7 +31,7 @@ func TestPostgresComplexity(t *testing.T) {
 
 func TestMySQLComplexity(t *testing.T) {
 	pr := tidb.New()
-	
+
 	// Simple
 	stmts, _, _ := pr.Parse("SELECT * FROM users", "", "")
 	cv := &complexityVisitor{}

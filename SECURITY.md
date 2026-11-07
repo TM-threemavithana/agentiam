@@ -1,6 +1,12 @@
 # Security Policy
 
-## Fixed Vulnerabilities (This Release)
+## Fixed & Remediated Vulnerabilities
+
+### GO-2026-4518 (Denial of Service in `pgproto3/v2`)
+- **Status:** RESOLVED / REMEDIATED
+- **Components:** `go.mod`, `internal/proxy/malformed_wire_test.go`
+- **Resolution:**
+  The vulnerable legacy dependency `github.com/jackc/pgproto3/v2` has been completely eliminated from the module dependency graph. AgentIAM now relies exclusively on `github.com/jackc/pgx/v5/pgproto3` via `pgx/v5 v5.11.0`. In addition, strict packet body length bounds and field count validation are enforced in `internal/proxy/decoder.go`, preventing memory exhaustion and panic attacks on corrupt wire frames (verified via `TestDecoder_GO_2026_4518_MalformedDataRow`).
 
 ### SELECT bypass in Postgres AllowedStatements
 - **Status:** FIXED
@@ -29,43 +35,60 @@
 
 ---
 
-## Known Vulnerabilities
+## AST Security Controls & View Provenance (Phase 2 Hardening)
 
-None currently tracked for core database wire proxy protocol handling.
+### Data Masking & View Provenance
+- **Status:** ENFORCED (Runtime & AST Verification)
+- **Components:** `internal/ast/view_provenance.go`, `internal/proxy/catalog_verifier.go`, `internal/proxy/session.go`
+
+View masking operates via AST semantic analysis with live PostgreSQL catalog provenance tracking:
+1. **Relation Whitelisting & Provenance:** Views querying masked tables must be explicitly declared in policy with column mappings. Incomplete column mappings on masked tables fail closed.
+2. **Fail-Closed Expression Semantics (SEC-P2-07):** Sensitive columns can only be directly projected for string constant redaction (`'[REDACTED]'`). Any reference inside `WHERE`, `JOIN ON`, `GROUP BY`, `ORDER BY`, `HAVING`, window, subqueries, or derived expressions (`UPPER()`, concatenations, casts) is strictly rejected before database execution, regardless of whether the column is declared in `unexposed_columns`.
+3. **Cross-Client Verified-View Cache Isolation (SEC-P2-06):** Verified view decisions are strictly partitioned by composite keys (`clientID:policyVersion:schema.viewName`). Verification for Client A never authorizes Client B. A failed verification for Client B never invalidates Client A's authorization.
+4. **Runtime Schema Drift Enforcement (RISK-VIEW-01 & Priority D):** Catalog verification is integrated directly into query-time dispatch (`handleQueryMsg`, `handleParseMsg`, and `handleBindMsg`) via `EnsureFreshness` with a 50ms default production TTL. When TTL=0, synchronous catalog querying is enforced on every query. Note that even with TTL=0, catalog checking and client execution occur on separate database connections; concurrent DDL commits during execution represent an inherent multi-connection TOCTOU gap that cannot be made transactionally atomic by proxy logic alone.
+5. **Nested View Dependency Validation (SEC-P2-08 & Priority A):** Outer view authorization recursively classifies and verifies all underlying view and base-table dependencies (`pg_class.relkind`). Extraction failures, unapproved inner views, or unsupported relation types (`'m'`, `'f'`) strictly fail closed.
+6. **Concurrent Invalidation & Generation Safeguards (Priority B):** Invalidation and newer verification failures advance monotonic generation counters, preventing older in-flight verifications from restoring `StatusVerified`.
+7. **Canonical Identity Correctness (Priority C):** Quoted identifiers (`"Reports"`) preserve case while unquoted (`reports`) fold to lowercase. Authenticated client IDs are strictly case-sensitive.
+8. **Immediate Policy Revocation:** Prepared statements and active sessions are dynamically revoked (Postgres `57P01`) on policy modification via synchronous notification hooks and version tracking.
+9. **Direct Access Boundary:** For direct connection isolation requirements and deployment constraints, refer to [DEPLOYMENT_SECURITY.md](docs/DEPLOYMENT_SECURITY.md).
 
 ---
 
-## AST Security Controls Limitations
+## Known Limitations & Security Risks
+
+### RISK-VIEW-02: Direct PostgreSQL Access Bypass (SEC-P2-01)
+- **Status:** OPEN (RELEASE BLOCKER)
+- **Impact:** Direct client connections to PostgreSQL port 5432 bypass all proxy-level masking and AST rules.
+- **Requirement:** Production sign-off requires independent verification of infrastructure network isolation (non-routable port 5432 from agent networks).
+
+### RISK-LOG-01: Panic Diagnostic Secret Exposure
+- **Status:** MITIGATED
+- **Impact:** Diagnostic logs or panic handlers could expose sensitive credentials (tokens, passwords, connection strings) in stack traces.
+- **Mitigation:** Panic handlers enforce sanitized stack traces and regex credential redaction (`sanitizedStackTrace`, `safePanicSummary`).
+
+### RISK-POOL-01: Terminal CAS Transition Cleanup Failure
+- **Status:** MITIGATED
+- **Impact:** Upstream connection pool cleanup failure after terminal CAS state transitions could lead to connection leakage or state contamination.
+- **Mitigation:** Atomic state transitions, idempotent double-release safeguards, and active connection health checks.
+
+### RISK-AUDIT-01: Audit Sink Delivery Failure
+- **Status:** MITIGATED
+- **Impact:** Network failures in UDP/file audit sinks could result in dropped security audit records.
+
+### RISK-POOL-02: Upstream Session Variable Sanitization
+- **Status:** MITIGATED
+- **Impact:** Dirty session variables from previous queries lingering on pooled connections.
+- **Mitigation:** Connection discard on checkout failure and session state replay.
 
 ### Schema-Qualified Function Shadowing
 - **Status:** Known Limitation
 - **Component:** `internal/ast/filter.go`
-
-**Details:**
-The AST parser's `Funcname` slice iteration correctly catches deeply nested and schema-qualified function calls (e.g., `pg_catalog.pg_sleep`) by comparing any segment of the function name against the `blocked_functions` list in the policy configuration.
-However, this means that if a user-defined function in a different schema shares a name with a blocked function (e.g., `my_schema.pg_sleep`), it will also be blocked.
-
-**Mitigation:**
-For most security-critical deployments, this conservative blocking is acceptable and preferred over allowing a potentially dangerous system function. Users are advised to avoid naming custom functions identically to restricted Postgres internals.
+- If a custom function shares a name with a blocked system function (e.g. `my_schema.pg_sleep`), it will be conservatively blocked.
 
 ### Time-Based Injection (pg_sleep)
-If an agent is granted `SELECT` access without query timeout enforcement, they can execute `SELECT pg_sleep(10)` or computationally expensive queries to exhaust upstream connection pools.
-**Mitigation:** `AgentConfig.MaxExecutionTimeMs` forces context cancellation on slow queries. Ensure this is configured appropriately for your upstream database tier.
-
-### Data Masking Bypass via Views
-- **Status:** UNRESOLVED (tracked for Medium Term in ROADMAP)
-
-Data Masking in AgentIAM operates strictly via AST semantic analysis. Because the proxy does not actively query Postgres internal catalogs to resolve view dependencies, it cannot trace an unrestricted view back to a masked base table.
-
-For example, if the `users` table masks `ssn`, but a DBA creates `CREATE VIEW users_view AS SELECT * FROM users`, an agent querying `SELECT ssn FROM users_view` **will successfully extract the unmasked SSN** because `users_view` is not configured as a masked table in the policy.
-
-**Mitigation:** Do not grant agents access to views or materialized views that wrap masked tables. Use standard Postgres `GRANT/REVOKE` permissions to ensure agents cannot query sensitive views directly.
+- **Mitigation:** `AgentConfig.MaxExecutionTimeMs` forces context cancellation on slow queries.
 
 ### Warehouse Parser Regex Dialect Translation
 - **Status:** Known Limitation
 - **Component:** `internal/ast/warehouse_parsers.go`
-
-The Snowflake and BigQuery dialect adapters use regex substitution (`::` cast, backtick identifiers) before passing SQL to the MySQL/ANSI parser. A `::` inside a string literal could be incorrectly transformed.
-
-**Mitigation:** For security-critical deployments, avoid using Snowflake/BigQuery parsers with untrusted input until a full AST-level dialect parser is implemented.
-
+- Snowflake and BigQuery dialect adapters use regex substitution before passing SQL to the MySQL/ANSI parser. Untrusted complex expressions should be avoided until full dialect AST parsers are implemented.

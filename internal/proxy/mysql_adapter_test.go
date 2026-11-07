@@ -77,7 +77,7 @@ func TestMySQLAuthHandler_Authenticate(t *testing.T) {
 	// Setup policy store
 	discardLogger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	store, _ := policy.NewStore("", "", discardLogger)
-	
+
 	// Create test agent policy
 	store.SetAgentPolicy("test-agent", policy.AgentConfig{
 		Name:              "test-agent",

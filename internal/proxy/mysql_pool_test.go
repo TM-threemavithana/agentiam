@@ -114,11 +114,11 @@ func TestMySQLUpstreamConn_ResetConnection_Success(t *testing.T) {
 		// Send OK packet: len=7, seq=1, header=0x00, affected_rows=0, last_insert_id=0, status=0x0002 (SERVER_STATUS_AUTOCOMMIT)
 		okPacket := []byte{
 			0x07, 0x00, 0x00, 0x01, // 4-byte header (len=7, seq=1)
-			0x00,                   // OK header
-			0x00,                   // 0 affected rows
-			0x00,                   // 0 last insert id
-			0x02, 0x00,             // SERVER_STATUS_AUTOCOMMIT
-			0x00, 0x00,             // 0 warnings
+			0x00,       // OK header
+			0x00,       // 0 affected rows
+			0x00,       // 0 last insert id
+			0x02, 0x00, // SERVER_STATUS_AUTOCOMMIT
+			0x00, 0x00, // 0 warnings
 		}
 		_, err := c2.Write(okPacket)
 		serverErrCh <- err
@@ -154,8 +154,8 @@ func TestMySQLUpstreamConn_ResetConnection_ErrorPacket_Discards(t *testing.T) {
 		// len = 1 (0xff) + 2 (code) + 1 (#) + 5 (state) + 13 (msg) = 22 bytes
 		errPacket := []byte{
 			0x16, 0x00, 0x00, 0x01, // len=22, seq=1
-			0xff,                   // ERR header
-			0x51, 0x04,             // error code 1105
+			0xff,       // ERR header
+			0x51, 0x04, // error code 1105
 			'#', 'H', 'Y', '0', '0', '0', // SQL state
 			'U', 'n', 'k', 'n', 'o', 'w', 'n', ' ', 'e', 'r', 'r', 'o', 'r',
 		}
@@ -316,7 +316,6 @@ func TestMySQLPool_Concurrency_AcquireReleaseClose(t *testing.T) {
 		t.Fatal("expected concurrent acquire/release operations to execute successfully")
 	}
 }
-
 
 func TestMySQLPool_Close_ConcurrentRelease_NoLeak(t *testing.T) {
 	logger := NewLogger(io.Discard)

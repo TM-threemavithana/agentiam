@@ -74,11 +74,11 @@ type UILatencyPoint struct {
 }
 
 type UILatencyRingBuffer struct {
-	mu     sync.RWMutex
-	points []UILatencyPoint
-	size   int
-	head   int
-	count  int
+	mu            sync.RWMutex
+	points        []UILatencyPoint
+	size          int
+	head          int
+	count         int
 	currentSecond string
 	currentSum    float64
 	currentCount  int
@@ -108,7 +108,7 @@ func (r *UILatencyRingBuffer) Add(ms float64) {
 		if r.currentCount > 0 {
 			avg = r.currentSum / float64(r.currentCount)
 		}
-		
+
 		r.points[r.head] = UILatencyPoint{
 			Time:    r.currentSecond,
 			ValueMs: avg,
@@ -132,7 +132,7 @@ func (r *UILatencyRingBuffer) Get() []UILatencyPoint {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	res := make([]UILatencyPoint, 0, r.count+1)
-	
+
 	idx := r.head
 	if r.count < r.size {
 		idx = 0
@@ -141,7 +141,7 @@ func (r *UILatencyRingBuffer) Get() []UILatencyPoint {
 		res = append(res, r.points[idx])
 		idx = (idx + 1) % r.size
 	}
-	
+
 	// Append the currently aggregating second
 	if r.currentCount > 0 {
 		res = append(res, UILatencyPoint{
@@ -149,7 +149,7 @@ func (r *UILatencyRingBuffer) Get() []UILatencyPoint {
 			ValueMs: r.currentSum / float64(r.currentCount),
 		})
 	}
-	
+
 	return res
 }
 
@@ -216,7 +216,7 @@ func (s *Server) HandleGenerateCredentials(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "agent_id is required", http.StatusBadRequest)
 		return
 	}
-	
+
 	ttl := req.TTLSeconds
 	if ttl <= 0 {
 		ttl = 3600 // Default 1 hour
@@ -231,37 +231,37 @@ func (s *Server) HandleGenerateCredentials(w http.ResponseWriter, r *http.Reques
 	salt := make([]byte, 16)
 	_, _ = rand.Read(salt)
 	iters := 4096
-	
+
 	// pbkdf2
 	saltedPassword := pbkdf2.Key([]byte(password), salt, iters, 32, sha256.New)
-	
+
 	// ClientKey = HMAC(SaltedPassword, "Client Key")
 	macClient := hmac.New(sha256.New, saltedPassword)
 	macClient.Write([]byte("Client Key"))
 	clientKey := macClient.Sum(nil)
-	
+
 	// StoredKey = HASH(ClientKey)
 	hashStored := sha256.New()
 	hashStored.Write(clientKey)
 	storedKey := hashStored.Sum(nil)
-	
+
 	// ServerKey = HMAC(SaltedPassword, "Server Key")
 	macServer := hmac.New(sha256.New, saltedPassword)
 	macServer.Write([]byte("Server Key"))
 	serverKey := macServer.Sum(nil)
 
-	scramSecret := fmt.Sprintf("SCRAM-SHA-256$%d:%s$%s:%s", 
-		iters, 
-		base64.StdEncoding.EncodeToString(salt), 
-		base64.StdEncoding.EncodeToString(storedKey), 
+	scramSecret := fmt.Sprintf("SCRAM-SHA-256$%d:%s$%s:%s",
+		iters,
+		base64.StdEncoding.EncodeToString(salt),
+		base64.StdEncoding.EncodeToString(storedKey),
 		base64.StdEncoding.EncodeToString(serverKey))
 
 	s.store.AddEphemeralAgent(req.AgentID, scramSecret, ttl)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"agent_id": req.AgentID,
-		"password": password,
+		"agent_id":    req.AgentID,
+		"password":    password,
 		"ttl_seconds": ttl,
 	})
 }

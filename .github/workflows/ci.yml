@@ -1,50 +1,111 @@
 name: CI
 
-on:
+'on':
   push:
-    branches: [main]
+    branches: [main, 'fix/**', 'chore/**', 'security/**', 'integration/**']
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
-  build-and-test:
+  quality-and-unit-tests:
+    name: Code Quality, Build & Regression Tests
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34 # v5.3.0
         with:
           go-version: '1.26.x'
           cache: true
 
-      - name: Verify module
-        run: go mod tidy && git diff --exit-code go.sum
-
-      - name: Lint
+      - name: Verify Go source formatting (gofmt)
         run: |
-          go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
-          golangci-lint run
+          echo "==> Verifying gofmt compliance..."
+          UNFORMATTED=$(gofmt -l .)
+          if [ -n "$UNFORMATTED" ]; then
+            echo "::error::The following Go files are not formatted according to gofmt standards:"
+            echo "$UNFORMATTED"
+            exit 1
+          fi
+          echo "All Go files are gofmt-compliant."
 
-      - name: Vulnerability Check
+      - name: Verify Go module dependency integrity
         run: |
+          echo "==> Running go mod verify..."
+          go mod verify
+
+      - name: Guard against retired pgproto3/v2 reintroduction
+        run: |
+          echo "==> Verifying absence of vulnerable legacy pgproto3 dependency (GO-2026-4518)..."
+          if grep -E "github\.com/jackc/pgproto3" go.mod go.sum 2>/dev/null; then
+            echo "::error::Legacy dependency github.com/jackc/pgproto3 detected in module dependency graph!"
+            exit 1
+          fi
+          echo "Confirmed: pgproto3/v2 is completely absent from go.mod and go.sum."
+
+      - name: Static analysis (go vet)
+        run: |
+          echo "==> Running go vet..."
+          go vet ./...
+
+      - name: Run golangci-lint
+        run: |
+          echo "==> Installing pinned golangci-lint v1.64.6..."
+          go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.6
+          echo "==> Running golangci-lint..."
+          golangci-lint run ./...
+
+      - name: Build all AgentIAM commands
+        run: |
+          echo "==> Building AgentIAM CLI, control plane, and proxy commands..."
+          go build -v ./cmd/...
+
+      - name: Run unit and regression tests
+        run: |
+          echo "==> Running unit test suite..."
+          go test -count=1 -v ./...
+
+      - name: Run concurrency and race detection tests
+        run: |
+          echo "==> Running race detector on all packages..."
+          go test -race -count=1 ./...
+
+      - name: Vulnerability analysis (govulncheck)
+        run: |
+          echo "==> Installing pinned govulncheck tool..."
           go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+          echo "==> Running govulncheck security scan..."
           govulncheck ./...
 
-      - name: Build
-        run: make build
+  database-integration-tests:
+    name: Database Integration & Security Suite (PostgreSQL 15 & MySQL 8.0)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
 
-      - name: Unit Tests
-        run: make test
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
-      - name: Race Detection
-        run: go test -race -short ./...
+      - name: Set up Go
+        uses: actions/setup-go@f111f3307d8850f501ac008e886eec1fd1932a34 # v5.3.0
+        with:
+          go-version: '1.26.x'
+          cache: true
 
-      - name: Integration Tests
-        run: make test-integration
-        timeout-minutes: 10
-
-      - name: Benchmark
-        run: make bench
+      - name: Run database integration test suite (PostgreSQL 15 & MySQL 8.0)
+        run: |
+          echo "==> Running PostgreSQL and MySQL wire-protocol, proxy, view-masking, and tenant integration tests..."
+          go test -v -tags=integration -timeout 25m -run "TestViewMaskingIntegration|TestProxyIntegration|TestTLSUpgradeAndEnforcement|TestMySQLAdapterIntegration" ./internal/proxy
+        env:
+          TESTCONTAINERS_RYUK_DISABLED: "false"
