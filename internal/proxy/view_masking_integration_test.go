@@ -856,7 +856,7 @@ func TestViewMaskingIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("initial authorized query failed: %v", err)
 		}
-		if id != 1 || name != "Alice" {
+		if id != 1 || name != "Alice Smith" {
 			t.Fatalf("unexpected initial query result: id=%d, name=%s", id, name)
 		}
 
