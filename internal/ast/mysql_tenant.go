@@ -96,8 +96,8 @@ func (v *mysqlTenantVisitor) Enter(in ast.Node) (ast.Node, bool) {
 			hasTenantTable := false
 			for _, t := range tables {
 				if !isSharedTable(t, v.rule.SharedTables) {
-				hasTenantTable = true
-				break
+					hasTenantTable = true
+					break
 				}
 			}
 			if hasTenantTable {
@@ -216,7 +216,6 @@ func appendTenantConditionMySQL(where ast.ExprNode, rule *TenantIsolationRule) a
 		R:  newCond,
 	}
 }
-
 
 func extractMySQLJoinTables(node ast.ResultSetNode) []string {
 	if node == nil {

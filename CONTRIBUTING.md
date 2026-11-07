@@ -6,30 +6,47 @@ Welcome! Thank you for considering contributing to AgentIAM. We welcome bug repo
 
 AgentIAM is written in Go and uses standard Go tooling.
 
-1. Install Go 1.25.11+.
-2. Install Docker (required for integration tests).
+1. Install Go 1.26.10+ (or current toolchain specified in `go.mod`).
+2. Install Docker (required for live PostgreSQL integration tests).
 3. Clone the repository: `git clone https://github.com/TM-threemavithana/agentiam.git`
-4. Run `go mod tidy` to download dependencies.
+4. Run `go mod download` and `make verify` to check cryptographic module integrity.
 
-## Testing
+## Testing & Quality Gates
 
-AgentIAM has a comprehensive test suite, including integration tests that spin up real PostgreSQL and MySQL databases using Docker.
+AgentIAM enforces automated quality gates in continuous integration. For full specifications, refer to [docs/CI_SECURITY_GATES.md](docs/CI_SECURITY_GATES.md).
 
-- To run all tests (including integration tests):
+- **Local Pre-Commit Pipeline:**
   ```bash
-  go test -v -race ./...
+  make ci-local
   ```
-  *(Note: Docker must be running for the integration tests to succeed).*
+  This runs `gofmt` compliance, `go mod verify`, retired `pgproto3/v2` guard, `go vet`, unit tests, and command builds.
+
+- **Race Detection:**
+  ```bash
+  make race
+  ```
+
+- **PostgreSQL 15 Integration Tests:**
+  ```bash
+  make test-integration
+  ```
+  *(Note: Docker must be running for integration tests to succeed).*
+
+- **Vulnerability Scanning:**
+  ```bash
+  make vulncheck
+  ```
 
 ## Making Changes
 
 Before submitting a Pull Request, please ensure the following:
-1. **Format & Lint Code**: Run `go fmt ./...` and `make lint` before committing. CI will fail if the code is unformatted or fails linting.
-2. **Add Tests**: If you fix a bug or add a new feature, add a corresponding test. Integration tests are preferred for proxy-level behavior changes.
-3. **Check CI**: Our GitHub Actions workflow checks formatting, module dependencies (`go.sum`), and runs the full test suite with the Go `-race` detector enabled.
+1. **Format Code**: Run `make fmt` before committing. CI enforces strict `gofmt` cleanliness.
+2. **Static Analysis**: Run `make vet` and `make lint`.
+3. **Verify Dependencies**: Ensure `go mod verify` passes and no retired or vulnerable dependencies are introduced.
+4. **Integration Coverage**: New features or security fixes must include unit and integration tests under `internal/proxy` or `internal/ast`.
 
 ## Architecture
 
-AgentIAM is an AST-filtering wire proxy. It parses the PostgreSQL wire protocol (`pgproto3`), intercepts queries, parses the AST using `pg_query_go`, applies YAML-based policies, and proxies safe queries upstream. 
+AgentIAM is an AST-filtering wire proxy. It parses PostgreSQL wire-protocol frames via `github.com/jackc/pgx/v5/pgproto3`, intercepts queries, performs semantic analysis via `wasilibs/go-pgquery`, validates view provenance and schema drift against live catalogs, and proxies sanitized queries upstream.
 
-Please read the [Architecture section in the README](README.md#%EF%B8%8F-architecture) for details on the goroutine multiplexing and PgBouncer topology before making deep changes to `internal/proxy/session.go`.
+Please read the [Architecture section in the README](README.md#%EF%B8%8F-architecture) and [docs/DEPLOYMENT_SECURITY.md](docs/DEPLOYMENT_SECURITY.md) before making changes to session dispatch or catalog verification.

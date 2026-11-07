@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"regexp"
@@ -21,7 +22,41 @@ import (
 	"github.com/jackc/pgx/v5/pgproto3"
 )
 
-var setCmdRegex = regexp.MustCompile(`(?i)^\s*SET\s+([a-zA-Z0-9_]+)\s*(?:TO|=)\s*(.+)$`)
+// DefaultMaxProtocolBodyLen defines the maximum permitted message body size (64MB)
+// to defend against memory exhaustion attacks from corrupt or malicious peers.
+const DefaultMaxProtocolBodyLen = 64 * 1024 * 1024
+
+var (
+	setCmdRegex = regexp.MustCompile(`(?i)^\s*SET\s+([a-zA-Z0-9_]+)\s*(?:TO|=)\s*(.+)$`)
+
+	testPanicMu                sync.RWMutex
+	testPanicHook              func()
+	testPanicOnUpstreamReceive func()
+)
+
+func SetTestPanicHook(fn func()) {
+	testPanicMu.Lock()
+	defer testPanicMu.Unlock()
+	testPanicHook = fn
+}
+
+func getTestPanicHook() func() {
+	testPanicMu.RLock()
+	defer testPanicMu.RUnlock()
+	return testPanicHook
+}
+
+func SetTestPanicOnUpstreamReceive(fn func()) {
+	testPanicMu.Lock()
+	defer testPanicMu.Unlock()
+	testPanicOnUpstreamReceive = fn
+}
+
+func getTestPanicOnUpstreamReceive() func() {
+	testPanicMu.RLock()
+	defer testPanicMu.RUnlock()
+	return testPanicOnUpstreamReceive
+}
 
 type PreparedStatement struct {
 	SQL           string
@@ -51,12 +86,21 @@ func NewPostgresProtocolHandler(upstreamDSN string, store *policy.Store, tlsConf
 
 func (h *PostgresProtocolHandler) HandleSession(ctx context.Context, clientConn net.Conn) error {
 	clientBackend := pgproto3.NewBackend(clientConn, clientConn)
+	clientBackend.SetMaxBodyLen(DefaultMaxProtocolBodyLen)
 	clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	startupMsg, err := clientBackend.ReceiveStartupMessage()
 	clientConn.SetReadDeadline(time.Time{})
 
 	if err != nil {
-		h.logger.Error("Failed to read startup message", "error", err)
+		var maxLenErr *pgproto3.ExceededMaxBodyLenErr
+		if errors.As(err, &maxLenErr) {
+			h.logger.Error("Startup message exceeded maximum allowed protocol body length",
+				"max", maxLenErr.MaxExpectedBodyLen,
+				"actual", maxLenErr.ActualBodyLen,
+			)
+		} else {
+			h.logger.Error("Failed to read startup message", "error", err)
+		}
 		return err
 	}
 
@@ -79,19 +123,24 @@ type Session struct {
 	upstreamDSN string
 	uconnMu     sync.Mutex
 
-	store  *policy.Store
-	logger *Logger
-	server *Server
+	store        *policy.Store
+	logger       *Logger
+	server       *Server
 	insecureAuth bool
 
 	clientBackend *pgproto3.Backend
 
-	errorDiscard atomic.Bool
-	canceled     atomic.Bool
-	closed       atomic.Bool
-	rules        ast.Rules
-	tlsConfig    *tls.Config
-	closeOnce    sync.Once
+	errorDiscard  atomic.Bool
+	invalidated   atomic.Bool
+	canceled      atomic.Bool
+	closed        atomic.Bool
+	authVersion   int
+	rules         ast.Rules
+	tlsConfig     *tls.Config
+	closeOnce     sync.Once
+	revokeOnce    sync.Once
+	clientWriteMu sync.Mutex
+	cancel        context.CancelFunc
 
 	startupMsg pgproto3.FrontendMessage
 	virtualPID uint32
@@ -106,7 +155,79 @@ type Session struct {
 	clientID           string
 }
 
+func (s *Session) isPolicyRevoked() bool {
+	if s.invalidated.Load() {
+		return true
+	}
+	if s.store != nil && s.clientID != "" {
+		currentVer := s.store.GetAgentVersion(s.clientID)
+		if currentVer != -1 && currentVer != s.authVersion {
+			s.invalidated.Store(true)
+			return true
+		}
+	}
+	return false
+}
+
+// TerminateWithPolicyRevocation coordinates graceful session termination on policy revocation.
+// It invalidates the session, curtails in-flight writes to a bounded deadline,
+// acquires exclusive write ownership without raw socket drains, delivers SQLSTATE 57P01,
+// and cleanly tears down the session context and socket.
+func (s *Session) TerminateWithPolicyRevocation() {
+	s.revokeOnce.Do(func() {
+		s.invalidated.Store(true)
+		s.errorDiscard.Store(true)
+		s.CancelQuery()
+
+		// Curtail any active client write immediately to a bounded 5-second deadline
+		if s.clientConn != nil {
+			_ = s.clientConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		}
+
+		// Bounded acquisition of clientWriteMu (up to 5 seconds) to ensure teardown cannot hang
+		acquireDeadline := time.Now().Add(5 * time.Second)
+		acquired := false
+		for time.Now().Before(acquireDeadline) {
+			if s.clientWriteMu.TryLock() {
+				acquired = true
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+
+		if acquired {
+			if s.clientConn != nil && s.clientBackend != nil {
+				_ = s.clientConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+				s.clientBackend.Send(&pgproto3.ErrorResponse{
+					Severity: "FATAL",
+					Code:     "57P01",
+					Message:  "AgentIAM Policy Violation: active session policy was revoked or updated",
+				})
+				_ = s.clientBackend.Flush()
+				_ = s.clientConn.SetWriteDeadline(time.Time{})
+
+				// Graceful half-close across plain TCP and TLS-wrapped connections
+				if cw, ok := s.clientConn.(interface{ CloseWrite() error }); ok {
+					_ = cw.CloseWrite()
+				}
+			}
+			s.clientWriteMu.Unlock()
+		} else if s.logger != nil {
+			s.logger.Warn("Failed to acquire clientWriteMu within 5s deadline on policy revocation, proceeding to forced teardown",
+				"client_id", s.clientID,
+			)
+		}
+
+		if s.cancel != nil {
+			s.cancel()
+		}
+		s.Close()
+	})
+}
+
 func NewSession(clientConn net.Conn, upstreamDSN string, store *policy.Store, tlsConfig *tls.Config, logger *Logger, server *Server, insecureAuth bool) *Session {
+	be := pgproto3.NewBackend(clientConn, clientConn)
+	be.SetMaxBodyLen(DefaultMaxProtocolBodyLen)
 	return &Session{
 		clientConn:         clientConn,
 		upstreamDSN:        upstreamDSN,
@@ -115,7 +236,7 @@ func NewSession(clientConn net.Conn, upstreamDSN string, store *policy.Store, tl
 		logger:             logger,
 		server:             server,
 		insecureAuth:       insecureAuth,
-		clientBackend:      pgproto3.NewBackend(clientConn, clientConn),
+		clientBackend:      be,
 		preparedStatements: make(map[string]PreparedStatement),
 		sessionVars:        make(map[string]string),
 	}
@@ -137,13 +258,40 @@ func (s *Session) CancelQuery() {
 	}
 }
 
-func (s *Session) Run() error {
+func (s *Session) Run() (err error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	s.cancel = cancel
+
+	defer func() {
+		if r := recover(); r != nil {
+			s.logger.Error("Panic recovered in session lifecycle",
+				"event", "session_worker_panic",
+				"client_id", s.clientID,
+				"addr", s.clientConn.RemoteAddr(),
+				"panic_type", panicType(r),
+				"panic_summary", safePanicSummary(r),
+				"stack", sanitizedStackTrace(),
+			)
+			s.recoverBrokenTransaction()
+			s.Close()
+			err = fmt.Errorf("session terminated due to unexpected panic (%s)", panicType(r))
+		}
+	}()
 
 	s.lastClientActivity.Store(time.Now().UnixNano())
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				s.logger.Error("Panic recovered in idle watchdog",
+					"event", "idle_watchdog_panic",
+					"client_id", s.clientID,
+					"panic_type", panicType(r),
+					"panic_summary", safePanicSummary(r),
+				)
+			}
+		}()
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for {
@@ -169,7 +317,6 @@ func (s *Session) Run() error {
 	}()
 
 	var clientID string
-	var err error
 
 	for i := 0; i < 3; i++ {
 		if s.startupMsg == nil {
@@ -209,6 +356,7 @@ func (s *Session) Run() error {
 
 			s.clientConn = tlsConn
 			s.clientBackend = pgproto3.NewBackend(s.clientConn, s.clientConn)
+			s.clientBackend.SetMaxBodyLen(DefaultMaxProtocolBodyLen)
 			s.startupMsg = nil
 			continue
 
@@ -258,10 +406,10 @@ func (s *Session) Run() error {
 	if !mtlsVerified {
 		if strings.HasPrefix(agentKey, "SCRAM-SHA-256$") {
 			s.clientBackend.Send(&pgproto3.AuthenticationSASL{AuthMechanisms: []string{"SCRAM-SHA-256"}})
-			if err := s.clientBackend.Flush(); err != nil {
-				return err
-			}
 			s.clientBackend.SetAuthType(pgproto3.AuthTypeSASL)
+			if err := s.clientBackend.Flush(); err != nil {
+				return fmt.Errorf("error flushing SASL mechanisms: %w", err)
+			}
 
 			s.clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
 			authMsg, err := s.clientBackend.Receive()
@@ -302,7 +450,7 @@ func (s *Session) Run() error {
 			serverFirst := fmt.Sprintf("r=%s,s=%s,i=%d", serverNonce, saltStr, iters)
 			s.clientBackend.Send(&pgproto3.AuthenticationSASLContinue{Data: []byte(serverFirst)})
 			if err := s.clientBackend.Flush(); err != nil {
-				return err
+				return fmt.Errorf("error flushing SASL continue: %w", err)
 			}
 
 			s.clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -333,14 +481,16 @@ func (s *Session) Run() error {
 			}
 
 			s.clientBackend.Send(&pgproto3.AuthenticationSASLFinal{Data: []byte("v=" + serverSignature)})
-			_ = s.clientBackend.Flush()
+			if err := s.clientBackend.Flush(); err != nil {
+				return fmt.Errorf("error flushing SASL final: %w", err)
+			}
 			mtlsVerified = true // Re-use mtlsVerified to signify pre-verified auth (SCRAM)
 		} else {
 			s.clientBackend.Send(&pgproto3.AuthenticationCleartextPassword{})
-			if err := s.clientBackend.Flush(); err != nil {
-				return err
-			}
 			s.clientBackend.SetAuthType(pgproto3.AuthTypeCleartextPassword)
+			if err := s.clientBackend.Flush(); err != nil {
+				return fmt.Errorf("error flushing cleartext password request: %w", err)
+			}
 
 			s.clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
 			authMsg, err := s.clientBackend.Receive()
@@ -363,7 +513,11 @@ func (s *Session) Run() error {
 		_ = s.clientBackend.Flush()
 		return fmt.Errorf("password auth failed")
 	}
+	if s.server != nil && s.server.verifier != nil {
+		rules = s.server.verifier.EnrichRulesWithVerifiedViews(clientID, authVersion, rules)
+	}
 	s.rules = rules
+	s.authVersion = authVersion
 	s.clientID = clientID
 
 	s.clientBackend.Send(&pgproto3.AuthenticationOk{})
@@ -383,7 +537,7 @@ func (s *Session) Run() error {
 	s.clientBackend.Send(&pgproto3.BackendKeyData{ProcessID: s.virtualPID, SecretKey: secBytes})
 	s.clientBackend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
 	if err := s.clientBackend.Flush(); err != nil {
-		return err
+		return fmt.Errorf("failed to flush startup responses: %w", err)
 	}
 
 	return s.proxyLoop(ctx, cancel, clientID)
@@ -408,65 +562,82 @@ func (s *Session) getOrAcquireUpstream(ctx context.Context, clientWriteCh chan p
 	if timeout <= 0 {
 		timeout = 5000 // default fallback
 	}
-	
+
 	stateQueries := make([]string, 0, len(s.sessionVars)+1)
 	stateQueries = append(stateQueries, fmt.Sprintf("SET statement_timeout = '%dms'", timeout))
 	for k, v := range s.sessionVars {
 		// Prevent attackers from overriding security timeouts
 		if strings.EqualFold(k, "statement_timeout") {
-			continue 
+			continue
 		}
 		stateQueries = append(stateQueries, fmt.Sprintf("SET %s = %s", k, v))
 	}
 
-	for range stateQueries {
+	u.frontendMu.Lock()
+	for _, q := range stateQueries {
 		u.SwallowSetTimeout.Add(1)
+		u.Frontend.Send(&pgproto3.Query{String: q})
 	}
-	if len(stateQueries) > 0 {
-		u.mu.Lock()
-		for _, q := range stateQueries {
-			u.Frontend.Send(&pgproto3.Query{String: q})
+	flushErr := u.Frontend.Flush()
+	if flushErr != nil {
+		u.Broken.Store(true)
+	}
+	u.frontendMu.Unlock()
+
+	if flushErr != nil {
+		if s.server != nil && s.server.pool != nil {
+			s.server.pool.Release(u)
+		} else {
+			u.Close()
 		}
-		err := u.Frontend.Flush()
-		u.mu.Unlock()
-		if err != nil {
-			u.Broken.Store(true)
-			if s.server != nil && s.server.pool != nil {
-				s.server.pool.Release(u)
-			} else {
-				u.Close()
-			}
-			return nil, err
-		}
+		return nil, fmt.Errorf("failed to flush session state queries: %w", flushErr)
 	}
 
 	s.uconn = u
 
 	go func() {
+		cleanedUp := false
 		defer func() {
 			if r := recover(); r != nil {
-				s.logger.Error("Uncaught panic in upstream reader goroutine; terminating session", "panic", r, "client", s.clientID)
+				s.logger.Error("Panic recovered in upstream response reader",
+					"event", "upstream_reader_panic",
+					"client_id", s.clientID,
+					"panic_type", panicType(r),
+					"panic_summary", safePanicSummary(r),
+					"stack", sanitizedStackTrace(),
+				)
 				u.Broken.Store(true)
-				s.uconnMu.Lock()
-				isActive := (s.uconn == u)
-				s.uconnMu.Unlock()
 				s.releaseUpstream(u)
-				if isActive {
+				if s.cancel != nil {
+					s.cancel()
+				} else {
 					s.Close()
 				}
+			} else if !cleanedUp {
+				u.Broken.Store(true)
+				s.releaseUpstream(u)
 			}
 		}()
 
 		for {
+			if fn := getTestPanicOnUpstreamReceive(); fn != nil {
+				fn()
+			}
 			msg, err := u.Frontend.Receive()
 			if err != nil {
-				s.logger.Error("Upstream read error; terminating session", "error", err, "client", s.clientID)
+				var maxLenErr *pgproto3.ExceededMaxBodyLenErr
+				if errors.As(err, &maxLenErr) {
+					s.logger.Error("Upstream message exceeded maximum permitted body length",
+						"max", maxLenErr.MaxExpectedBodyLen,
+						"actual", maxLenErr.ActualBodyLen,
+					)
+				}
 				u.Broken.Store(true)
-				s.uconnMu.Lock()
-				isActive := (s.uconn == u)
-				s.uconnMu.Unlock()
+				cleanedUp = true
 				s.releaseUpstream(u)
-				if isActive {
+				if s.cancel != nil {
+					s.cancel()
+				} else {
 					s.Close()
 				}
 				return
@@ -539,11 +710,15 @@ func (s *Session) getOrAcquireUpstream(ctx context.Context, clientWriteCh chan p
 				u.TxStatus = rfq.TxStatus
 				if rfq.TxStatus == 'I' {
 					if s.rules.PoolMode != "session" {
+						// Allocate independent ReadyForQuery to decouple from u.Frontend's internal buffer
+						// before releasing u back to the pool cleanup worker.
+						rfqCopy := &pgproto3.ReadyForQuery{TxStatus: rfq.TxStatus}
 						select {
 						case <-ctx.Done():
 							return
-						case clientWriteCh <- msg:
+						case clientWriteCh <- rfqCopy:
 						}
+						cleanedUp = true
 						s.releaseUpstream(u)
 						return
 					}
@@ -561,22 +736,49 @@ func (s *Session) getOrAcquireUpstream(ctx context.Context, clientWriteCh chan p
 	return u, nil
 }
 
-func (s *Session) releaseUpstream(target *UpstreamConn) {
-	if target == nil {
+// sendAndFlushUpstream safely serializes access to the upstream pgproto3.Frontend encoder,
+// flushes the buffered message, and ensures failed flushes mark the connection unusable.
+func (s *Session) sendAndFlushUpstream(u *UpstreamConn, msg pgproto3.FrontendMessage) error {
+	u.frontendMu.Lock()
+	defer u.frontendMu.Unlock()
+
+	if u.State() != ConnStateInUse || u.Broken.Load() {
+		return fmt.Errorf("upstream connection is not in use or broken")
+	}
+
+	u.Frontend.Send(msg)
+	if err := u.Frontend.Flush(); err != nil {
+		u.Broken.Store(true)
+		return fmt.Errorf("failed to flush message to upstream: %w", err)
+	}
+	return nil
+}
+
+func (s *Session) releaseUpstream(targets ...*UpstreamConn) {
+	if len(targets) > 0 && targets[0] == nil {
 		return
 	}
 	s.uconnMu.Lock()
-	if s.uconn != target {
-		s.uconnMu.Unlock()
-		return
+	u := s.uconn
+	if len(targets) > 0 {
+		if s.uconn != targets[0] {
+			s.uconnMu.Unlock()
+			return
+		}
 	}
 	s.uconn = nil
 	s.uconnMu.Unlock()
 
-	if s.server != nil && s.server.pool != nil {
-		s.server.pool.Release(target)
-	} else {
-		target.Close()
+	if u != nil {
+		// Wait for any pending session frontend sends and flushes to complete before ownership transfers to pool
+		u.frontendMu.Lock()
+		_ = u.Broken.Load()
+		u.frontendMu.Unlock()
+		if s.server != nil && s.server.pool != nil {
+			s.server.pool.Release(u)
+		} else {
+			u.Close()
+		}
 	}
 }
 
@@ -602,11 +804,36 @@ func (s *Session) handleParseMsg(ctx context.Context, v *pgproto3.Parse, clientW
 	_, span := Tracer.Start(ctx, "proxy.Parse")
 	defer span.End()
 
+	if s.isPolicyRevoked() {
+		s.TerminateWithPolicyRevocation()
+		return fmt.Errorf("session policy revoked")
+	}
 	if s.errorDiscard.Load() {
 		return nil
 	}
 
-	rewrittenSQL, limitParams, err := (&ast.PostgresParser{}).ApplyRules(v.Query, s.rules, s.server.astCache)
+	if s.server != nil && s.server.verifier != nil && len(s.rules.Views) > 0 {
+		refs, refErr := ast.ExtractReferencedRelations(v.Query)
+		if refErr == nil && len(refs) > 0 {
+			if freshErr := s.server.verifier.EnsureFreshness(ctx, s.clientID, s.authVersion, &s.rules, refs); freshErr != nil {
+				s.server.DispatchAudit(AuditEvent{Event: EventPolicyBlocked, ClientID: s.clientID, SQL: v.Query, Status: "blocked", Error: freshErr.Error()})
+				BlockedQueriesTotal.WithLabelValues("policy").Inc()
+				clientWriteCh <- &pgproto3.ErrorResponse{
+					Severity: "ERROR",
+					Code:     "57P01",
+					Message:  fmt.Sprintf("AgentIAM Policy Violation: %v", freshErr),
+				}
+				s.errorDiscard.Store(true)
+				return nil
+			}
+		}
+	}
+
+	currentRules := s.rules
+	if s.server != nil && s.server.verifier != nil {
+		currentRules = s.server.verifier.EnrichRulesWithVerifiedViews(s.clientID, s.authVersion, s.rules)
+	}
+	rewrittenSQL, limitParams, err := (&ast.PostgresParser{}).ApplyRules(v.Query, currentRules, s.server.astCache)
 	if err != nil {
 		s.server.DispatchAudit(AuditEvent{Event: EventPolicyBlocked, ClientID: s.clientID, SQL: v.Query, Status: "blocked", Error: err.Error()})
 		BlockedQueriesTotal.WithLabelValues("policy").Inc()
@@ -633,7 +860,7 @@ func (s *Session) handleParseMsg(ctx context.Context, v *pgproto3.Parse, clientW
 	if err != nil {
 		return err
 	}
-	return u.SendAndFlush(v)
+	return s.sendAndFlushUpstream(u, v)
 }
 
 // handleBindMsg processes a Bind message (Extended Query Protocol).
@@ -642,6 +869,10 @@ func (s *Session) handleBindMsg(ctx context.Context, v *pgproto3.Bind, clientWri
 	_, span := Tracer.Start(ctx, "proxy.Bind")
 	defer span.End()
 
+	if s.isPolicyRevoked() {
+		s.TerminateWithPolicyRevocation()
+		return fmt.Errorf("session policy revoked")
+	}
 	if s.errorDiscard.Load() {
 		return nil
 	}
@@ -664,9 +895,33 @@ func (s *Session) handleBindMsg(ctx context.Context, v *pgproto3.Bind, clientWri
 		return err
 	}
 
+	u.frontendMu.Lock()
+	defer u.frontendMu.Unlock()
+
+	if u.State() != ConnStateInUse || u.Broken.Load() {
+		return fmt.Errorf("upstream connection is not in use or broken")
+	}
+
 	ps, exists := s.preparedStatements[v.PreparedStatement]
 	var parseMsg *pgproto3.Parse
 	if exists {
+		if s.server != nil && s.server.verifier != nil && len(s.rules.Views) > 0 {
+			refs, refErr := ast.ExtractReferencedRelations(ps.SQL)
+			if refErr == nil && len(refs) > 0 {
+				if freshErr := s.server.verifier.EnsureFreshness(ctx, s.clientID, s.authVersion, &s.rules, refs); freshErr != nil {
+					s.server.DispatchAudit(AuditEvent{Event: EventPolicyBlocked, ClientID: s.clientID, SQL: ps.SQL, Status: "blocked", Error: freshErr.Error()})
+					BlockedQueriesTotal.WithLabelValues("policy").Inc()
+					clientWriteCh <- &pgproto3.ErrorResponse{
+						Severity: "FATAL",
+						Code:     "57P01",
+						Message:  fmt.Sprintf("AgentIAM Policy Violation: %v", freshErr),
+					}
+					s.errorDiscard.Store(true)
+					return nil
+				}
+			}
+		}
+
 		u.SwallowParseComplete.Add(1)
 		parseMsg = &pgproto3.Parse{
 			Name:          "",
@@ -724,18 +979,31 @@ func (s *Session) handleBindMsg(ctx context.Context, v *pgproto3.Bind, clientWri
 	v.PreparedStatement = ""
 	v.DestinationPortal = ""
 	if parseMsg != nil {
-		return u.SendAndFlush(parseMsg, v)
+		u.Frontend.Send(parseMsg)
 	}
-	return u.SendAndFlush(v)
+	u.Frontend.Send(v)
+	if err := u.Frontend.Flush(); err != nil {
+		u.Broken.Store(true)
+		return fmt.Errorf("failed to flush bind message: %w", err)
+	}
+	return nil
 }
 
 // handleQueryMsg processes a simple Query message (Simple Query Protocol).
 // It applies rate limiting, AST rules, tracks SET vars, and forwards upstream.
 func (s *Session) handleQueryMsg(ctx context.Context, v *pgproto3.Query, clientWriteCh chan pgproto3.BackendMessage) error {
+	if fn := getTestPanicHook(); fn != nil {
+		fn()
+	}
 	s.queryRunning.Store(true)
 	s.queryStartTime.Store(time.Now().UnixNano())
 	_, span := Tracer.Start(ctx, "proxy.Query")
 	defer span.End()
+
+	if s.isPolicyRevoked() {
+		s.TerminateWithPolicyRevocation()
+		return fmt.Errorf("session policy revoked")
+	}
 
 	if s.server.pool != nil {
 		s.server.store.SetPoolLatency(s.server.pool.GetAvgAcquireDuration())
@@ -752,7 +1020,28 @@ func (s *Session) handleQueryMsg(ctx context.Context, v *pgproto3.Query, clientW
 		return nil
 	}
 
-	rewrittenSQL, _, err := (&ast.PostgresParser{}).ApplyRules(v.String, s.rules, s.server.astCache)
+	if s.server != nil && s.server.verifier != nil && len(s.rules.Views) > 0 {
+		refs, refErr := ast.ExtractReferencedRelations(v.String)
+		if refErr == nil && len(refs) > 0 {
+			if freshErr := s.server.verifier.EnsureFreshness(ctx, s.clientID, s.authVersion, &s.rules, refs); freshErr != nil {
+				s.server.DispatchAudit(AuditEvent{Event: EventPolicyBlocked, ClientID: s.clientID, SQL: v.String, Status: "blocked", Error: freshErr.Error()})
+				BlockedQueriesTotal.WithLabelValues("policy").Inc()
+				clientWriteCh <- &pgproto3.ErrorResponse{
+					Severity: "ERROR",
+					Code:     "57P01",
+					Message:  fmt.Sprintf("AgentIAM Policy Violation: %v", freshErr),
+				}
+				clientWriteCh <- &pgproto3.ReadyForQuery{TxStatus: 'I'}
+				return nil
+			}
+		}
+	}
+
+	currentRules := s.rules
+	if s.server != nil && s.server.verifier != nil {
+		currentRules = s.server.verifier.EnrichRulesWithVerifiedViews(s.clientID, s.authVersion, s.rules)
+	}
+	rewrittenSQL, _, err := (&ast.PostgresParser{}).ApplyRules(v.String, currentRules, s.server.astCache)
 	if err != nil {
 		s.server.DispatchAudit(AuditEvent{Event: EventPolicyBlocked, ClientID: s.clientID, SQL: v.String, Status: "blocked", Error: err.Error()})
 		BlockedQueriesTotal.WithLabelValues("policy").Inc()
@@ -782,7 +1071,7 @@ func (s *Session) handleQueryMsg(ctx context.Context, v *pgproto3.Query, clientW
 	if err != nil {
 		return err
 	}
-	return u.SendAndFlush(v)
+	return s.sendAndFlushUpstream(u, v)
 }
 
 // handleSyncMsg processes a Sync message (Extended Query Protocol).
@@ -803,7 +1092,7 @@ func (s *Session) handleSyncMsg(ctx context.Context, v *pgproto3.Sync, clientWri
 	if err != nil {
 		return err
 	}
-	return u.SendAndFlush(v)
+	return s.sendAndFlushUpstream(u, v)
 }
 
 // proxyLoop is the main read loop for a session.
@@ -814,6 +1103,18 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 	// Writer goroutine: drains clientWriteCh and sends to the client connection.
 	go func() {
 		defer cancel()
+		defer func() {
+			if r := recover(); r != nil {
+				s.logger.Error("Panic recovered in client writer goroutine",
+					"event", "client_writer_panic",
+					"client_id", s.clientID,
+					"panic_type", panicType(r),
+					"panic_summary", safePanicSummary(r),
+					"stack", sanitizedStackTrace(),
+				)
+				s.recoverBrokenTransaction()
+			}
+		}()
 		for {
 			select {
 			case <-ctx.Done():
@@ -822,14 +1123,24 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 				if !ok {
 					return
 				}
-				s.clientBackend.Send(msg)
-				for len(clientWriteCh) > 0 {
-					next := <-clientWriteCh
-					s.clientBackend.Send(next)
+				s.clientWriteMu.Lock()
+				if !s.errorDiscard.Load() {
+					_ = s.clientConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+					s.clientBackend.Send(msg)
+					for len(clientWriteCh) > 0 {
+						next := <-clientWriteCh
+						s.clientBackend.Send(next)
+					}
+					flushErr := s.clientBackend.Flush()
+					if !s.errorDiscard.Load() {
+						_ = s.clientConn.SetWriteDeadline(time.Time{})
+					}
+					if flushErr != nil {
+						s.clientWriteMu.Unlock()
+						return
+					}
 				}
-				if err := s.clientBackend.Flush(); err != nil {
-					return
-				}
+				s.clientWriteMu.Unlock()
 			}
 		}
 	}()
@@ -841,6 +1152,19 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 		msg, err := s.clientBackend.Receive()
 
 		if err != nil {
+			var maxLenErr *pgproto3.ExceededMaxBodyLenErr
+			if errors.As(err, &maxLenErr) {
+				s.logger.Error("Client message exceeded maximum permitted body length",
+					"max", maxLenErr.MaxExpectedBodyLen,
+					"actual", maxLenErr.ActualBodyLen,
+					"client", s.clientConn.RemoteAddr(),
+				)
+				s.clientBackend.Send(&pgproto3.ErrorResponse{
+					Severity: "FATAL",
+					Message:  "Query message exceeded maximum permitted protocol body length",
+				})
+				_ = s.clientBackend.Flush()
+			}
 			s.recoverBrokenTransaction()
 			return err
 		}
@@ -852,6 +1176,11 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 			s.recoverBrokenTransaction()
 			return ctx.Err()
 		default:
+		}
+
+		if _, isTerm := msg.(*pgproto3.Terminate); !isTerm && s.isPolicyRevoked() {
+			s.TerminateWithPolicyRevocation()
+			return fmt.Errorf("session policy revoked")
 		}
 
 		switch v := msg.(type) {
@@ -871,34 +1200,42 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 				span.End()
 				continue
 			}
+			if s.isPolicyRevoked() {
+				span.End()
+				s.TerminateWithPolicyRevocation()
+				return fmt.Errorf("session policy revoked")
+			}
 			u, err := s.getOrAcquireUpstream(ctx, clientWriteCh)
 			if err != nil {
 				span.End()
 				return err
 			}
-			var parseMsg *pgproto3.Parse
+			u.frontendMu.Lock()
+			if u.State() != ConnStateInUse || u.Broken.Load() {
+				u.frontendMu.Unlock()
+				span.End()
+				return fmt.Errorf("upstream connection not in use or broken")
+			}
 			if v.ObjectType == 'S' {
 				ps, exists := s.preparedStatements[v.Name]
 				if exists {
 					u.SwallowParseComplete.Add(1)
-					parseMsg = &pgproto3.Parse{
+					u.Frontend.Send(&pgproto3.Parse{
 						Name:          "",
 						Query:         ps.SQL,
 						ParameterOIDs: ps.ParameterOIDs,
-					}
+					})
 				}
 			}
 			v.Name = ""
-			var sendErr error
-			if parseMsg != nil {
-				sendErr = u.SendAndFlush(parseMsg, v)
-			} else {
-				sendErr = u.SendAndFlush(v)
-			}
-			if sendErr != nil {
+			u.Frontend.Send(v)
+			if err := u.Frontend.Flush(); err != nil {
+				u.Broken.Store(true)
+				u.frontendMu.Unlock()
 				span.End()
-				return sendErr
+				return err
 			}
+			u.frontendMu.Unlock()
 			span.End()
 
 		case *pgproto3.Execute:
@@ -909,13 +1246,18 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 				span.End()
 				continue
 			}
+			if s.isPolicyRevoked() {
+				span.End()
+				s.TerminateWithPolicyRevocation()
+				return fmt.Errorf("session policy revoked")
+			}
 			u, err := s.getOrAcquireUpstream(ctx, clientWriteCh)
 			if err != nil {
 				span.End()
 				return err
 			}
 			v.Portal = ""
-			if err := u.SendAndFlush(v); err != nil {
+			if err := s.sendAndFlushUpstream(u, v); err != nil {
 				span.End()
 				return err
 			}
@@ -930,7 +1272,7 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 				u, err := s.getOrAcquireUpstream(ctx, clientWriteCh)
 				if err == nil {
 					v.Name = ""
-					_ = u.SendAndFlush(v)
+					_ = s.sendAndFlushUpstream(u, v)
 				}
 			}
 			span.End()
@@ -955,7 +1297,7 @@ func (s *Session) proxyLoop(ctx context.Context, cancel context.CancelFunc, clie
 				if err != nil {
 					return err
 				}
-				if err := u.SendAndFlush(msg); err != nil {
+				if err := s.sendAndFlushUpstream(u, msg); err != nil {
 					return err
 				}
 			}

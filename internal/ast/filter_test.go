@@ -1,9 +1,9 @@
 package ast
 
 import (
+	"github.com/tm-threemavithana/agentiam/internal/cache"
 	"strings"
 	"testing"
-	"github.com/tm-threemavithana/agentiam/internal/cache"
 )
 
 func TestApplyRules(t *testing.T) {
@@ -239,7 +239,7 @@ func TestApplyRules(t *testing.T) {
 			if !tt.expectLimit && strings.Contains(result, "LIMIT 100") {
 				t.Errorf("expected LIMIT 100 NOT to be injected, got: %s", result)
 			}
-			
+
 			if tt.name == "LIMIT $1 dynamic bypass" {
 				if len(limitParams) != 1 || limitParams[0] != 1 {
 					t.Errorf("expected limitParams to contain [1], got: %v", limitParams)
@@ -344,7 +344,7 @@ func TestPostgresWindowFunction_LimitEnforcement(t *testing.T) {
 			name:         "COUNT(*) scalar aggregate without OVER preserves analytical exemption",
 			sql:          "SELECT count(*) FROM users",
 			rules:        rules,
-			wantContains: "SELECT count(*) FROM users",
+			wantContains: "SELECT count(*) FROM public.users",
 		},
 		{
 			name:         "Mixed window functions with projected columns and excessive LIMIT clamps limit",
@@ -514,7 +514,6 @@ func TestAllowedTablesPostgres(t *testing.T) {
 		}
 	})
 }
-
 
 func TestPostgresAnalyticalClassification_NestedAndWindow(t *testing.T) {
 	rules := Rules{

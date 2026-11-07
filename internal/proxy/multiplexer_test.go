@@ -157,7 +157,7 @@ func TestMultiplexer_StateReplay(t *testing.T) {
 	if tzStr != "UTC" {
 		t.Errorf("Expected Client B timezone 'UTC', got '%s'", tzStr)
 	}
-	
+
 	// Print test logic block dummy variable to ignore unused
 	_ = tz
 }

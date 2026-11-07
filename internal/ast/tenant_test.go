@@ -144,7 +144,6 @@ func TestTenantIsolation_InsertBlocked(t *testing.T) {
 	}
 }
 
-
 func TestTenantIsolation_Update_TenantColumnProhibited(t *testing.T) {
 	rules := Rules{
 		AllowedStatements: []string{"UPDATE", "SELECT"},

@@ -1,10 +1,10 @@
 package main
 
 import (
-	"github.com/tm-threemavithana/agentiam/internal/policy"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"github.com/tm-threemavithana/agentiam/internal/policy"
 	"os"
 	"strings"
 	"time"

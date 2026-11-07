@@ -207,11 +207,11 @@ func TestInitTracer_OTLPExport_CollectorError_429(t *testing.T) {
 // TestInitTracer_OTLPExport_OversizedResponse verifies bounded response reading on collector error.
 //
 // Security Guarantee Documentation:
-// - Upstream Fix (CVE-2026-27616 / GO-2026-4985): Patched go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp
-//   v1.47.0 bounds HTTP response body reading to 4 MB (4194304 bytes), preventing unbounded allocation / OOM when interacting
-//   with misconfigured or hostile telemetry backends.
-// - Local Regression Test: Verifies that AgentIAM's tracer integration completes within bounded time, captures the
-//   "response body too large" error condition predictably, and does not crash or terminate the process.
+//   - Upstream Fix (CVE-2026-27616 / GO-2026-4985): Patched go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp
+//     v1.47.0 bounds HTTP response body reading to 4 MB (4194304 bytes), preventing unbounded allocation / OOM when interacting
+//     with misconfigured or hostile telemetry backends.
+//   - Local Regression Test: Verifies that AgentIAM's tracer integration completes within bounded time, captures the
+//     "response body too large" error condition predictably, and does not crash or terminate the process.
 func TestInitTracer_OTLPExport_OversizedResponse(t *testing.T) {
 	var receivedCount int32
 	// 5 MB response payload exceeding the 4 MB limit in otlptracehttp v1.47.0

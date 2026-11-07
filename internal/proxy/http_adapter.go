@@ -148,7 +148,7 @@ func (h *HTTPInterceptor) interceptSQLPayload(w http.ResponseWriter, r *http.Req
 	r.Body = io.NopCloser(bytes.NewReader(newBodyBytes))
 	r.ContentLength = int64(len(newBodyBytes))
 	r.Header.Set("Content-Length", fmt.Sprintf("%d", len(newBodyBytes)))
-	
+
 	h.logger.Info("HTTP Intercept: SQL Rewritten successfully", "agent", agentID)
 	h.reverseProxy.ServeHTTP(w, r)
 }

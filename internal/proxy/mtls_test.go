@@ -17,9 +17,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tm-threemavithana/agentiam/internal/policy"
-
 	"github.com/jackc/pgx/v5/pgproto3"
+	"github.com/tm-threemavithana/agentiam/internal/policy"
 )
 
 func generateTestCA() (tls.Certificate, *x509.Certificate, error) {

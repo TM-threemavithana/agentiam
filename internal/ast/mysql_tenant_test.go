@@ -177,7 +177,6 @@ func TestMySQLTenantIsolation_InsertBlocked(t *testing.T) {
 	}
 }
 
-
 func TestMySQLTenantIsolation_Update_TenantColumnProhibited(t *testing.T) {
 	parser := &ast.MySQLParser{}
 	rules := ast.Rules{

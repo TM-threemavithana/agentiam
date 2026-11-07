@@ -20,8 +20,8 @@ import (
 	"github.com/tm-threemavithana/agentiam/internal/policy"
 	"github.com/tm-threemavithana/agentiam/internal/proxy"
 
-	driver "github.com/go-sql-driver/mysql"
 	_ "github.com/go-sql-driver/mysql"
+	driver "github.com/go-sql-driver/mysql"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/mysql"
 	"github.com/testcontainers/testcontainers-go/wait"

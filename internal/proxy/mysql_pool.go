@@ -434,7 +434,6 @@ func (p *MySQLPool) Close() {
 
 		p.closeMu.Lock()
 		defer p.closeMu.Unlock()
-
 		for {
 			select {
 			case u := <-p.conns:

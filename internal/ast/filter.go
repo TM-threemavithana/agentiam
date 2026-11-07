@@ -13,8 +13,8 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 
-	"github.com/tm-threemavithana/agentiam/internal/cache"
 	pg_query "github.com/pganalyze/pg_query_go/v6"
+	"github.com/tm-threemavithana/agentiam/internal/cache"
 	"github.com/wasilibs/go-pgquery/parser"
 	"google.golang.org/protobuf/proto"
 )
@@ -72,14 +72,12 @@ func (p *PostgresParser) ApplyRules(sql string, rules Rules, astCache cache.ASTC
 				return "", nil, fmt.Errorf("policy violation: query complexity %d exceeds maximum of %d", complexity, rules.MaxComplexity)
 			}
 		}
-		// Enforce table-level access control for Postgres
-		if len(rules.AllowedTables) > 0 && !isAllowed("*", rules.AllowedTables) {
-			tables := extractPostgresTables(stmt.Stmt)
-			for _, tbl := range tables {
-				if !isAllowed(tbl, rules.AllowedTables) {
-					return "", nil, fmt.Errorf("access to table '%s' is not allowed by policy", tbl)
-				}
-			}
+		// Enforce relation-level access control (default-deny for tables and views)
+		if err := enforceRelationAccess(stmt.Stmt, rules); err != nil {
+			return "", nil, err
+		}
+		if err := CanonicalizeRelationSchemas(stmt.Stmt, rules); err != nil {
+			return "", nil, err
 		}
 		if err := InjectTenantIsolation(stmt.Stmt, rules); err != nil {
 			return "", nil, fmt.Errorf("tenant isolation blocked query: %w", err)
@@ -124,65 +122,190 @@ func isCacheable(sql string) bool {
 	return true
 }
 
-// extractPostgresTables walks an AST node and collects all referenced table names (RangeVar).
-func extractPostgresTables(node *pg_query.Node) []string {
+// RelationRef represents a referenced relation, optionally schema-qualified.
+type RelationRef struct {
+	Schema string
+	Name   string
+}
+
+// collectCTENames collects all Common Table Expression (CTE) names defined within a statement.
+// These are query-local aliases and should not be treated as database tables.
+func collectCTENames(node *pg_query.Node) map[string]bool {
+	ctes := make(map[string]bool)
+	collectCTEsRecursive(node, ctes)
+	return ctes
+}
+
+func collectCTEsRecursive(node *pg_query.Node, ctes map[string]bool) {
+	if node == nil {
+		return
+	}
+	if sel, ok := node.Node.(*pg_query.Node_SelectStmt); ok && sel.SelectStmt != nil {
+		if sel.SelectStmt.WithClause != nil {
+			for _, cteNode := range sel.SelectStmt.WithClause.Ctes {
+				if cte, ok2 := cteNode.Node.(*pg_query.Node_CommonTableExpr); ok2 && cte.CommonTableExpr != nil {
+					ctes[strings.ToLower(cte.CommonTableExpr.Ctename)] = true
+					collectCTEsRecursive(cte.CommonTableExpr.Ctequery, ctes)
+				}
+			}
+		}
+	}
+	if ins, ok := node.Node.(*pg_query.Node_InsertStmt); ok && ins.InsertStmt != nil && ins.InsertStmt.WithClause != nil {
+		for _, cteNode := range ins.InsertStmt.WithClause.Ctes {
+			if cte, ok2 := cteNode.Node.(*pg_query.Node_CommonTableExpr); ok2 && cte.CommonTableExpr != nil {
+				ctes[strings.ToLower(cte.CommonTableExpr.Ctename)] = true
+				collectCTEsRecursive(cte.CommonTableExpr.Ctequery, ctes)
+			}
+		}
+	}
+	if upd, ok := node.Node.(*pg_query.Node_UpdateStmt); ok && upd.UpdateStmt != nil && upd.UpdateStmt.WithClause != nil {
+		for _, cteNode := range upd.UpdateStmt.WithClause.Ctes {
+			if cte, ok2 := cteNode.Node.(*pg_query.Node_CommonTableExpr); ok2 && cte.CommonTableExpr != nil {
+				ctes[strings.ToLower(cte.CommonTableExpr.Ctename)] = true
+				collectCTEsRecursive(cte.CommonTableExpr.Ctequery, ctes)
+			}
+		}
+	}
+	if del, ok := node.Node.(*pg_query.Node_DeleteStmt); ok && del.DeleteStmt != nil && del.DeleteStmt.WithClause != nil {
+		for _, cteNode := range del.DeleteStmt.WithClause.Ctes {
+			if cte, ok2 := cteNode.Node.(*pg_query.Node_CommonTableExpr); ok2 && cte.CommonTableExpr != nil {
+				ctes[strings.ToLower(cte.CommonTableExpr.Ctename)] = true
+				collectCTEsRecursive(cte.CommonTableExpr.Ctequery, ctes)
+			}
+		}
+	}
+}
+
+// ExtractReferencedRelations parses SQL and extracts all relation names (RangeVar) referenced in it,
+// returning lowercase canonical identifiers (e.g. "public.customers" or "customers").
+func ExtractReferencedRelations(sql string) ([]string, error) {
+	b, err := parser.ParseToProtobuf(sql)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse SQL: %w", err)
+	}
+	var tree pg_query.ParseResult
+	if err := proto.Unmarshal(b, &tree); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal AST: %w", err)
+	}
+	var rels []string
+	seen := make(map[string]bool)
+	for _, stmt := range tree.Stmts {
+		refs := extractPostgresRelationRefs(stmt.Stmt)
+		for _, r := range refs {
+			name := QuoteIdentIfNeeded(r.Name)
+			if r.Schema != "" {
+				name = QuoteIdentIfNeeded(r.Schema) + "." + name
+			}
+			if !seen[name] {
+				seen[name] = true
+				rels = append(rels, name)
+			}
+		}
+	}
+	return rels, nil
+}
+
+// extractPostgresRelationRefs walks an AST node and collects all referenced relations (RangeVar),
+// ignoring query-local CTE names.
+func extractPostgresRelationRefs(node *pg_query.Node) []RelationRef {
 	if node == nil {
 		return nil
 	}
-	var tables []string
-	collectTables(node.Node, &tables)
-	return tables
+	cteNames := collectCTENames(node)
+	var refs []RelationRef
+	seen := make(map[string]bool)
+
+	collectRelationRefs(node.Node, cteNames, &refs, seen)
+	return refs
 }
 
-func collectTables(v interface{}, tables *[]string) {
+func collectRelationRefs(v interface{}, cteNames map[string]bool, refs *[]RelationRef, seen map[string]bool) {
 	if v == nil {
 		return
 	}
 
-	// Fast path type switch for common nodes
 	switch n := v.(type) {
 	case *pg_query.Node_RangeVar:
-		if n.RangeVar != nil && n.RangeVar.Relname != "" {
-			*tables = append(*tables, n.RangeVar.Relname)
+		rv := n.RangeVar
+		if rv != nil && rv.Relname != "" {
+			nameLower := strings.ToLower(rv.Relname)
+			if rv.Schemaname == "" && cteNames[nameLower] {
+				return
+			}
+			key := rv.Schemaname + "." + rv.Relname
+			if !seen[key] {
+				seen[key] = true
+				*refs = append(*refs, RelationRef{
+					Schema: rv.Schemaname,
+					Name:   rv.Relname,
+				})
+			}
+		}
+		return
+	case *pg_query.RangeVar:
+		rv := n
+		if rv != nil && rv.Relname != "" {
+			nameLower := strings.ToLower(rv.Relname)
+			if rv.Schemaname == "" && cteNames[nameLower] {
+				return
+			}
+			key := rv.Schemaname + "." + rv.Relname
+			if !seen[key] {
+				seen[key] = true
+				*refs = append(*refs, RelationRef{
+					Schema: rv.Schemaname,
+					Name:   rv.Relname,
+				})
+			}
 		}
 		return
 	case *pg_query.Node_SelectStmt:
 		sel := n.SelectStmt
-		if sel == nil { return }
-		collectTablesNodeSlice(sel.TargetList, tables)
-		collectTablesNodeSlice(sel.FromClause, tables)
-		collectTablesNode(sel.WhereClause, tables)
-		collectTablesNode(sel.WithClause, tables)
+		if sel == nil {
+			return
+		}
+		collectRelationRefsNodeSlice(sel.TargetList, cteNames, refs, seen)
+		collectRelationRefsNodeSlice(sel.FromClause, cteNames, refs, seen)
+		collectRelationRefs(sel.WhereClause, cteNames, refs, seen)
+		collectRelationRefs(sel.WithClause, cteNames, refs, seen)
 		return
 	case *pg_query.Node_JoinExpr:
 		join := n.JoinExpr
-		if join == nil { return }
-		collectTablesNode(join.Larg, tables)
-		collectTablesNode(join.Rarg, tables)
-		collectTablesNode(join.Quals, tables)
+		if join == nil {
+			return
+		}
+		collectRelationRefs(join.Larg, cteNames, refs, seen)
+		collectRelationRefs(join.Rarg, cteNames, refs, seen)
+		collectRelationRefs(join.Quals, cteNames, refs, seen)
 		return
 	case *pg_query.Node_InsertStmt:
 		ins := n.InsertStmt
-		if ins == nil { return }
-		collectTablesNode(ins.Relation, tables)
-		collectTablesNode(ins.SelectStmt, tables)
-		collectTablesNode(ins.WithClause, tables)
+		if ins == nil {
+			return
+		}
+		collectRelationRefs(ins.Relation, cteNames, refs, seen)
+		collectRelationRefs(ins.SelectStmt, cteNames, refs, seen)
+		collectRelationRefs(ins.WithClause, cteNames, refs, seen)
 		return
 	case *pg_query.Node_UpdateStmt:
 		upd := n.UpdateStmt
-		if upd == nil { return }
-		collectTablesNode(upd.Relation, tables)
-		collectTablesNodeSlice(upd.FromClause, tables)
-		collectTablesNode(upd.WhereClause, tables)
-		collectTablesNode(upd.WithClause, tables)
+		if upd == nil {
+			return
+		}
+		collectRelationRefs(upd.Relation, cteNames, refs, seen)
+		collectRelationRefsNodeSlice(upd.FromClause, cteNames, refs, seen)
+		collectRelationRefs(upd.WhereClause, cteNames, refs, seen)
+		collectRelationRefs(upd.WithClause, cteNames, refs, seen)
 		return
 	case *pg_query.Node_DeleteStmt:
 		del := n.DeleteStmt
-		if del == nil { return }
-		collectTablesNode(del.Relation, tables)
-		collectTablesNodeSlice(del.UsingClause, tables)
-		collectTablesNode(del.WhereClause, tables)
-		collectTablesNode(del.WithClause, tables)
+		if del == nil {
+			return
+		}
+		collectRelationRefs(del.Relation, cteNames, refs, seen)
+		collectRelationRefsNodeSlice(del.UsingClause, cteNames, refs, seen)
+		collectRelationRefs(del.WhereClause, cteNames, refs, seen)
+		collectRelationRefs(del.WithClause, cteNames, refs, seen)
 		return
 	case *pg_query.Node_AConst, *pg_query.Node_ColumnRef, *pg_query.Node_ParamRef:
 		return
@@ -196,13 +319,23 @@ func collectTables(v interface{}, tables *[]string) {
 		if val.IsNil() {
 			return
 		}
-		collectTables(val.Elem().Interface(), tables)
+		collectRelationRefs(val.Elem().Interface(), cteNames, refs, seen)
 		return
 	}
-	// Direct RangeVar match
 	if rv, ok := v.(*pg_query.Node_RangeVar); ok {
 		if rv.RangeVar != nil && rv.RangeVar.Relname != "" {
-			*tables = append(*tables, rv.RangeVar.Relname)
+			nameLower := strings.ToLower(rv.RangeVar.Relname)
+			if rv.RangeVar.Schemaname == "" && cteNames[nameLower] {
+				return
+			}
+			key := strings.ToLower(rv.RangeVar.Schemaname) + "." + nameLower
+			if !seen[key] {
+				seen[key] = true
+				*refs = append(*refs, RelationRef{
+					Schema: rv.RangeVar.Schemaname,
+					Name:   rv.RangeVar.Relname,
+				})
+			}
 		}
 		return
 	}
@@ -214,58 +347,374 @@ func collectTables(v interface{}, tables *[]string) {
 			}
 			if field.Kind() == reflect.Ptr && !field.IsNil() {
 				if n, ok := field.Interface().(*pg_query.Node); ok {
-					if rv, ok2 := n.Node.(*pg_query.Node_RangeVar); ok2 {
-						if rv.RangeVar != nil && rv.RangeVar.Relname != "" {
-							*tables = append(*tables, rv.RangeVar.Relname)
-						}
-					}
-					collectTables(n.Node, tables)
+					collectRelationRefs(n.Node, cteNames, refs, seen)
 					continue
 				}
 			}
-			collectTables(field.Interface(), tables)
+			collectRelationRefs(field.Interface(), cteNames, refs, seen)
 		}
 	} else if val.Kind() == reflect.Slice {
 		for i := 0; i < val.Len(); i++ {
 			elem := val.Index(i)
 			if elem.Kind() == reflect.Ptr && !elem.IsNil() {
 				if n, ok := elem.Interface().(*pg_query.Node); ok {
-					if rv, ok2 := n.Node.(*pg_query.Node_RangeVar); ok2 {
-						if rv.RangeVar != nil && rv.RangeVar.Relname != "" {
-							*tables = append(*tables, rv.RangeVar.Relname)
-						}
-					}
-					collectTables(n.Node, tables)
+					collectRelationRefs(n.Node, cteNames, refs, seen)
 					continue
 				}
 			}
-			collectTables(elem.Interface(), tables)
+			collectRelationRefs(elem.Interface(), cteNames, refs, seen)
 		}
 	}
 }
 
-func collectTablesNode(n interface{}, tables *[]string) {
-	if n == nil {
-		return
+//nolint:unused // reserved for direct AST relation inspection
+func collectRelationRefsNode(node *pg_query.Node, cteNames map[string]bool, refs *[]RelationRef, seen map[string]bool) {
+	if node != nil {
+		collectRelationRefs(node.Node, cteNames, refs, seen)
 	}
-	if node, ok := n.(*pg_query.Node); ok {
-		if node != nil {
-			collectTables(node.Node, tables)
-		}
-		return
-	}
-	collectTables(n, tables)
 }
 
-func collectTablesNodeSlice(nodes []*pg_query.Node, tables *[]string) {
+func collectRelationRefsNodeSlice(nodes []*pg_query.Node, cteNames map[string]bool, refs *[]RelationRef, seen map[string]bool) {
 	for _, n := range nodes {
 		if n != nil {
-			collectTables(n.Node, tables)
+			collectRelationRefs(n.Node, cteNames, refs, seen)
 		}
 	}
 }
 
+// matchesRelation determines if an extracted RelationRef matches an allowed relation pattern.
+// Handles bare names (implying public/default schema) and explicit schema qualification.
+// Respects PostgreSQL quoted identifier exact casing and unquoted folding.
+func matchesRelation(ref RelationRef, allowed string) bool {
+	allowedTrimmed := strings.TrimSpace(allowed)
+	if allowedTrimmed == "*" {
+		return true
+	}
 
+	allowedSchema, allowedName := SplitSchemaView(allowedTrimmed)
+	refSchema := CanonicalizeIdentifier(ref.Schema)
+	refName := CanonicalizeIdentifier(ref.Name)
+
+	// Schema check
+	schemaMatches := false
+	if strings.Contains(allowedTrimmed, ".") {
+		if refSchema != "" {
+			schemaMatches = (refSchema == allowedSchema)
+		} else {
+			schemaMatches = (allowedSchema == "public")
+		}
+	} else {
+		schemaMatches = (refSchema == "" || refSchema == "public")
+	}
+
+	if !schemaMatches {
+		return false
+	}
+
+	return refName == allowedName
+}
+
+// enforceRelationAccess checks that every relation referenced in stmt is explicitly authorized.
+// When sensitive column masking is active, default-deny is strictly enforced: wildcard '*' is prohibited,
+// and relations must match explicitly authorized base tables or approved views.
+func enforceRelationAccess(stmt *pg_query.Node, rules Rules) error {
+	hasMasking := len(rules.MaskedColumns) > 0 || len(rules.Views) > 0
+
+	// If no masking and allowed_tables allows all, nothing to restrict
+	if !hasMasking && (len(rules.AllowedTables) == 0 || isAllowed("*", rules.AllowedTables)) {
+		return nil
+	}
+
+	// When masking is enabled, a wildcard '*' in allowed_tables is forbidden (default-deny requirement)
+	if hasMasking && isAllowed("*", rules.AllowedTables) {
+		return fmt.Errorf("policy configuration error: wildcard '*' in allowed_tables is not permitted when sensitive-column masking is enabled (explicit allowed-relation policy required)")
+	}
+
+	refs := extractPostgresRelationRefs(stmt)
+	for _, ref := range refs {
+		allowed := false
+
+		// 1. Check if ref matches an explicitly authorized base table
+		for _, tbl := range rules.AllowedTables {
+			if tbl == "*" && !hasMasking {
+				allowed = true
+				break
+			}
+			if matchesRelation(ref, tbl) {
+				allowed = true
+				break
+			}
+		}
+
+		// 2. Check if ref matches an explicitly approved view
+		if !allowed && len(rules.Views) > 0 {
+			for _, v := range rules.Views {
+				if matchesRelation(ref, v.Name) {
+					if rules.RequireCatalogVerification {
+						schema, name := SplitSchemaView(v.Name)
+						canonKey := CanonicalViewKey(schema, name)
+						bareKey := CanonicalizeIdentifier(name)
+						isVerified := false
+						if rules.VerifiedViews != nil {
+							isVerified = rules.VerifiedViews[canonKey] || rules.VerifiedViews[bareKey]
+						}
+						if !isVerified {
+							relStr := ref.Name
+							if ref.Schema != "" {
+								relStr = ref.Schema + "." + ref.Name
+							}
+							return fmt.Errorf("policy violation: approved view '%s' has not been verified against PostgreSQL catalog definition or verification failed (fail-closed)", relStr)
+						}
+					}
+					allowed = true
+					break
+				}
+			}
+		}
+
+		if !allowed {
+			relStr := ref.Name
+			if ref.Schema != "" {
+				relStr = ref.Schema + "." + ref.Name
+			}
+			return fmt.Errorf("policy violation: access to relation '%s' is not allowed by policy (default-deny)", relStr)
+		}
+	}
+	return nil
+}
+
+// CanonicalizeRelationSchemas canonicalizes unqualified RangeVar relations to their explicit
+// schema-qualified identity based on policy (defaulting to "public"), preventing search_path shadowing attacks.
+func CanonicalizeRelationSchemas(node *pg_query.Node, rules Rules) error {
+	if node == nil || node.Node == nil {
+		return nil
+	}
+
+	cteNames := collectCTENames(node)
+
+	canonicalSchemas := make(map[string]string)
+	for _, v := range rules.Views {
+		schema, name := splitSchemaName(v.Name)
+		canonicalSchemas[strings.ToLower(name)] = schema
+		canonicalSchemas[strings.ToLower(schema+"."+name)] = schema
+	}
+	for _, tbl := range rules.AllowedTables {
+		if tbl == "*" {
+			continue
+		}
+		schema, name := splitSchemaName(tbl)
+		canonicalSchemas[strings.ToLower(name)] = schema
+		canonicalSchemas[strings.ToLower(schema+"."+name)] = schema
+	}
+
+	walkRangeVars(node, func(rv *pg_query.RangeVar) {
+		if rv == nil || rv.Relname == "" {
+			return
+		}
+		nameLower := strings.ToLower(rv.Relname)
+		if rv.Schemaname == "" && !cteNames[nameLower] {
+			if canonicalSchema, ok := canonicalSchemas[nameLower]; ok && canonicalSchema != "" {
+				rv.Schemaname = canonicalSchema
+			}
+		}
+	})
+
+	return nil
+}
+
+func walkRangeVars(v interface{}, fn func(rv *pg_query.RangeVar)) {
+	if v == nil {
+		return
+	}
+
+	switch n := v.(type) {
+	case *pg_query.Node:
+		if n != nil && n.Node != nil {
+			walkRangeVars(n.Node, fn)
+		}
+		return
+	case *pg_query.Node_RangeVar:
+		if n.RangeVar != nil {
+			fn(n.RangeVar)
+		}
+		return
+	case *pg_query.RangeVar:
+		fn(n)
+		return
+	case *pg_query.Node_SelectStmt:
+		sel := n.SelectStmt
+		if sel == nil {
+			return
+		}
+		for _, item := range sel.TargetList {
+			walkRangeVars(item, fn)
+		}
+		for _, item := range sel.FromClause {
+			walkRangeVars(item, fn)
+		}
+		walkRangeVars(sel.WhereClause, fn)
+		walkRangeVars(sel.WithClause, fn)
+		if sel.Larg != nil {
+			walkRangeVars(sel.Larg, fn)
+		}
+		if sel.Rarg != nil {
+			walkRangeVars(sel.Rarg, fn)
+		}
+		return
+	case *pg_query.SelectStmt:
+		sel := n
+		if sel == nil {
+			return
+		}
+		for _, item := range sel.TargetList {
+			walkRangeVars(item, fn)
+		}
+		for _, item := range sel.FromClause {
+			walkRangeVars(item, fn)
+		}
+		walkRangeVars(sel.WhereClause, fn)
+		walkRangeVars(sel.WithClause, fn)
+		if sel.Larg != nil {
+			walkRangeVars(sel.Larg, fn)
+		}
+		if sel.Rarg != nil {
+			walkRangeVars(sel.Rarg, fn)
+		}
+		return
+	case *pg_query.Node_JoinExpr:
+		join := n.JoinExpr
+		if join == nil {
+			return
+		}
+		walkRangeVars(join.Larg, fn)
+		walkRangeVars(join.Rarg, fn)
+		walkRangeVars(join.Quals, fn)
+		return
+	case *pg_query.JoinExpr:
+		join := n
+		if join == nil {
+			return
+		}
+		walkRangeVars(join.Larg, fn)
+		walkRangeVars(join.Rarg, fn)
+		walkRangeVars(join.Quals, fn)
+		return
+	case *pg_query.Node_RangeSubselect:
+		sub := n.RangeSubselect
+		if sub != nil {
+			walkRangeVars(sub.Subquery, fn)
+		}
+		return
+	case *pg_query.RangeSubselect:
+		sub := n
+		if sub != nil {
+			walkRangeVars(sub.Subquery, fn)
+		}
+		return
+	case *pg_query.Node_InsertStmt:
+		ins := n.InsertStmt
+		if ins != nil {
+			walkRangeVars(ins.Relation, fn)
+			walkRangeVars(ins.SelectStmt, fn)
+			walkRangeVars(ins.WithClause, fn)
+		}
+		return
+	case *pg_query.Node_UpdateStmt:
+		upd := n.UpdateStmt
+		if upd != nil {
+			walkRangeVars(upd.Relation, fn)
+			for _, item := range upd.FromClause {
+				walkRangeVars(item, fn)
+			}
+			walkRangeVars(upd.WhereClause, fn)
+			walkRangeVars(upd.WithClause, fn)
+		}
+		return
+	case *pg_query.Node_DeleteStmt:
+		del := n.DeleteStmt
+		if del != nil {
+			walkRangeVars(del.Relation, fn)
+			for _, item := range del.UsingClause {
+				walkRangeVars(item, fn)
+			}
+			walkRangeVars(del.WhereClause, fn)
+			walkRangeVars(del.WithClause, fn)
+		}
+		return
+	case *pg_query.Node_CommonTableExpr:
+		cte := n.CommonTableExpr
+		if cte != nil {
+			walkRangeVars(cte.Ctequery, fn)
+		}
+		return
+	case *pg_query.CommonTableExpr:
+		cte := n
+		if cte != nil {
+			walkRangeVars(cte.Ctequery, fn)
+		}
+		return
+	case *pg_query.Node_WithClause:
+		wc := n.WithClause
+		if wc != nil {
+			for _, cte := range wc.Ctes {
+				walkRangeVars(cte, fn)
+			}
+		}
+		return
+	case []*pg_query.Node:
+		for _, item := range n {
+			walkRangeVars(item, fn)
+		}
+		return
+	}
+
+	val := reflect.ValueOf(v)
+	if !val.IsValid() {
+		return
+	}
+	if val.Kind() == reflect.Ptr || val.Kind() == reflect.Interface {
+		if val.IsNil() {
+			return
+		}
+		walkRangeVars(val.Elem().Interface(), fn)
+		return
+	}
+	if val.Kind() == reflect.Slice {
+		for i := 0; i < val.Len(); i++ {
+			walkRangeVars(val.Index(i).Interface(), fn)
+		}
+		return
+	}
+	if val.Kind() == reflect.Struct {
+		for i := 0; i < val.NumField(); i++ {
+			field := val.Field(i)
+			if !field.CanInterface() {
+				continue
+			}
+			walkRangeVars(field.Interface(), fn)
+		}
+	}
+}
+
+func splitSchemaName(rel string) (string, string) {
+	parts := strings.Split(rel, ".")
+	if len(parts) == 2 {
+		return parts[0], parts[1]
+	}
+	return "public", rel
+}
+
+// extractPostgresTables walks an AST node and collects all referenced table names (RangeVar).
+//
+//nolint:unused // reserved for direct AST relation inspection
+func extractPostgresTables(node *pg_query.Node) []string {
+	refs := extractPostgresRelationRefs(node)
+	var tables []string
+	for _, r := range refs {
+		tables = append(tables, r.Name)
+	}
+	return tables
+}
 
 func enforceRules(node *pg_query.Node, rules Rules, depth int, limitParams *[]int) error {
 	if node == nil || node.Node == nil {
@@ -448,91 +897,201 @@ func walkChildren(v interface{}, rules Rules, depth int, limitParams *[]int) err
 	switch n := v.(type) {
 	case *pg_query.Node_SelectStmt:
 		sel := n.SelectStmt
-		if sel == nil { return nil }
-		if err := filterWalkNodeSlice(sel.TargetList, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNodeSlice(sel.FromClause, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(sel.WhereClause, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNodeSlice(sel.GroupClause, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(sel.HavingClause, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNodeSlice(sel.WindowClause, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNodeSlice(sel.SortClause, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(sel.LimitOffset, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(sel.LimitCount, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNodeSlice(sel.LockingClause, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(sel.WithClause, rules, depth, limitParams); err != nil { return err }
+		if sel == nil {
+			return nil
+		}
+		if err := filterWalkNodeSlice(sel.TargetList, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNodeSlice(sel.FromClause, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(sel.WhereClause, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNodeSlice(sel.GroupClause, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(sel.HavingClause, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNodeSlice(sel.WindowClause, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNodeSlice(sel.SortClause, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(sel.LimitOffset, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(sel.LimitCount, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNodeSlice(sel.LockingClause, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(sel.WithClause, rules, depth, limitParams); err != nil {
+			return err
+		}
 		return nil
 	case *pg_query.Node_InsertStmt:
 		ins := n.InsertStmt
-		if ins == nil { return nil }
-		if err := filterWalkNode(ins.Relation, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNodeSlice(ins.Cols, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(ins.SelectStmt, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(ins.OnConflictClause, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNodeSlice(ins.ReturningList, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(ins.WithClause, rules, depth, limitParams); err != nil { return err }
+		if ins == nil {
+			return nil
+		}
+		if err := filterWalkNode(ins.Relation, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNodeSlice(ins.Cols, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(ins.SelectStmt, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(ins.OnConflictClause, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNodeSlice(ins.ReturningList, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(ins.WithClause, rules, depth, limitParams); err != nil {
+			return err
+		}
 		return nil
 	case *pg_query.Node_UpdateStmt:
 		upd := n.UpdateStmt
-		if upd == nil { return nil }
-		if err := filterWalkNode(upd.Relation, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNodeSlice(upd.TargetList, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(upd.WhereClause, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNodeSlice(upd.FromClause, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNodeSlice(upd.ReturningList, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(upd.WithClause, rules, depth, limitParams); err != nil { return err }
+		if upd == nil {
+			return nil
+		}
+		if err := filterWalkNode(upd.Relation, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNodeSlice(upd.TargetList, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(upd.WhereClause, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNodeSlice(upd.FromClause, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNodeSlice(upd.ReturningList, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(upd.WithClause, rules, depth, limitParams); err != nil {
+			return err
+		}
 		return nil
 	case *pg_query.Node_DeleteStmt:
 		del := n.DeleteStmt
-		if del == nil { return nil }
-		if err := filterWalkNode(del.Relation, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNodeSlice(del.UsingClause, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(del.WhereClause, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNodeSlice(del.ReturningList, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(del.WithClause, rules, depth, limitParams); err != nil { return err }
+		if del == nil {
+			return nil
+		}
+		if err := filterWalkNode(del.Relation, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNodeSlice(del.UsingClause, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(del.WhereClause, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNodeSlice(del.ReturningList, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(del.WithClause, rules, depth, limitParams); err != nil {
+			return err
+		}
 		return nil
 	case *pg_query.Node_JoinExpr:
 		join := n.JoinExpr
-		if join == nil { return nil }
-		if err := filterWalkNode(join.Larg, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(join.Rarg, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(join.Quals, rules, depth, limitParams); err != nil { return err }
+		if join == nil {
+			return nil
+		}
+		if err := filterWalkNode(join.Larg, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(join.Rarg, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(join.Quals, rules, depth, limitParams); err != nil {
+			return err
+		}
 		return nil
 	case *pg_query.Node_FuncCall:
 		fc := n.FuncCall
-		if fc == nil { return nil }
-		if err := filterWalkNodeSlice(fc.Funcname, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNodeSlice(fc.Args, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNodeSlice(fc.AggOrder, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(fc.AggFilter, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(fc.Over, rules, depth, limitParams); err != nil { return err }
+		if fc == nil {
+			return nil
+		}
+		if err := filterWalkNodeSlice(fc.Funcname, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNodeSlice(fc.Args, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNodeSlice(fc.AggOrder, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(fc.AggFilter, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(fc.Over, rules, depth, limitParams); err != nil {
+			return err
+		}
 		return nil
 	case *pg_query.Node_AExpr:
 		aexpr := n.AExpr
-		if aexpr == nil { return nil }
-		if err := filterWalkNodeSlice(aexpr.Name, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(aexpr.Lexpr, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(aexpr.Rexpr, rules, depth, limitParams); err != nil { return err }
+		if aexpr == nil {
+			return nil
+		}
+		if err := filterWalkNodeSlice(aexpr.Name, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(aexpr.Lexpr, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(aexpr.Rexpr, rules, depth, limitParams); err != nil {
+			return err
+		}
 		return nil
 	case *pg_query.Node_BoolExpr:
 		bexpr := n.BoolExpr
-		if bexpr == nil { return nil }
-		if err := filterWalkNodeSlice(bexpr.Args, rules, depth, limitParams); err != nil { return err }
+		if bexpr == nil {
+			return nil
+		}
+		if err := filterWalkNodeSlice(bexpr.Args, rules, depth, limitParams); err != nil {
+			return err
+		}
 		return nil
 	case *pg_query.Node_ResTarget:
 		rt := n.ResTarget
-		if rt == nil { return nil }
-		if err := filterWalkNodeSlice(rt.Indirection, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(rt.Val, rules, depth, limitParams); err != nil { return err }
+		if rt == nil {
+			return nil
+		}
+		if err := filterWalkNodeSlice(rt.Indirection, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(rt.Val, rules, depth, limitParams); err != nil {
+			return err
+		}
 		return nil
 	case *pg_query.Node_TypeCast:
 		tc := n.TypeCast
-		if tc == nil { return nil }
-		if err := filterWalkNode(tc.Arg, rules, depth, limitParams); err != nil { return err }
-		if err := filterWalkNode(tc.TypeName, rules, depth, limitParams); err != nil { return err }
+		if tc == nil {
+			return nil
+		}
+		if err := filterWalkNode(tc.Arg, rules, depth, limitParams); err != nil {
+			return err
+		}
+		if err := filterWalkNode(tc.TypeName, rules, depth, limitParams); err != nil {
+			return err
+		}
 		return nil
 	case *pg_query.Node_ColumnRef:
 		cr := n.ColumnRef
-		if cr == nil { return nil }
+		if cr == nil {
+			return nil
+		}
 		return filterWalkNodeSlice(cr.Fields, rules, depth, limitParams)
 	case *pg_query.Node_RangeVar, *pg_query.Node_AConst, *pg_query.Node_ParamRef, *pg_query.Node_String_, *pg_query.Node_Integer:
 		return nil // Leaf nodes
@@ -634,7 +1193,9 @@ func hasAnalyticalNodes(v interface{}) bool {
 	switch n := v.(type) {
 	case *pg_query.Node_FuncCall:
 		fc := n.FuncCall
-		if fc == nil { return false }
+		if fc == nil {
+			return false
+		}
 		// Window functions (fc.Over != nil) evaluate across a window partition/frame and output
 		// a value for every input row; they do not group or collapse rows. Therefore, window functions
 		// must NOT be treated as row-collapsing analytical nodes.
@@ -658,7 +1219,9 @@ func hasAnalyticalNodes(v interface{}) bool {
 		return false
 	case *pg_query.Node_SubLink:
 		sl := n.SubLink
-		if sl == nil { return false }
+		if sl == nil {
+			return false
+		}
 		// A subquery represents an independent query scope with its own result cardinality.
 		// Aggregates inside its subselect do NOT collapse rows of the enclosing query.
 		// Only check the test expression (e.g., COUNT(*) IN (SELECT ...)) which belongs to this level.
@@ -669,25 +1232,39 @@ func hasAnalyticalNodes(v interface{}) bool {
 		return false
 	case *pg_query.Node_JoinExpr:
 		join := n.JoinExpr
-		if join == nil { return false }
+		if join == nil {
+			return false
+		}
 		if hasAnalyticalNodesNode(join.Larg) || hasAnalyticalNodesNode(join.Rarg) || hasAnalyticalNodesNode(join.Quals) {
 			return true
 		}
 		return false
 	case *pg_query.Node_AExpr:
 		aexpr := n.AExpr
-		if aexpr == nil { return false }
-		if hasAnalyticalNodesNode(aexpr.Lexpr) || hasAnalyticalNodesNode(aexpr.Rexpr) { return true }
+		if aexpr == nil {
+			return false
+		}
+		if hasAnalyticalNodesNode(aexpr.Lexpr) || hasAnalyticalNodesNode(aexpr.Rexpr) {
+			return true
+		}
 		return false
 	case *pg_query.Node_BoolExpr:
 		bexpr := n.BoolExpr
-		if bexpr == nil { return false }
-		if hasAnalyticalNodesNodeSlice(bexpr.Args) { return true }
+		if bexpr == nil {
+			return false
+		}
+		if hasAnalyticalNodesNodeSlice(bexpr.Args) {
+			return true
+		}
 		return false
 	case *pg_query.Node_ResTarget:
 		rt := n.ResTarget
-		if rt == nil { return false }
-		if hasAnalyticalNodesNode(rt.Val) { return true }
+		if rt == nil {
+			return false
+		}
+		if hasAnalyticalNodesNode(rt.Val) {
+			return true
+		}
 		return false
 	case *pg_query.Node_RangeVar, *pg_query.Node_ColumnRef, *pg_query.Node_AConst, *pg_query.Node_ParamRef, *pg_query.Node_String_, *pg_query.Node_Integer:
 		return false // Leaf nodes
@@ -854,12 +1431,22 @@ func calculateGenericReflectComplexity(valInterface interface{}) int {
 	switch n := valInterface.(type) {
 	case *pg_query.Node_SelectStmt:
 		sel := n.SelectStmt
-		if sel == nil { return 0 }
+		if sel == nil {
+			return 0
+		}
 		score := 0
-		if len(sel.FromClause) > 1 { score += (len(sel.FromClause) - 1) * 5 }
-		if sel.WhereClause != nil { score += 1 }
-		if len(sel.SortClause) > 0 { score += 2 }
-		if len(sel.GroupClause) > 0 { score += 3 }
+		if len(sel.FromClause) > 1 {
+			score += (len(sel.FromClause) - 1) * 5
+		}
+		if sel.WhereClause != nil {
+			score += 1
+		}
+		if len(sel.SortClause) > 0 {
+			score += 2
+		}
+		if len(sel.GroupClause) > 0 {
+			score += 3
+		}
 		score += calculateGenericReflectComplexityNodeSlice(sel.TargetList)
 		score += calculateGenericReflectComplexityNodeSlice(sel.FromClause)
 		score += calculateGenericReflectComplexityNode(sel.WhereClause)
@@ -868,38 +1455,56 @@ func calculateGenericReflectComplexity(valInterface interface{}) int {
 		return score
 	case *pg_query.Node_JoinExpr:
 		join := n.JoinExpr
-		if join == nil { return 0 }
+		if join == nil {
+			return 0
+		}
 		return 5 + calculateGenericReflectComplexityNode(join.Larg) + calculateGenericReflectComplexityNode(join.Rarg) + calculateGenericReflectComplexityNode(join.Quals)
 	case *pg_query.Node_FuncCall:
 		fc := n.FuncCall
-		if fc == nil { return 0 }
+		if fc == nil {
+			return 0
+		}
 		score := 0
-		if fc.Over != nil { score += 4 }
+		if fc.Over != nil {
+			score += 4
+		}
 		score += calculateGenericReflectComplexityNodeSlice(fc.Args)
 		return score
 	case *pg_query.Node_InsertStmt:
 		ins := n.InsertStmt
-		if ins == nil { return 0 }
+		if ins == nil {
+			return 0
+		}
 		return calculateGenericReflectComplexityNode(ins.SelectStmt) + calculateGenericReflectComplexityNode(ins.OnConflictClause)
 	case *pg_query.Node_UpdateStmt:
 		upd := n.UpdateStmt
-		if upd == nil { return 0 }
+		if upd == nil {
+			return 0
+		}
 		return calculateGenericReflectComplexityNodeSlice(upd.TargetList) + calculateGenericReflectComplexityNode(upd.WhereClause) + calculateGenericReflectComplexityNodeSlice(upd.FromClause)
 	case *pg_query.Node_DeleteStmt:
 		del := n.DeleteStmt
-		if del == nil { return 0 }
+		if del == nil {
+			return 0
+		}
 		return calculateGenericReflectComplexityNodeSlice(del.UsingClause) + calculateGenericReflectComplexityNode(del.WhereClause)
 	case *pg_query.Node_AExpr:
 		aexpr := n.AExpr
-		if aexpr == nil { return 0 }
+		if aexpr == nil {
+			return 0
+		}
 		return calculateGenericReflectComplexityNode(aexpr.Lexpr) + calculateGenericReflectComplexityNode(aexpr.Rexpr)
 	case *pg_query.Node_BoolExpr:
 		bexpr := n.BoolExpr
-		if bexpr == nil { return 0 }
+		if bexpr == nil {
+			return 0
+		}
 		return calculateGenericReflectComplexityNodeSlice(bexpr.Args)
 	case *pg_query.Node_ResTarget:
 		rt := n.ResTarget
-		if rt == nil { return 0 }
+		if rt == nil {
+			return 0
+		}
 		return calculateGenericReflectComplexityNode(rt.Val)
 	case *pg_query.Node_RangeVar, *pg_query.Node_ColumnRef, *pg_query.Node_AConst, *pg_query.Node_ParamRef, *pg_query.Node_String_, *pg_query.Node_Integer:
 		return 0

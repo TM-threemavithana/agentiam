@@ -255,7 +255,6 @@ func isSharedTable(relName string, sharedTables []string) bool {
 	return false
 }
 
-
 func checkPostgresUpdateTargetList(targetList []*pg_query.Node, tenantCol string) error {
 	for _, target := range targetList {
 		if target == nil {
