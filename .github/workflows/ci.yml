@@ -106,6 +106,6 @@ jobs:
       - name: Run database integration test suite (PostgreSQL 15 & MySQL 8.0)
         run: |
           echo "==> Running PostgreSQL and MySQL wire-protocol, proxy, view-masking, and tenant integration tests..."
-          go test -v -tags=integration -timeout 25m -run "TestViewMaskingIntegration|TestProxyIntegration|TestTLSUpgradeAndEnforcement|TestMySQLAdapterIntegration" ./internal/proxy
+          go test -v -count=1 -tags=integration -timeout 25m -run "TestViewMaskingIntegration|TestProxyIntegration|TestTLSUpgradeAndEnforcement|TestMySQLAdapterIntegration" ./internal/proxy
         env:
           TESTCONTAINERS_RYUK_DISABLED: "false"
